@@ -16,7 +16,8 @@
 2. 屏障统一：dispatch→blit 保留 `MTLStageDispatch→MTLStageBlit`；blit 后若同帧还有渲染写同一 `d`，补 `MTLStageBlit→MTLStageRender`（只在 `d` 上有后续绘制时加，避免全局 All）。
 3. 仍崩则**放弃计算内核**，改"全屏渲染 pass 合成"：在 present 前开一个 `1920x1080` pass，用一条片元 `return src.sample(sampler, uv)` 把 HDR 源写进窗口目标（复用现有 `blit()`/present 路径，不碰计算编码器）。
 
-**验收**：`NIER_T2T_CONVERT=1 TOTK_GPU_MIDCLEAR=1` 下 13 秒 ×10 全干净；再叠 `BLOCKRT/WIDEN` 各 ×5 干净。
+**进展（2026-10-21）**：参数缓冲改成持久 `MTLBuffer` 后，`NIER_T2T_CONVERT=1 TOTK_GPU_MIDCLEAR=1` 的 13 秒 ×5 全干净——说明"参数缓冲被 arena 回收"确实是原因之一。但打开 `TOTK_GPU_ALLOW_SUBMIT=1`（真正提交 GPU）后仍在第一次 `cv_flush()` 处以 SIGTRAP（`pc` 在系统库，堆/断言）崩溃；此前所有"干净"的测试都没真正提交 GPU。因此计算内核这条路线在真实提交下不可用，**改为"全屏渲染 pass 合成"**：用 MTL4 渲染编码器在目标上开一个 pass，画一个三角形，片元里 `texture2d<float> src` 采样，写入目标（目标 usage 5 = shaderRead|renderTarget，正好可写）。这一段需要复用 `draw_inner` 的 argument-table 绑定方式（`setArgumentTable` + `setTexture:gpuResourceID` + `setRenderPipelineState` + `drawPrimitives`），不能再用计算编码器。
+**当前默认**：转换仍关（`NIER_T2T_CONVERT`）；关掉后 App 环境（含 `ALLOW_SUBMIT`）启动 22 秒无 fault，但窗口是黑的——说明**这张窗口合成就是画面呈现的唯一通道**，所以 P0 是画面的前置项。
 
 **风险**：`BLOCKRT/WIDEN` 是内核 panic 后隔离的实验路径，见 P1。
 

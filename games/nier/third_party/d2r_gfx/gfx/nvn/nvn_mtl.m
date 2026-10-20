@@ -10549,7 +10549,7 @@ static const char *k_cv_src =
     "  if (d.x >= (uint)dst.get_width() || d.y >= (uint)dst.get_height()) return;\n"
     "  float4 v = src.read(s, 0); dst.write(v, d);\n}\n";
 void nvn_cv_dump_request(void) { }   /* diagnostic hook kept for the runtime input command */
-static int cv_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("NIER_T2T_CONVERT"); v = e && e[0] == '1'; } return v; }   /* off by default: the deferred flush is stable in dev runs, but the packaged-app env still faults */
+static int cv_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("NIER_T2T_CONVERT"); v = e && e[0] == '1'; } return v; }   /* off by default: the compute copy traps once GPU submission is real (see docs/repair-plan.md P0) */
 static id<MTLComputePipelineState> cv_pso(void) {
     static id<MTLComputePipelineState> ps; static int tried;
     if (!tried) { tried = 1; NSError *e = nil; id<MTLLibrary> lib = totk_msl_library(@(k_cv_src), &e);
@@ -10603,12 +10603,15 @@ static void cv_flush(void) {
         int direct = (q->d.usage & MTLTextureUsageShaderWrite) != 0;
         id<MTLTexture> out = direct ? q->d : cv_scratch(q->d.pixelFormat, (NSUInteger)(q->dx + q->w), (NSUInteger)(q->dy + q->h));
         if (!out) continue;
-        id<MTLBuffer> pb; size_t po = arena_alloc(32, &pb);
-        uint32_t *pp = (uint32_t *)((uint8_t *)pb.contents + po);
+        /* Persistent 16-byte parameter buffer: an arena allocation can be recycled later in the same frame while the GPU
+           is still reading it, which corrupted guest memory through this layer's direct guest mappings. */
+        static id<MTLBuffer> g_cvb;
+        if (!g_cvb) { g_cvb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (!g_cvb) continue; res_add(g_cvb); }
+        uint32_t *pp = (uint32_t *)g_cvb.contents;
         pp[0] = (uint32_t)q->sx; pp[1] = (uint32_t)q->sy; pp[2] = (uint32_t)q->dx; pp[3] = (uint32_t)q->dy;
         id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
         [ce setArgumentTable:cv_at]; [ce setComputePipelineState:ps];
-        [cv_at setTexture:q->s.gpuResourceID atIndex:0]; [cv_at setTexture:out.gpuResourceID atIndex:1]; [cv_at setAddress:pb.gpuAddress + po atIndex:0];
+        [cv_at setTexture:q->s.gpuResourceID atIndex:0]; [cv_at setTexture:out.gpuResourceID atIndex:1]; [cv_at setAddress:g_cvb.gpuAddress atIndex:0];
         [ce dispatchThreadgroups:MTLSizeMake(((NSUInteger)q->w + 7) / 8, ((NSUInteger)q->h + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         if (!direct) {
             id b = blit();
