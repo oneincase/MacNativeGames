@@ -1,0 +1,198 @@
+/* nn::audio's AudioOut API (audout) for NieR:Automata. The game only imports the public C++ wrappers
+   (OpenDefaultAudioOut, AppendAudioOutBuffer, StartAudioOut, GetReleasedAudioOutBuffer, …), never audren's renderer, and
+   on this build the SDK's own wrapper does not get as far as connecting to audout:u: it opens the audren device service
+   three times, reads the active channel count / device name, takes the device notification event and then waits on it
+   instead of opening the output (see docs/status-1.0.3.md). Rather than emulate that stall, this file answers the public
+   API directly: each AudioOut becomes a Core Audio AudioQueue, appended buffers are mixed to what the queue wants and
+   the tags come back when the device has played them, so the game is paced by the real output exactly as with the
+   audout:u IPC service (runtime/audio_out.c, which stays for ports whose SDK does reach it).
+   Layouts are the SDK's own: AudioOut = {u32 sample_rate, u32 channel_count, u32 sample_format, u32 state, x0x10 host},
+   AudioOutBuffer = 0x28 bytes {next(tag), sample_buffer, capacity, data_size, data_offset}. */
+#include "runtime.h"
+#include <AudioToolbox/AudioToolbox.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+enum { STATE_STARTED = 0, STATE_STOPPED = 1, FORMAT_PCM16 = 2, QUEUE_MAX = 32 };
+
+typedef struct { uint64_t next, sample_buffer, capacity, data_size, data_offset; } AudioOutBuffer;
+_Static_assert(sizeof(AudioOutBuffer) == 0x28, "AudioOutBuffer");
+
+typedef struct {
+    uint32_t rate, channels, format, state;   /* the fields the SDK's getters read */
+    void *host;                               /* HostOut */
+} AudioOut;
+
+typedef struct { uint64_t tag, bytes; } Queued;
+typedef struct {
+    AudioOut *owner;
+    pthread_mutex_t lock;
+    AudioQueueRef aq;
+    Queued queue[QUEUE_MAX]; unsigned nqueue;
+    uint64_t released[QUEUE_MAX]; unsigned nreleased;
+    uint64_t played_samples;
+    int silent;
+    pthread_t thread; int running;
+} HostOut;
+
+static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void trace(const char *fmt, ...) {
+    if (!getenv("NIER_TRACE_AUDIO")) return;
+    va_list ap; va_start(ap, fmt); fputs("[audio] ", stderr); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap);
+}
+
+static void release_head(HostOut *h) {
+    if (!h->nqueue) return;
+    const Queued head = h->queue[0];
+    memmove(h->queue, h->queue + 1, (--h->nqueue) * sizeof *h->queue);
+    if (h->nreleased < QUEUE_MAX) h->released[h->nreleased++] = head.tag;
+    h->played_samples += head.bytes / (2ull * h->owner->channels);
+}
+static void played(void *user, AudioQueueRef q, AudioQueueBufferRef b) {   /* Core Audio thread */
+    HostOut *h = user;
+    pthread_mutex_lock(&h->lock); release_head(h); pthread_mutex_unlock(&h->lock);
+    AudioQueueFreeBuffer(q, b);
+}
+static void *silent_playback(void *arg) {
+    HostOut *h = arg; uint64_t due = 0;
+    for (;;) {
+        pthread_mutex_lock(&h->lock);
+        if (!h->running) { pthread_mutex_unlock(&h->lock); return NULL; }
+        uint64_t now = now_ns();
+        if (h->owner->state == STATE_STARTED && h->nqueue) {
+            if (!due) due = now + h->queue[0].bytes / (2ull * h->owner->channels) * 1000000000ull / h->owner->rate;
+            if (now >= due) { release_head(h); due = 0; pthread_mutex_unlock(&h->lock); continue; }
+        } else due = 0;
+        pthread_mutex_unlock(&h->lock);
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+}
+static void to_stereo(const int16_t *in, int16_t *out, uint64_t frames, uint32_t channels) {
+    for (uint64_t i = 0; i < frames; i++) {
+        const int16_t *s = in + i * channels;
+        if (channels == 2) { out[2 * i] = s[0]; out[2 * i + 1] = s[1]; continue; }
+        if (channels == 1) { out[2 * i] = out[2 * i + 1] = s[0]; continue; }
+        float c = s[2] * 0.7071f, l = s[0] + c + s[4] * 0.7071f, r = s[1] + c + s[5] * 0.7071f;
+        l *= 0.5f; r *= 0.5f;
+        out[2 * i] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l); out[2 * i + 1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+    }
+}
+
+/* ---------- the public API ---------- */
+uint64_t nier_audio_open_default(void *out_raw, const void *param_raw) {
+    AudioOut *o = out_raw;
+    uint32_t rate = 48000, channels = 2, p0 = 0, p1 = 0;
+    if (param_raw) { const uint32_t *p = param_raw; p0 = p[0]; p1 = p[1]; if (p[0] >= 8000 && p[0] <= 192000) rate = p[0]; if (p[1] == 1 || p[1] == 2 || p[1] == 6) channels = p[1]; }
+    trace("OpenDefaultAudioOut parameter words %#x %#x -> using %u Hz x%u", p0, p1, rate, channels);
+    HostOut *h = calloc(1, sizeof *h);
+    if (!h) return 0x815;
+    pthread_mutex_init(&h->lock, NULL);
+    h->owner = o; h->running = 1;
+    o->rate = rate; o->channels = channels; o->format = FORMAT_PCM16; o->state = STATE_STOPPED; o->host = h;
+    const char *e = getenv("BY3_AUDIO");
+    h->silent = e && !strcmp(e, "0");
+    if (!h->silent) {
+        AudioStreamBasicDescription f = {.mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM,
+            .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked, .mBytesPerPacket = 4, .mFramesPerPacket = 1,
+            .mBytesPerFrame = 4, .mChannelsPerFrame = 2, .mBitsPerChannel = 16};
+        if (AudioQueueNewOutput(&f, played, h, NULL, kCFRunLoopCommonModes, 0, &h->aq)) { fprintf(stderr, "[audio] no Core Audio output; continuing silent\n"); h->silent = 1; }
+    }
+    if (h->silent) pthread_create(&h->thread, NULL, silent_playback, h);
+    trace("AudioOut open %u Hz x%u PCM16 -> %s", rate, channels, h->silent ? "silent sink" : "Core Audio (stereo)");
+    return 0;
+}
+uint64_t nier_audio_start(void *out_raw) {
+    AudioOut *o = out_raw; if (!o || !o->host) return 0;
+    HostOut *h = o->host; o->state = STATE_STARTED;
+    if (h->aq) AudioQueueStart(h->aq, NULL);
+    trace("AudioOut start");
+    return 0;
+}
+uint64_t nier_audio_stop(void *out_raw) {
+    AudioOut *o = out_raw; if (!o || !o->host) return 0;
+    HostOut *h = o->host; o->state = STATE_STOPPED;
+    if (h->aq) AudioQueuePause(h->aq);
+    trace("AudioOut stop");
+    return 0;
+}
+uint64_t nier_audio_close(void *out_raw) {
+    AudioOut *o = out_raw; if (!o || !o->host) return 0;
+    HostOut *h = o->host; h->running = 0;
+    if (h->aq) AudioQueueDispose(h->aq, true);
+    if (h->silent) pthread_join(h->thread, NULL);
+    pthread_mutex_destroy(&h->lock); free(h); o->host = NULL;
+    trace("AudioOut close");
+    return 0;
+}
+uint64_t nier_audio_append(void *out_raw, void *buf_raw) {
+    AudioOut *o = out_raw; AudioOutBuffer *b = buf_raw;
+    if (!o || !o->host || !b) return 0;
+    HostOut *h = o->host;
+    uint64_t bytes = b->data_size;
+    pthread_mutex_lock(&h->lock);
+    if (h->nqueue >= QUEUE_MAX) { pthread_mutex_unlock(&h->lock); return 0x8a5; }   /* queue full */
+    h->queue[h->nqueue++] = (Queued){b->next, bytes};
+    pthread_mutex_unlock(&h->lock);
+    if (h->silent) return 0;
+    uint32_t channels = o->channels;
+    uint64_t frames = bytes / (2ull * channels), offset = b->data_offset;
+    if (offset + bytes > b->capacity) { trace("AudioOut buffer out of range (offset %llu size %llu capacity %llu)", (unsigned long long)offset, (unsigned long long)bytes, (unsigned long long)b->capacity); return 0x8a5; }
+    AudioQueueBufferRef qb;
+    if (AudioQueueAllocateBuffer(h->aq, (UInt32)(frames ? frames * 4 : 4), &qb)) return 0x8a5;
+    to_stereo((const int16_t *)(uintptr_t)(b->sample_buffer + offset), qb->mAudioData, frames, channels);
+    qb->mAudioDataByteSize = (UInt32)(frames * 4);
+    if (!frames) { memset(qb->mAudioData, 0, 4); qb->mAudioDataByteSize = 4; }
+    if (AudioQueueEnqueueBuffer(h->aq, qb, 0, NULL)) return 0x8a5;
+    static unsigned appends; if (++appends == 1 || appends % 500 == 0) trace("AudioOut appended %u buffers, %llu frames each", appends, (unsigned long long)frames);
+    return 0;
+}
+uint64_t nier_audio_released(void *out_raw) {
+    AudioOut *o = out_raw; if (!o || !o->host) return 0;
+    HostOut *h = o->host; uint64_t tag = 0;
+    pthread_mutex_lock(&h->lock);
+    if (h->nreleased) { tag = h->released[0]; memmove(h->released, h->released + 1, (--h->nreleased) * sizeof *h->released); }
+    pthread_mutex_unlock(&h->lock);
+    return tag;
+}
+uint64_t nier_audio_played_samples(void *out_raw) {
+    AudioOut *o = out_raw; if (!o || !o->host) return 0;
+    HostOut *h = o->host; pthread_mutex_lock(&h->lock); uint64_t v = h->played_samples; pthread_mutex_unlock(&h->lock); return v;
+}
+/* Small accessors: the SDK implementations are exactly these loads/stores, but they are guest code; answering them here
+   keeps one owner of the struct while an override owns the device. */
+uint64_t nier_audio_buffer_info(void *buf_raw, void *ptr, uint64_t capacity, uint64_t size) {
+    AudioOutBuffer *b = buf_raw; b->sample_buffer = (uint64_t)(uintptr_t)ptr; b->capacity = capacity; b->data_size = size; return 0;
+}
+uint64_t nier_audio_buffer_pointer(const void *buf_raw) { return ((const AudioOutBuffer *)buf_raw)->sample_buffer; }
+uint64_t nier_audio_buffer_size(const void *buf_raw) { return ((const AudioOutBuffer *)buf_raw)->data_size; }
+uint64_t nier_audio_channel_count(const void *out_raw) { return ((const AudioOut *)out_raw)->channels; }
+uint64_t nier_audio_sample_rate(const void *out_raw) { return ((const AudioOut *)out_raw)->rate; }
+uint64_t nier_audio_sample_format(const void *out_raw) { return ((const AudioOut *)out_raw)->format; }
+uint64_t nier_audio_state(const void *out_raw) { return ((const AudioOut *)out_raw)->state; }
+
+void *runtime_audio_override(const char *name) {
+    static const struct { const char *name; void *fn; } entries[] = {
+        {"_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE", (void *)nier_audio_open_default},
+        {"_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", (void *)nier_audio_start},
+        {"_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", (void *)nier_audio_stop},
+        {"_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", (void *)nier_audio_close},
+        {"_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE", (void *)nier_audio_append},
+        {"_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", (void *)nier_audio_released},
+        {"_ZN2nn5audio28GetAudioOutPlayedSampleCountEPKNS0_8AudioOutE", (void *)nier_audio_played_samples},
+        {"_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm", (void *)nier_audio_buffer_info},
+        {"_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE", (void *)nier_audio_buffer_pointer},
+        {"_ZN2nn5audio25GetAudioOutBufferDataSizeEPKNS0_14AudioOutBufferE", (void *)nier_audio_buffer_size},
+        {"_ZN2nn5audio23GetAudioOutChannelCountEPKNS0_8AudioOutE", (void *)nier_audio_channel_count},
+        {"_ZN2nn5audio21GetAudioOutSampleRateEPKNS0_8AudioOutE", (void *)nier_audio_sample_rate},
+        {"_ZN2nn5audio23GetAudioOutSampleFormatEPKNS0_8AudioOutE", (void *)nier_audio_sample_format},
+        {"_ZN2nn5audio16GetAudioOutStateEPKNS0_8AudioOutE", (void *)nier_audio_state},
+    };
+    for (size_t i = 0; i < sizeof entries / sizeof entries[0]; i++) if (!strcmp(name, entries[i].name)) return entries[i].fn;
+    return NULL;
+}

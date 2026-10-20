@@ -24,3 +24,11 @@ games/totk/tools/totk_xlate/obj/
 games/totk/tools/totk_xlate/bin/
 games/totk/scripts/shader_inventory/obj/
 games/totk/scripts/shader_inventory/bin/
+
+# NieR:Automata (work folder usually lives outside the repo)
+NIER_build/
+games/nier/build/
+games/nier/extracted/
+games/nier/rewritten/
+games/nier/analysis/
+games/nier/user-data/

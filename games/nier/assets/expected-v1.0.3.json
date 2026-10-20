@@ -1,0 +1,37 @@
+{
+    "_comment": "Verified NieR:Automata The End of YoRHa Edition 1.0.3 code (base ExeFS is the same modules; the update replaces main and main.npdm) and merged RomFS. Runtime validation is recorded separately.",
+    "title_id": "0100B8E016F76000",
+    "update_title_id": "0100B8E016F76800",
+    "version": 131072,
+    "display_version": "1.0.3",
+    "main_build_id": "98397A10419894652F372D4DC1B6FC2C672765CD",
+    "base_program_nca": {
+        "name": "a6be4d4bd658d0d37e6a1cb603f63f7a.nca",
+        "nca_offset": 6468,
+        "size": 11687559168
+    },
+    "update_program_nca": {
+        "name": "31f1be0591830ced0a7521a8e5457afb.nca",
+        "nca_offset": 400,
+        "size": 23668224
+    },
+    "exefs_sha256": {
+        "main": "2d69d1cffa28fcb24d772eae3fdbdfba8655968e215bf46d615c632e9b9e07c2",
+        "main.npdm": "8a82be4ce1479173d7f410fa91f8206db3b87fcb885d866d1d574b7b52592aae",
+        "rtld": "a977ae6f4952aad94e1c69e6b4ae6a7526824fea5ff01abd7271d81ac737a624",
+        "sdk": "dcf4aba559fd4ef623a0d5b5462deb1a9f4111587b6e78dae24ee2dba0fc5c5a",
+        "subsdk0": "d413db23c0f1cf09d2a71c9ba0e627e1fffec14a3516ffe87c05f661308ae335"
+    },
+    "rewritten_sha256": {
+        "main.patched.bin": "cc2e989d3d04e84cc547d0c5897b625195613c97d3ad0cbe6322d21015e15c5a",
+        "sdk.patched.bin": "5068bdb9b58caee33cd79367b54ddac5adbc52061a7f7324a8aacf128bb26c3f",
+        "subsdk0.patched.bin": "57e50f0e8f2f2e1b82e0ddf62d21986f682415ce7dedbb84bc7d03abc98b12c4"
+    },
+    "romfs": {
+        "size": 11644591488,
+        "sha256": "7510d8816ff6ae4cdc9a51a96c58a4364cd8c07f9c072161ba669e09c46cfb7f",
+        "files": 660,
+        "bytes_from_base": 11663898912,
+        "bytes_from_update": 3548256
+    }
+}
