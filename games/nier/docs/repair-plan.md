@@ -17,7 +17,15 @@
 3. 仍崩则**放弃计算内核**，改"全屏渲染 pass 合成"：在 present 前开一个 `1920x1080` pass，用一条片元 `return src.sample(sampler, uv)` 把 HDR 源写进窗口目标（复用现有 `blit()`/present 路径，不碰计算编码器）。
 
 **进展（2026-10-21）**：参数缓冲改成持久 `MTLBuffer` 后，`NIER_T2T_CONVERT=1 TOTK_GPU_MIDCLEAR=1` 的 13 秒 ×5 全干净——说明"参数缓冲被 arena 回收"确实是原因之一。但打开 `TOTK_GPU_ALLOW_SUBMIT=1`（真正提交 GPU）后仍在第一次 `cv_flush()` 处以 SIGTRAP（`pc` 在系统库，堆/断言）崩溃；此前所有"干净"的测试都没真正提交 GPU。因此计算内核这条路线在真实提交下不可用，**改为"全屏渲染 pass 合成"**：用 MTL4 渲染编码器在目标上开一个 pass，画一个三角形，片元里 `texture2d<float> src` 采样，写入目标（目标 usage 5 = shaderRead|renderTarget，正好可写）。这一段需要复用 `draw_inner` 的 argument-table 绑定方式（`setArgumentTable` + `setTexture:gpuResourceID` + `setRenderPipelineState` + `drawPrimitives`），不能再用计算编码器。
-**当前默认**：转换仍关（`NIER_T2T_CONVERT`）；关掉后 App 环境（含 `ALLOW_SUBMIT`）启动 22 秒无 fault，但窗口是黑的——说明**这张窗口合成就是画面呈现的唯一通道**，所以 P0 是画面的前置项。
+
+**完成（2026-10-21，渲染合成版）**：计算内核整体退役，`copy_t2t_convert()` 现在按游戏下发顺序**立即执行**渲染合成（不再挂起、无 `cv_flush`）：`rp_end` 落地挂起通道 → `rs_sync`（编码线程模式）→ 源纹理写进共享片元参数表纹理槽 0（游戏着色器是 argument-buffer ABI，不读该槽）→ `enc_r_begin` 开 `DontCare` 加载的 pass（尺寸=目标级尺寸），全屏三角形 `src.sample(s)`（`constexpr sampler`，不用采样器槽）直接写目标，`enc_r_end` 收尾带 `bar_end` 队列屏障；随后 `args_dirty_all()` 供游戏绘制继续用共享表。流式合成 pass 自动沿用 `enc_r_begin` 的编码线程路径。MSL：`cvv/cvf`（与 present 管线同款全屏三角形 UV 约定）。验证（M1 部分达成）：
+- `NIER_T2T_CONVERT=1` + `ALLOW_SUBMIT=1`：stability.sh 13 秒 ×3 全干净（之前计算内核在此配置下第一次 flush 即 SIGTRAP）；100 秒实跑 0 fault。
+- `TOTK_WINDOW_SHOT` 整窗截图：YoRHa 启动序列（LOADING/文本/logo）完整；序章飞行场景云海/天际线/字幕正常呈现（绿色调与缺口是 P2/P3 的已知残留，合成前就存在）。
+- 不带 `NIER_T2T_CONVERT` 的默认路径 13 秒 ×2 依旧干净（改动不影响关闭分支）。
+- launcher（`app/launcher.m`）现默认设 `NIER_T2T_CONVERT=1`（`NIER_build/` 里的 app 需重新 `make app` 打包后生效）。
+- 后续注意：合成只覆盖整级 level-0、无偏移的形态（与原内核门一致）；出现 4x4 排布/部分区域形态仍会走报红路径，属预期。
+
+**当前默认**：转换已默认开（launcher 设 `NIER_T2T_CONVERT=1`；想临时关掉可 `NIER_T2T_CONVERT=0` 启动 runtime 压过它）。
 
 **风险**：`BLOCKRT/WIDEN` 是内核 panic 后隔离的实验路径，见 P1。
 

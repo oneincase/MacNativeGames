@@ -173,3 +173,10 @@ keys and saves are never committed. Status lives in [docs/status-1.0.3.md](docs/
 - 诊断开关 NIER_GS_COUNTER_HINT=1 打印出 `S.ssbo[2][0].addr`，与 draw_resolve 读到 count=0 的间接参数是同一段内存（同一次启动同一地址），说明这支 passthrough GS 的 atomicAdd 计数器就是间接绘制的 count 字段。
 - 打开该开关后，`[ind]` 日志里 count=0 的比例从 61%（6,336/10,480）变成 0（0/5,245）：缺口链条闭合 —— 丢掉 GS → count 恒为 0 → GPU 驱动绘制全部跳过 → 屏幕区域停在上一帧。
 - 仍然缺的一步：紧凑列表（c0+0x10C）里每个顶点的 _37.x 来自该程序 VS 的 location 3 输出，Metal 没有 transform feedback，需要给这条 VS 生成写缓冲的变体 + 一个三角形压缩内核（诊断开关默认关闭，仅用于验证）。
+
+2026-10-21 P0 完成：换格式拷贝改渲染合成，窗口画面恢复
+- 计算内核路线退役（真实提交下第一次 flush 即 SIGTRAP，前两轮"干净"都没提交 GPU）：`copy_t2t_convert()` 改为按游戏下发顺序立即执行的渲染合成；`rp_begin_ex` 里的 `cv_flush` 挂起机制删除。
+- 合成 pass：`rp_end` → `rs_sync` → 源纹理写进共享片元参数表纹理槽 0（游戏着色器 argument-buffer ABI 不读该槽）→ `enc_r_begin`（DontCare 加载、尺寸=目标级尺寸）→ 全屏三角形 `src.sample(s)`（`constexpr sampler`，不占采样器槽）直接写目标 → `enc_r_end`（`bar_end` 队列屏障）→ `args_dirty_all()`。MSL `cvv/cvf` 与 present 管线同款 UV 约定。流式合成沿用编码线程路径。
+- 门条件不变：仅 HDR 源→LDR 目标、整级 level-0、无偏移、非 3D、非压缩；块压缩目标直接回退（BLOCKRT 关闭下不会出现）。
+- 验证：`NIER_T2T_CONVERT=1` + `TOTK_GPU_ALLOW_SUBMIT=1` stability.sh 13 秒 ×3 与 100 秒实跑全干净（0 fault）；整窗截图 YoRHa 启动序列完整、序章云海/字幕正常（绿色调与场景缺口为 P2/P3 已知残留，与本改动无关）；不带转换的默认路径 13 秒 ×2 干净。
+- launcher 默认 `NIER_T2T_CONVERT=1`（`make app` 重打包生效）；`docs/screens/07-composite-boot.png` 为合成路径下的启动画面。

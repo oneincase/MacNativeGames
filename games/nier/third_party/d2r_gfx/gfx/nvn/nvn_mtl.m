@@ -4359,13 +4359,10 @@ static void mfx_snapshot_scene(void) {
 }
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
-static void cv_flush(void);   /* deferred format-converting copies (see copy_t2t_convert) */
 static int rt_none(void); static void noatt_dims(NSUInteger *w, NSUInteger *h);
 static int g_rpb_why;   // pass dumps: why the last rp_begin_ex gave no encoder (1 no targets set, 2 no Metal attachment, 3 encoder creation)
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (g_enc) return g_enc;
-    cv_flush();   /* NieR: converting copies are parked and run here, where no render pass is open (a compute dispatch inside
-                     an open pass broke the encoder bookkeeping and corrupted guest-backed textures) */
     g_rpb_why = 0;
     chunk_maybe_split();
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
@@ -10538,87 +10535,85 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 
 /* NieR: NVN allows texture->texture copies between different formats (the game composites an RG11B10Float HDR scene into
-   an RGBA8Unorm window). Metal cannot copy across formats, so convert with a compute kernel; the window swapchain is
-   render-target only, so when the destination is not shader-writable the kernel writes a scratch texture that is then
-   copied in. Layouts/levels are taken from the copy descriptor. */
-static const char *k_cv_src =
-    "#include <metal_stdlib>\nusing namespace metal;\n"
-    "kernel void cv(texture2d<float> src[[texture(0)]], texture2d<float, access::write> dst[[texture(1)]], constant uint4 *p[[buffer(0)]], uint2 g[[thread_position_in_grid]]) {\n"
-    "  uint2 s = g + p[0].xy; uint2 d = g + p[0].zw;\n"
-    "  if (s.x >= (uint)src.get_width() || s.y >= (uint)src.get_height()) return;\n"
-    "  if (d.x >= (uint)dst.get_width() || d.y >= (uint)dst.get_height()) return;\n"
-    "  float4 v = src.read(s, 0); dst.write(v, d);\n}\n";
+   an RGBA8Unorm window). Metal cannot copy across formats. The repair plan (docs/repair-plan.md P0) first parked these
+   copies behind a compute kernel flushed at the next render pass; with real GPU submission the dispatch trapped at the
+   first flush (SIGTRAP, system-library pc) and the window stayed black whenever the convert was off — this composite is
+   the only present path. The compute route is retired: like present_encode_m4, a render pass on the shared MTL4 command
+   buffer draws a full-screen triangle that samples the source and writes the destination directly (usage 5 =
+   shaderRead|renderTarget), so the copy keeps its place in the game's command order and no compute encoder is opened.
+   The fragment sampler is constexpr (no sampler table slot; g_ft carries none) and the texture goes into the shared
+   fragment table's free texture slot 0 before the pass (argument-buffer-ABI shaders only read their own argument
+   buffers, so the slot stays free for this purpose; rs_sync first keeps the encode thread from touching tables
+   concurrently). Full-size level-0 copies only, same as the old kernel gate. */
 void nvn_cv_dump_request(void) { }   /* diagnostic hook kept for the runtime input command */
-static int cv_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("NIER_T2T_CONVERT"); v = e && e[0] == '1'; } return v; }   /* off by default: the compute copy traps once GPU submission is real (see docs/repair-plan.md P0) */
-static id<MTLComputePipelineState> cv_pso(void) {
-    static id<MTLComputePipelineState> ps; static int tried;
-    if (!tried) { tried = 1; NSError *e = nil; id<MTLLibrary> lib = totk_msl_library(@(k_cv_src), &e);
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"cv"] : nil;
-        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
-        if (!ps) MLOG("【红】换格式贴图拷贝：内核编译失败：%s", e.localizedDescription.UTF8String); }
-    return ps;
-}
-static id<MTLTexture> cv_scratch(MTLPixelFormat f, NSUInteger w, NSUInteger h) {
-    /* three rotating scratch textures: the window composite is written every frame and the previous one may still be in
-       flight when the next convert starts, so a single scratch would be overwritten under it. */
-    static id<MTLTexture> t[4][3]; static MTLPixelFormat tf[4]; static NSUInteger tw[4], th[4]; static int n, rot;
-    int idx = -1;
-    for (int i = 0; i < n; i++) if (tf[i] == f && tw[i] == w && th[i] == h) idx = i;
-    if (idx < 0) { if (n >= 4) return nil; idx = n++; tf[idx] = f; tw[idx] = w; th[idx] = h; }
-    int k = rot++ % 3;
-    if (!t[idx][k]) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate;
-        id<MTLTexture> x = [g_dev newTextureWithDescriptor:td]; if (!x) return nil;
-        res_add(x); t[idx][k] = x;
-        MLOG("换格式贴图拷贝：建了 %lux%lu 格式 %lu 的暂存贴图（轮换 %d 张；目标不可着色器写）", (unsigned long)w, (unsigned long)h, (unsigned long)f, 3);
+static int cv_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("NIER_T2T_CONVERT"); v = e && e[0] == '1'; } return v; }   /* off by default until the window path is proven on real submission (docs/repair-plan.md P0) */
+static id<MTLRenderPipelineState> cv_pso(MTLPixelFormat dst_fmt) {
+    static id<MTLRenderPipelineState> ps[2]; static MTLPixelFormat f[2]; static int n;
+    static const char *k_cv_msl =
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct CVV { float4 p [[position]]; float2 uv; };\n"
+        "vertex CVV cvv(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); CVV o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
+        "fragment float4 cvf(CVV in [[stage_in]], texture2d<float> src [[texture(0)]]) { constexpr sampler s(filter::linear); return src.sample(s, in.uv); }\n";
+    static id<MTLLibrary> lib; static id<MTLFunction> vf, ff; static int failed;
+    if (!lib && !failed) {
+        NSError *e = nil;
+        lib = totk_msl_library(@(k_cv_msl), &e);
+        vf = lib ? [lib newFunctionWithName:@"cvv"] : nil;
+        ff = lib ? [lib newFunctionWithName:@"cvf"] : nil;
+        if (!vf || !ff) { failed = 1; MLOG("【红】换格式贴图拷贝：合成着色器建不出 %s", e.localizedDescription.UTF8String); }
     }
-    return t[idx][k];
+    if (failed) return nil;
+    int i = -1;
+    for (int k = 0; k < n; k++) if (f[k] == dst_fmt) i = k;
+    if (i < 0) {
+        if (n >= 2) { RED_ONCE(48, "换格式贴图拷贝：目标格式超过两种（%lu）", (unsigned long)dst_fmt); return nil; }
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = vf; pd.fragmentFunction = ff;
+        pd.colorAttachments[0].pixelFormat = dst_fmt;
+        NSError *e = nil;
+        id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!p) { failed = 1; MLOG("【红】换格式贴图拷贝：合成管线建不出（目标格式 %lu）：%s", (unsigned long)dst_fmt, e.localizedDescription.UTF8String); return nil; }
+        f[n] = dst_fmt; ps[n] = p; i = n++;
+        MLOG("换格式贴图拷贝：渲染合成管线就绪（目标格式 %lu）", (unsigned long)dst_fmt);
+    }
+    return ps[i];
 }
-typedef struct { __unsafe_unretained id<MTLTexture> s, d; unsigned dl; int sx, sy, dx, dy, w, h; } cv_pend;
-static cv_pend g_cvp[16]; static int g_cvn;
+static void cv_composite(id<MTLTexture> s, id<MTLTexture> d, unsigned dl) {
+    id<MTLRenderPipelineState> ps = cv_pso(d.pixelFormat);
+    if (!ps) return;
+    rp_end();   // no render pass may be open on g_cb; rp_end can open its own copy encoder (write-backs)
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    rs_sync();   // encode-thread mode: tables are only safe to touch once B has drained
+    [g_ft setTexture:s.gpuResourceID atIndex:0];
+    NSUInteger w = (NSUInteger)d.width >> dl, h = (NSUInteger)d.height >> dl;
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = d;
+    rp.colorAttachments[0].level = dl;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.renderTargetWidth = w; rp.renderTargetHeight = h;
+    id<MTL4RenderCommandEncoder> re = enc_r_begin(rp);
+    if (!re) { MLOG("【红】换格式贴图拷贝：合成渲染编码器建不出"); return; }
+    enc_r_pso(re, ps);
+    enc_r_viewport(re, (MTLViewport){0, 0, (double)w, (double)h, 0, 1});
+    enc_r_scissor(re, (MTLScissorRect){0, 0, w, h});
+    enc_r_draw(re, MTLPrimitiveTypeTriangle, 0, 3);
+    enc_r_end(re);
+    args_dirty_all();   // the game's draws continue on the shared fragment table right after this
+}
 static int copy_t2t_convert(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned sz, unsigned dl, unsigned dz,
                             int sx, int sy, int dx, int dy, int w, int h) {
-    (void)sl; (void)sz; (void)dz;
+    (void)sz; (void)dz;
     /* Never touch block-compressed textures here: with TOTK_GPU_BLOCKRT the layer renders into an uncompressed auxiliary
-       texture and writes it back with a blit; a compute pass over the compressed base (or over the aux view) runs outside
-       that bookkeeping and corrupted guest memory. */
+       texture and writes it back with a blit; a composite over the compressed base (or the aux view) runs outside that
+       bookkeeping and corrupted guest memory. (BLOCKRT is off for NieR anyway.) */
     if (pf_block_compressed(s.pixelFormat) || pf_block_compressed(d.pixelFormat)) return 0;
-    if (g_cvn >= 16) return 0;
-    g_cvp[g_cvn++] = (cv_pend){ s, d, dl, sx, sy, dx, dy, w, h };
-    static int once; if (!once++) MLOG("换格式拷贝 %dx%d 格式 %lu→%lu 偏移 %d,%d→%d,%d（排到下一个通道之前执行）", w, h,
+    /* Render composite needs the destination as a render target and the source as a sampled texture. */
+    if (!(d.usage & MTLTextureUsageRenderTarget)) return 0;
+    cv_composite(s, d, dl);
+    static int once; if (!once++) MLOG("换格式拷贝 %dx%d 格式 %lu→%lu 偏移 %d,%d→%d,%d（渲染合成，按游戏下发顺序立即执行）", w, h,
         (unsigned long)s.pixelFormat, (unsigned long)d.pixelFormat, sx, sy, dx, dy);
     return 1;
-}
-static void cv_flush(void) {
-    if (!g_cvn) return;
-    int n = g_cvn; g_cvn = 0;
-    id<MTLComputePipelineState> ps = cv_pso();
-    static id<MTL4ArgumentTable> cv_at;
-    if (!ps) return;
-    if (!cv_at) { NSError *e = nil; MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 2;
-        cv_at = [g_dev newArgumentTableWithDescriptor:ad error:&e]; if (!cv_at) return; }
-    for (int i = 0; i < n; i++) {
-        cv_pend *q = &g_cvp[i];
-        int direct = (q->d.usage & MTLTextureUsageShaderWrite) != 0;
-        id<MTLTexture> out = direct ? q->d : cv_scratch(q->d.pixelFormat, (NSUInteger)(q->dx + q->w), (NSUInteger)(q->dy + q->h));
-        if (!out) continue;
-        /* Persistent 16-byte parameter buffer: an arena allocation can be recycled later in the same frame while the GPU
-           is still reading it, which corrupted guest memory through this layer's direct guest mappings. */
-        static id<MTLBuffer> g_cvb;
-        if (!g_cvb) { g_cvb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (!g_cvb) continue; res_add(g_cvb); }
-        uint32_t *pp = (uint32_t *)g_cvb.contents;
-        pp[0] = (uint32_t)q->sx; pp[1] = (uint32_t)q->sy; pp[2] = (uint32_t)q->dx; pp[3] = (uint32_t)q->dy;
-        id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
-        [ce setArgumentTable:cv_at]; [ce setComputePipelineState:ps];
-        [cv_at setTexture:q->s.gpuResourceID atIndex:0]; [cv_at setTexture:out.gpuResourceID atIndex:1]; [cv_at setAddress:g_cvb.gpuAddress atIndex:0];
-        [ce dispatchThreadgroups:MTLSizeMake(((NSUInteger)q->w + 7) / 8, ((NSUInteger)q->h + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        if (!direct) {
-            id b = blit();
-            [b barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
-            enc_b_copy_texture(b, out, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake((NSUInteger)q->w, (NSUInteger)q->h, 1), q->d, 0, q->dl, MTLOriginMake(q->dx, q->dy, 0));
-        }
-    }
 }
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");

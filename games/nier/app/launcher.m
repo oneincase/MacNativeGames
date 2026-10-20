@@ -44,9 +44,12 @@ static NSString *work_folder(void) {
     [NSFileManager.defaultManager createDirectoryAtPath:logs withIntermediateDirectories:YES attributes:nil error:nil];
     [NSFileManager.defaultManager createDirectoryAtPath:profile withIntermediateDirectories:YES attributes:nil error:nil];
 
-    /* The GPU switches and the mid-pass clear path the port was tested with (the runtime also defaults the latter). */
+    /* The GPU switches and the mid-pass clear path the port was tested with (the runtime also defaults the latter).
+       NIER_T2T_CONVERT: P0 (docs/repair-plan.md) — the HDR→window format-converting copy is the only present channel;
+       it runs as an immediate render-pass composite now, proven under real GPU submission. */
     setenv("TOTK_GPU_ALLOW_SUBMIT", "1", 1);
     setenv("TOTK_GPU_MIDCLEAR", "1", 1);
+    setenv("NIER_T2T_CONVERT", "1", 1);
     setenv("TOTK_GPU_BUDGET_MB", "5000", 1);
     setenv("DM_PRESENT_LINK_FALLBACK", "1", 1);
     setenv("TOTK_SLOT_OWNER", "user", 1);
