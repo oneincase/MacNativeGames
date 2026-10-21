@@ -76,10 +76,13 @@
 1. **与 GS 无关**：`NIER_GS_COMPACT=1` 前后、`NIER_GS_FORCE=900` 强制计数、完全不开 GS 三条路都出现同一白块；`NIER_GS_COMPACT=0` 与 `=1` 的标题截图逐像素差异只有 2.1%，白块位置不变。原计划把 P4 归因于 `NIER_KEEP_GS_DRAWS=1` 的放大三角形不成立。
 2. **不是移植的泛光 1/4 叠加**：`DM_NVN_BLOOM_Q=0`（关掉移植自己的泛光捷径、走游戏原链）白块一模一样。
 3. **不是 alpha test / logic op 那批绘制**：新增诊断 `NIER_LOG_ALPHATEST` 显示命中 `logic=3 afunc=5` 的绘制全是 4 顶点全屏四边形（`fs=f7dfe9e1…-1178a6955197_b`，`blend=15` 已开），不是文字批次，且只影响 1920x1080 全屏后处理。
+4. **不是 alpha test 缺席**（2026-10-21 晚，已把 alpha test 真正实现掉，提交 `8e77128`）：实现前后各抓一帧标题画面，白块位置与形状完全一致；alpha test 的参考值实测为 0、函数为 `GREATER`，标题文字此前是整片四边形着色（现在是 `alpha > 0` 才保留，`Press Any Button` 等掩码恢复正常），白块不受影响。
+5. **不是被跳过的三个 alpha-test 片元着色器**：`DM_NVN_SKIP_FS=c0ed2509…`、`=38576bae…,f7dfe9e1…` 两轮把可疑批次整批丢掉，白块仍在（只少了对应文字/描边）。
 
 **下一步（按证据推进，不要再猜）**
 1. 用 `TOTK_GPU_HILITE1=<fs key>` 逐个替换可疑片元着色器为纯色，定位真正画白块的批次；先用 `DM_NVN_PASSDUMP_ALL` 抓一帧标题画面的完整 `d` 行（vs/fs key + blend + cmask），按 pass 顺序取最后几个 UI 通道。
-2. 白块内的方块尺寸与「字体图集被按低层 mip / 错误行距采样」吻合，优先查该批次的纹理：`TOTK_TEX_CHECK_ONCE`、纹理 serial 与 format、以及 sampler 的 `mag/min`（`DM_NVN_PASSDUMP` 的 `B … samp` 行）。
+2. 白块是**整块矩形**、里面有字形轮廓，形状与「文字绘制的四边形被涂成纯白、字形来自上层另一遍绘制」一致：优先假设某个文字批次的片元输出 alpha 被写成 1（顶点色 / 图集 alpha 通道没进着色器）。定位手段：`NIER_LOG_KEYS=1` 列出该帧全部 (片元键, 顶点数)，再用 `TOTK_GPU_HILITE1` 一次染 4 个键看哪一组盖住白块区域；锁定后看该片元着色器的输入（顶点色属性、图集格式）与 `ps slot` 的纹理格式。
+   另一条并行假设：字体图集被采样到低层 mip（整块取平均 → 白）。`NIER_FORCE_LOD0`（新增诊断，强制 `lodMaxClamp = 0`）一跑就能排除。
 3. 若确认是某张贴图内容没上传（采样到白）：查 `tex_mtl()` 的上传条件与该贴图的 `has_layout`/`mem`。
 
 **验收**：标题 logo 完整、无白块。

@@ -5525,6 +5525,8 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
         if (d.rAddressMode == MTLSamplerAddressModeClampToBorderColor) d.rAddressMode = MTLSamplerAddressModeClampToEdge;
     }
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
+    /* TOTK diagnostic NIER_FORCE_LOD0=1: 所有采样只取第 0 级 mip——用来区分「贴图被采到低层 mip（整块取平均）」这类缺陷 */
+    { static int lod0 = -1; if (lod0 < 0) lod0 = getenv("NIER_FORCE_LOD0") != NULL; if (lod0) { d.lodMinClamp = 0; d.lodMaxClamp = 0; } }
     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     d.borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack) : MTLSamplerBorderColorTransparentBlack;
