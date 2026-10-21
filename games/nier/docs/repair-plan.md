@@ -112,7 +112,7 @@
 
 | 里程碑 | 内容 | 判定 |
 |---|---|---|
-| M1 | P0+P1 | 转换默认开、App ×10 无 fault、标题/序章画面恢复 |
+| M1 | P0+P1 | **已达成 2026-10-21**：转换默认开（launcher 设 `NIER_T2T_CONVERT=1`）、`stability.sh 10 13` 全 0 fault、标题/序章/菜单画面恢复（截图 `docs/screens/07-composite-boot.png`、`/tmp/nier-shots/noforce1200.png`） |
 | M2 | P2 | `count=0` <1%、飞行场景无缺口 |
 | M3 | P3+P4 | 无接缝、无白块 |
 | M4 | P5 | 有声 |
