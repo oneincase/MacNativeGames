@@ -298,7 +298,13 @@ static int h_configure(void *obj, void *format) {
 }
 static int h_register_events(void *obj, void *events) {
     Movie *m = find(obj); if (!m) return ((md_fn)G.orig[MOVIE_REGISTER_EVENTS])(obj, events);
-    m->events = events; return ST_OK;
+    m->events = events;
+    { static int on = -1; if (on < 0) on = getenv("NIER_MOVIE_LOG") != NULL;
+      if (on) { uint64_t *ev = (uint64_t *)events;
+          LOG("register events obj=%p ev=%#llx,%#llx,%#llx,%#llx", obj,
+              ev ? (unsigned long long)ev[0] : 0, ev ? (unsigned long long)ev[1] : 0,
+              ev ? (unsigned long long)ev[2] : 0, ev ? (unsigned long long)ev[3] : 0); } }
+    return ST_OK;
 }
 static void set_format(Movie *m, void *md) {
     G.md_set_string(md, "mime", "video/raw");

@@ -30,6 +30,8 @@ uint32_t runtime_audio_device_event(void);
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
+#include "mach_vm_compat.h"   /* W0 probe in case 0x18 walks the guest's MultiWait list (mach_vm_read_overwrite) */
+int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);   /* runtime/gfx_bridge.c: module+offset for a host-visible pointer */
 #include <pthread/qos.h>
 #include <dlfcn.h>
 
@@ -64,6 +66,7 @@ typedef struct thr {
     int preempt;               // a higher-priority thread waits for this thread's core
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
+    int s18_prev; int s18_valid;   // NIER_TRACE_SVC0: the last handle count this thread passed to svc 0x18 (W0 evidence)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
 } thr_t;
@@ -502,6 +505,12 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x45: {  // CreateEvent(→w1 写端, w2 读端) | CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
         pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+        { static int on = -1; static unsigned n;   /* W0: does the movie's event get created at all? n==0 with a
+               non-empty holder list means GetSyncHandle answered false; if svc 0x45 never ran, a holder has no
+               kernel object to return and false is certain. Default off, capped. */
+          if (on < 0) on = getenv("NIER_TRACE_SVC0") != NULL;
+          if (on && ++n <= 8) { thr_t *ct = cur(); uint64_t htid = 0; if (ct && ct->pt) pthread_threadid_np(ct->pt, &htid);
+              fprintf(stderr, "[svc0] CreateEvent #%u th=%llu hw=%#x hr=%#x lr=%#llx\n", n, (unsigned long long)htid, hw, hr, (unsigned long long)regs[30]); } }
         regs[0] = 0; regs[1] = hw; regs[2] = hr; return 1;
     }
     case 0x11: case 0x12: case 0x17: {  // SignalEvent(写端) / ClearEvent(任一端) / ResetSignal(读端，未触发报错) | SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
@@ -527,6 +536,46 @@ int svc_thread(int num, uint64_t *regs) {
               fprintf(stderr, "[audiodev] the guest waits on the device-change event; signalling it (timeout %lld)\n", (long long)ns);
               runtime_event_signal(dev); break; } }
         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
+        {   /* W0 evidence (docs/plan-2026-10-22.md): NIER_TRACE_SVC0=1 logs every change of the handle count this
+               thread passes to WaitSynchronization, plus the previous wait's handles. Runs BEFORE the n==0 early
+               return below so the spin stays visible. Default off, capped lines. */
+            static int on = -1, lines; static unsigned n0_calls;
+            if (on < 0) on = getenv("NIER_TRACE_SVC0") != NULL;
+            if (on && n == 0 && (++n0_calls <= 6)) {   /* the spin's shape: lr = the SDK site, a0..a3 = the NE
+                   wrapper's args (a0 = a STACK out-index slot, sdk+0x348298 — not a MultiWait pointer, so no
+                   object dump here; the layout-free evidence is the initializer counters in game_patches.c:
+                   did InitializeEvent / InitializeMultiWaitHolder / LinkMultiWaitHolder run at all). */
+                uint64_t htid = 0; if (t->pt) pthread_threadid_np(t->pt, &htid);
+                fprintf(stderr, "[svc0] n==0 call #%u th=%llu nsvc=%llu lr=%#llx a0=%#llx a1=%#llx a2=%#llx a3=%#llx\n",
+                        n0_calls, (unsigned long long)htid, (unsigned long long)t->nsvc, (unsigned long long)regs[30],
+                        (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2],
+                        (unsigned long long)regs[3]);
+            }
+            if (on && lines < 64 && (n != t->s18_prev || !t->s18_valid)) {
+                uint64_t htid = 0; if (t->pt) pthread_threadid_np(t->pt, &htid);
+                fprintf(stderr, "[svc0] th=%llu n %d->%d hs=%#llx timeout=%lld prev_wh=%#x,%#x,%#x,%#x\n",
+                        (unsigned long long)htid, t->s18_valid ? t->s18_prev : -1, n,
+                        (unsigned long long)regs[1], (long long)ns,
+                        t->wh[0], t->wh[1], t->wh[2], t->wh[3]);
+                t->s18_prev = n; t->s18_valid = 1; lines++;
+            }
+        }
+        if(n==0){   /* W1 (docs/plan-2026-10-22.md). c130: blocking an empty wh[] froze the movie event thread
+               forever (white screen). c136: this SDK's EventType is user-mode (InitializeEvent never runs svc
+               0x45; CreateEvent=0 is normal): the game's five holders ARE linked, but none carries a kernel
+               handle, so the SDK collects count=0 and re-waits with the MultiWait's infinite timeout — it polls
+               the MW's signalled-holder slot itself. Returning the error immediately made that a 5M/s spin that
+               hogged a virtual core and starved the decoder thread. Shape: sleep up to 1 ms (releasing the core),
+               then answer R_CANCELLED, which WaitSynchronizationNE maps to out index -2 (sdk+0x3482c8) — the
+               SDK's -2 path (sdk+0x342af0) checks front+0x10 and returns the holder if the decoder signalled one,
+               otherwise it re-collects and re-waits. R_TIMEOUT would map to -1 and make the SDK read handles[-1]
+               (a stale stack slot). The decoder signals the events through the guest's user-mode SignalEvent
+               (sdk+0x33e270: sets the event byte and writes every linked holder's MW front+0x10), so the 1 ms
+               poll is exactly what observes it. */
+            int64_t sl = ns < 0 ? 1000000 : ns > 1000000 ? 1000000 : ns;
+            if (sl > 0) { pthread_mutex_lock(&G); block(t, 4, sl); pthread_mutex_unlock(&G); }
+            regs[0]=R_CANCELLED; regs[1]=(uint64_t)-2; return 1;
+        }
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
         pthread_mutex_lock(&G);
         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];

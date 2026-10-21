@@ -47,6 +47,7 @@ void runtime_watch_set(uintptr_t addr,size_t len){
 }
 void runtime_watch_tick(uint64_t frame){
  { extern void nier_audio_state_tick(uint64_t) __attribute__((weak)); if(nier_audio_state_tick)nier_audio_state_tick(frame); }
+ { extern void nier_taskpool_tick(uint64_t) __attribute__((weak)); if(nier_taskpool_tick)nier_taskpool_tick(frame); }
  if(!watch_init){watch_init=1;const char *e=getenv("TOTK_WATCH_ADDR");if(e){uintptr_t a=(uintptr_t)strtoull(e,NULL,16);const char *l=getenv("TOTK_WATCH_LEN");runtime_watch_set(a,l?(size_t)strtoull(l,NULL,0):256);}const char *f=getenv("TOTK_WATCH_FRAME");if(f)watch_from=atol(f);watch_read=getenv("TOTK_WATCH_READ")!=NULL;}
  if(watch_lo&&(long)frame>=watch_from){ unsigned char cur[32];memcpy(cur,(const void *)watch_addr,32);
   if(!watch_snap_valid||memcmp(cur,watch_snap,32)){char b[256];size_t n=0;watch_hex(b,&n,"[watch] content at present frame=",frame);for(int i=0;i<32;i+=4){uint32_t w;memcpy(&w,cur+i,4);b[n++]=' ';for(int k=7;k>=0;k--)b[n++]="0123456789abcdef"[(w>>(k*4))&15];}b[n++]=10;write(2,b,n);memcpy(watch_snap,cur,32);watch_snap_valid=1;} }

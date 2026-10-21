@@ -1,3 +1,19 @@
+## 2026-10-22 W1 实施：白屏的线程挂起解除（svc 0x18 空句柄轮询化）+ W0/osinit 取证探针
+
+**实测链（c130→c138，同脚本只差开关）**
+- W0 判据（c130）：影片事件线程 `h=0x1025` 的**第一次** svc 0x18 就 `n==0`（`n -1->0`，不是中途掉句柄）→ 排除"上游丢 holder"的 H-B 原始形态。
+- W1a 第一版（c131/c132：`n==0` 立即返回错误）：线程不再冻结，但 `nsvc≈1.5 亿/30 s`（约 5M 次/秒）空转，霸住虚拟核（`core 0 owner 0x1025 for 11710 ms`），其余线程饿死 → 错误码方向对、节奏错。
+- osinit 计数（c136，`NIER_TRACE_SVC0` 下挂 `InitializeEvent`/`InitializeMultiWaitHolder(Event)`/`InitializeMultiWait`/`LinkMultiWaitHolder`/`WaitAny` 五个转发桩）：SDK 初始化链**完整跑过**——InitializeEvent ≥16 次、5 个 holder 全部 Link 进同一个 mw、WaitAny 在同一 mw 上反复进入。`CreateEvent`（svc 0x45）全程 0 次是**正常的**：这个 SDK 版本的 `EventType` 是纯用户态实现（`sdk+0x33e200 InitializeEvent` 只写对象字节、不调内核；`sdk+0x33e270 SignalEvent` 的唤醒 = 写事件字节 + 遍历 holder 写各自 MW 的 front+0x10，也全是内存写）。
+- 因此 `n==0` 的真实语义：这 5 个 holder 没有内核句柄可交（GetSyncHandle 返回 false），SDK 自己就是"count=0 + MW 无限超时"的**轮询等待者**，两次 WaitSynchronizationNE 之间检查 front+0x10。宿主立即返回错误 = 把轮询变成 5M/s 忙等。
+- **W1c（本版）**：`n==0` 时 `block(t,4,min(ns,1ms))` 睡最多 1 ms（让出虚拟核），再返回 `R_CANCELLED` + 下标 -2（`sdk+0x3482c8` 把 0xec01 映射成 -2；`sdk+0x342af0` 的 -2 路径检查 front+0x10，有 signal 就返回 holder，否则重新收集再等）。返回 -1（R_TIMEOUT）会让 SDK 读 `handles[-1]`（栈垃圾），已排除。
+- **实测（c137，30 s）**：轮询率 5M/s → **590/s**；`[负载] T 99% → 2%`，CPU P 38%→4%；**EOS 正常到达**（`end of stream after 74 frames`，c131/c132 里从未到过）；装载泵 `h=0x1027` 的 `nsvc 158 → 2133`（在推进，不再定格）。回归 `stability.sh 3 13` = `STABLE`。
+- **仍未解除**：画面仍是同一张静止近白（`c137_a.png` md5 与 c122 全同）。事件线程活着、EOS 已交付，但游戏不 `stop/configure` 第二部影片 —— 转入 W2：查 EOS 之后影片播放器状态机卡在哪一步（c138 已证明 4 个 DecoderEvents 指针注册到位：`register events obj=… ev=…eb8,…ee0,…f08,…f30`，与 InitializeEvent #13-16 逐一对应；宿主 fire() 有处可发）。
+
+**新增诊断（全部默认关、有上限）**：`NIER_TRACE_SVC0=1`：`[svc0]` svc 0x18 句柄数轨迹 + n==0 计数（含 lr/参数）、`[svc0] CreateEvent` 计数、`[taskpool]` 任务池状态（`game_patches.c:nier_taskpool_tick`，由 `runtime_watch_tick` 驱动）；`[osinit]` 五个 nn::os 初始化转发桩（`game_patches.c:nier_os_init_override`，接入 `runtime_override` 链）。`NIER_MOVIE_LOG=1` 增加 `register events` 行。
+
+**修正一条历史误判**：c132/c133 的"mw dump 显示 holder 链表非空/vptr=0"作废——svc 0x18 的 x0 是 `WaitSynchronizationNE` 的**栈上出参槽**（`sdk+0x348298 add x0,x29,#0x1c`），不是 MultiWait 指针，当时读的是栈垃圾。教训：探针先核对参数的真实含义再下结论。
+
+
 # 2026-10-22 白屏根因重估：不是渲染，是 guest 线程挂起（`svc 0x18` 等 0 个句柄 + `AcquireSemaphore` 等任务完成）
 
 本轮不改行为，只把"白屏"的病因从"影片池被填 0xFF"改判为"推进影片/装载状态机的线程根本没在跑"。执行方案迁到 `docs/plan-2026-10-22.md`。

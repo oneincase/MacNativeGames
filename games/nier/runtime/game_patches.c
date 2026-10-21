@@ -259,6 +259,84 @@ void nier_audio_state_tick(uint64_t frame) {
     fflush(stderr);
 }
 
+/* W0 evidence (docs/plan-2026-10-22.md): the ExecStartupShader pump (main+0x9a6234, caller main+0x58fe38) reads the
+   task pool through the relocated slot main+0x12c7df0 (R_AARCH64_RELATIVE, like every audstate slot): holder =
+   *(pool), task = *(holder+0x20), state = task[+0x28] — the pump sets 3 and waits on the semaphores task[+0x38]
+   (completion) and task[+0x68] (worker wake); the completion path sets 5 (main+0x9a6af8/0x9a6bc8 release +0x38).
+   "state stuck at 3" means the waiter is healthy and the completer is dead; a state that moves (or the pool
+   rotating through different task objects) means the task system is alive and the white screen has another cause.
+   Default off (NIER_TRACE_SVC0=1, same switch as the svc 0x18 trace so one run answers both), prints on change and
+   every 600 frames, capped. Reads through aud_peek: holder/task live on the guest heap. */
+void nier_taskpool_tick(uint64_t frame) {
+    static int on = -1, lines; static uint64_t last_sig;
+    if (on < 0) on = getenv("NIER_TRACE_SVC0") != NULL;
+    if (!on || lines >= 16) return;
+    const uint8_t *b = runtime_module_base("main"); if (!b) return;
+    uint64_t pool = 0; memcpy(&pool, b + 0x12c7df0, 8);
+    uint64_t holder = 0, task = 0; uint32_t state = 0, sem38 = 0, sem68 = 0;
+    int ok = pool && aud_peek(pool, &holder, 8);
+    if (ok) ok = holder && aud_peek(holder + 0x20, &task, 8);
+    if (ok) ok = task && aud_peek(task + 0x28, &state, 4) && aud_peek(task + 0x38, &sem38, 4) && aud_peek(task + 0x68, &sem68, 4);
+    uint64_t sig = pool ^ (holder << 1) ^ (task << 2) ^ ((uint64_t)state << 3) ^ ((uint64_t)sem38 << 12) ^ ((uint64_t)sem68 << 24);
+    if (frame % 600 && sig == last_sig) return;
+    last_sig = sig; lines++;
+    fprintf(stderr, "[taskpool] F=%llu pool=%#llx holder=%#llx task=%#llx state=%u sem38=%#x sem68=%#x ok=%d\n",
+            (unsigned long long)frame, (unsigned long long)pool, (unsigned long long)holder,
+            (unsigned long long)task, state, sem38, sem68, ok);
+    if (task && lines <= 6) {                       /* first sights: raw bytes covering both semaphores */
+        uint8_t tb[0x80];
+        if (aud_peek(task, tb, sizeof tb)) {
+            for (int row = 0; row < 0x80; row += 0x20) {
+                char line[256]; size_t o = 0;
+                o += snprintf(line + o, sizeof line - o, "[taskpool] task+%#04x:", row);
+                for (int i = 0; i < 0x20; i += 4) o += snprintf(line + o, sizeof line - o, " %08x", aud_r32(tb, row + i));
+                fprintf(stderr, "%s\n", line);
+            }
+        }
+    }
+    fflush(stderr);
+}
+
+/* W1b evidence (docs/plan-2026-10-22.md): the movie player's event thread waits (svc 0x18) with a handle list the
+   SDK collects as EMPTY (n==0, c130..c135), and the kernel event creator (svc 0x45 CreateEvent) never runs (c134).
+   The SDK builds a waitable holder in three steps: InitializeEvent -> InitializeMultiWaitHolder(holder, event) ->
+   LinkMultiWaitHolder(list, holder). Counting these (and nn::os::WaitAny) answers which step the player skips:
+   if InitializeEvent never runs for the movie's events, the holders carry no kernel object, GetSyncHandle returns
+   false, and n==0 is the guest's own bug path — not the host's. Each stub logs its first calls with the argument
+   pointers (the HLE wrapper puts the stub's lr inside the host thunk, so no guest lr here; correlate by object
+   pointer instead), forwards all eight argument registers and the return value, and resolves the guest target
+   lazily on first call. Default off: NIER_TRACE_SVC0=1. */
+typedef uint64_t (*os_fn8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static void *os_evt_orig, *os_mwh_orig, *os_mw_orig, *os_link_orig, *os_waitany_orig;
+static unsigned os_evt_n, os_mwh_n, os_mw_n, os_link_n, os_waitany_n;
+#define OS_COUNT_STUB(field, cnt, label, name, cap) \
+    static uint64_t field##_stub(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) { \
+        if (!field##_orig) field##_orig = runtime_symbol(name); \
+        if (!field##_orig) { fprintf(stderr, "[osinit] " label ": guest symbol missing\n"); return 0; } \
+        if (++cnt <= cap) fprintf(stderr, "[osinit] " label " #%u a0=%#llx a1=%#llx a2=%#llx\n", cnt, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2); \
+        return ((os_fn8)field##_orig)(a0, a1, a2, a3, a4, a5, a6, a7); \
+    }
+OS_COUNT_STUB(os_evt, os_evt_n, "InitializeEvent", "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE", 16)
+OS_COUNT_STUB(os_mwh, os_mwh_n, "InitializeMultiWaitHolder(Event)", "_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE", 16)
+OS_COUNT_STUB(os_mw, os_mw_n, "InitializeMultiWait", "_ZN2nn2os19InitializeMultiWaitEPNS0_13MultiWaitTypeE", 16)
+OS_COUNT_STUB(os_link, os_link_n, "LinkMultiWaitHolder", "_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE", 24)
+OS_COUNT_STUB(os_waitany, os_waitany_n, "WaitAny", "_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE", 8)
+
+void *nier_os_init_override(const char *name) {
+    static int on = -1;
+    if (on < 0) on = getenv("NIER_TRACE_SVC0") != NULL;
+    if (!on) return NULL;
+    struct { const char *name; void *stub; } e[] = {
+        {"_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE", (void *)os_evt_stub},
+        {"_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE", (void *)os_mwh_stub},
+        {"_ZN2nn2os19InitializeMultiWaitEPNS0_13MultiWaitTypeE", (void *)os_mw_stub},
+        {"_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE", (void *)os_link_stub},
+        {"_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE", (void *)os_waitany_stub},
+    };
+    for (size_t i = 0; i < sizeof e / sizeof e[0]; i++) if (!strcmp(name, e[i].name)) return e[i].stub;
+    return NULL;
+}
+
 /* The TotK host hooks the shared graphics layer and the input keys call keep their names and answer "off". */
 void runtime_frame_step_pin(double ms) { (void)ms; }
 void runtime_frame_step_update(uint64_t now_ns) { (void)now_ns; }
