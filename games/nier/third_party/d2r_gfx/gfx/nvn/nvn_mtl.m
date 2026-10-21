@@ -6277,7 +6277,7 @@ static id<MTLRenderPipelineState> gs_capture_pso(NvProg *pr) {
 }
 static const char k_gs_compact_msl[] =
     "#include <metal_stdlib>\nusing namespace metal;\n"
-    "struct Q { uint ntri, cap_base, itype, capn; };\n"
+    "struct Q { uint ntri, cap_base, itype, capn, lst_cap; };\n"
     "kernel void gs_compact(device float4 *cap [[buffer(0)]], device uint *cnt [[buffer(1)]], device uint *lst [[buffer(2)]],\n"
     "                        constant Q& q [[buffer(3)]], device uint *rep [[buffer(4)]], device uchar *idx [[buffer(5)]], uint t [[thread_position_in_grid]]) {\n"
     "  if (t >= q.ntri) return;\n"
@@ -6316,7 +6316,12 @@ static const char k_gs_compact_msl[] =
     "    }\n"
     "  }\n"
     "  if (!keep) return;\n"
-    "  uint i = atomic_fetch_add_explicit((device atomic_uint *)cnt, 3u, memory_order_relaxed);\n"
+    "  /* Bound the append by the byte window the host validated for the list: a recycled or never-initialised counter\n"
+    "     record can hold any value, and lst[4*i] would then be a wild address -- a GPU page fault in this port, because\n"
+    "     every binding is a raw address. Compare-exchange keeps cnt itself sane as well. */\n"
+    "  device atomic_uint *ac = (device atomic_uint *)cnt; uint i = atomic_load_explicit(ac, memory_order_relaxed);\n"
+    "  for (;;) { if (i > q.lst_cap - 3u) { if (rep) atomic_fetch_add_explicit((device atomic_uint *)rep + 3u, 1u, memory_order_relaxed); return; }\n"
+    "             if (atomic_compare_exchange_weak_explicit(ac, &i, i + 3u, memory_order_relaxed, memory_order_relaxed)) break; }\n"
     "  atomic_fetch_add_explicit((device atomic_uint *)rep, 3u, memory_order_relaxed);\n"
     "  lst[i] = as_type<uint>(a0c3.x);\n"
     "  lst[i + 1u] = as_type<uint>(a1c3.x);\n"
@@ -6333,7 +6338,7 @@ static id<MTLComputePipelineState> gs_compact_pso(void) {
 }
 /* Run capture for this draw and park the compaction; the parked work flushes outside any render pass (gs_compact_flush,
    called by copy_t2t / mtl_sub_commit, the same rhythm the old cv_flush kept). draw=900 -> 300 triangles per kernel. */
-typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; uint64_t a_cnt, a_lst; uint64_t a_idx, gpu_idx; uint32_t itype, capn; } gs_cpt;
+typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; uint64_t a_cnt, a_lst; uint64_t a_idx, gpu_idx; uint32_t itype, capn, idx_off, lst_cap; } gs_cpt;
 static gs_cpt g_gs_pend[8]; static int g_gs_pendn;
 static uint64_t g_gs_ring[256];   /* P2 diagnostic: counter records the last captures target */
 /* NieR P2: the consumer draw of a geometry-stage count. draw_resolve recognises the record, flushes the parked compaction so the
@@ -6356,7 +6361,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
        which is a GPU page fault in this port because every binding is a raw address). Capture through the same index
        buffer, with the base vertex folded into the address so the slot of a vertex stays its index value, and let the
        compaction kernel gather the three vertices of each triangle from that buffer. */
-    uint32_t itype = 0, capn_verts = vcount;
+    uint32_t itype = 0, capn_verts = vcount, idx_off = 0;
     uint64_t gpu_idx = 0, a_idx = 0; NSUInteger idx_len = 0;
     if (di) {
         if (di->itype == 0) { static int once; if (!once++) MLOG("[gs] 捕获跳过：8 位索引（count=%u）", vcount); return; }
@@ -6368,13 +6373,16 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
         NSUInteger blen = ((__bridge id<MTLBuffer>)mb).length;
         if (mo + bv * isz >= blen) return;
         const uint8_t *src = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo + bv * isz;
-        gpu_idx += (uint64_t)(bv * isz);
+        gpu_idx += (uint64_t)(bv * isz); idx_off = (uint32_t)(bv * isz);
         idx_len = blen - mo - bv * isz;
         itype = di->itype == 1 ? 1 : 2;
         uint32_t mx = 0;
         if (itype == 1) { const uint16_t *w = (const uint16_t *)src; for (uint32_t i = 0; i < vcount; i++) if (w[i] > mx) mx = w[i]; }
         else { const uint32_t *w = (const uint32_t *)src; for (uint32_t i = 0; i < vcount; i++) if (w[i] > mx) mx = w[i]; }
         capn_verts = mx + 1u;
+        /* The kernel gathers through this index buffer outside the draw call, so it has to be long enough for the indices
+           the draw names: a count past the buffer the game declared would be a read past the pool (raw addresses again). */
+        if (idx_len < (NSUInteger)vcount * isz) { static uint64_t once; if (once++ < 4) MLOG("【红】GS 捕获：索引缓冲区不够 %u 个索引（%lu 字节，已有 %lu 字节），跳过压缩", vcount, (unsigned long)((NSUInteger)vcount * isz), (unsigned long)idx_len); return; }
         a_idx = di->ibuf;
         if (capn_verts > 65536u) { static int once; if (!once++) MLOG("【红】GS 捕获：索引跨度 %u 过大（count=%u），跳过压缩", capn_verts, vcount); return; }
     }
@@ -6425,7 +6433,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     /* Park the compaction: the counter / list / parameter bindings of the draw, read now. */
     gs_cpt *q = &g_gs_pend[g_gs_pendn++];
     *q = (gs_cpt){ .capb = capb, .parb = nil, .vs = pr->sh[0],
-        .ntri = ntri, .cap_base = cap_base, .itype = itype, .capn = capn_verts, .a_idx = a_idx, .gpu_idx = gpu_idx };
+        .ntri = ntri, .cap_base = cap_base, .itype = itype, .capn = capn_verts, .a_idx = a_idx, .gpu_idx = gpu_idx, .idx_off = idx_off };
     uint64_t c0 = S.ssbo[2][0].addr;              // gp_s0: the GS counter word (same record the indirect draw reads)
     uint64_t lst = S.ssbo[2][2].addr;             // gp_s1: the compaction list the GS writes (measured 900 words / 3600 B)
     if (!c0 || !lst) { static int once; if (!once++) MLOG("【红】GS 捕获：计数/列表绑定缺失（ssbo2[0]=%#llx ssbo2[2]=%#llx）", (unsigned long long)c0, (unsigned long long)lst); g_gs_pendn--; return; }
@@ -6454,7 +6462,7 @@ void gs_compact_flush(void) {
        slot only until the frame that encoded it completes, so a 4096-slot ring (64 KB) leaves far more headroom than the
        2-3 frames in flight. */
     static id<MTLBuffer> g_parb; static unsigned g_parb_i;
-    if (!g_parb) { g_parb = [g_dev newBufferWithLength:16 * 4096 options:MTLResourceStorageModeShared]; if (!g_parb) return; res_add(g_parb); }
+    if (!g_parb) { g_parb = [g_dev newBufferWithLength:32 * 4096 options:MTLResourceStorageModeShared]; if (!g_parb) return; res_add(g_parb); }
     static uint64_t stale;
     for (int i = 0; i < n; i++) {
         gs_cpt *q = &g_gs_pend[i];
@@ -6467,15 +6475,24 @@ void gs_compact_flush(void) {
                 && mtl_gpu_addr(q->a_lst, (uint64_t)q->ntri * 12 + 16, &b2, &o2, &g2)
                 && b1 == q->mb_cnt && b2 == q->mb_lst;
           if (ok && q->itype) { void *b3 = NULL; uint64_t o3 = 0, g3 = 0;
-            ok = mtl_gpu_addr(q->gpu_idx, (uint64_t)q->ntri * 3 * (q->itype == 1 ? 2 : 4) + 16, &b3, &o3, &g3) && g3 == q->gpu_idx; }
+            ok = mtl_gpu_addr(q->a_idx, 1, &b3, &o3, &g3) && g3 + q->idx_off == q->gpu_idx; }
           if (!ok) { stale++; if (stale <= 8 || !(stale % 100)) MLOG("[gs] 压缩放弃：计数/列表地址在排布后失效（累计 %llu 次，帧内 %d 个排布）", (unsigned long long)stale, n); continue; }
-          q->gpu_cnt = g1; q->gpu_lst = g2; q->cnt_p = (uint32_t *)(void *)((uint8_t *)b1 + o1); }
+          q->gpu_cnt = g1; q->gpu_lst = g2; q->cnt_p = (uint32_t *)(void *)((uint8_t *)b1 + o1);
+          /* The list lives in a guest pool; every entry we append must stay inside it (the pool is the only extent the host
+             can prove mapped, and the consumer draw reads through the same raw address). */
+          { uint64_t bl = (uint64_t)((__bridge id<MTLBuffer>)b2).length; q->lst_cap = bl > o2 + 16 ? (uint32_t)((bl - o2 - 16) / 4) : 0u; } }
         { static int nok = -1; if (nok < 0) nok = getenv("NIER_GS_NOKERN") != NULL; if (nok) { continue; } }  // 诊断：跳过压缩内核，只留捕获+间接绘制
         id<MTLBuffer> parb = g_parb;
         unsigned slot = g_parb_i++ & 4095;
-        NSUInteger poff = (NSUInteger)slot * 16;
+        NSUInteger poff = (NSUInteger)slot * 32;
         uint32_t *pp = (uint32_t *)(void *)((uint8_t *)parb.contents + poff);   /* constant Q q */
-        pp[0] = q->ntri; pp[1] = q->cap_base; pp[2] = q->itype; pp[3] = q->capn;
+        if (!q->lst_cap) continue;
+        pp[0] = q->ntri; pp[1] = q->cap_base; pp[2] = q->itype; pp[3] = q->capn; pp[4] = q->lst_cap;   /* lst_cap: list entries left in the pool */
+        /* A garbage counter word only bounds what the kernel may *write*: it is not written back here. Writing the guest's
+           record from the host is not ours to do -- c35 (which reset super-pool counts to 0) crashed the guest at
+           main+0x9bbebc with fault=0xccfd28, i.e. a corrupted pointer read, so the reset is gone. */
+        if (q->cnt_p) { static uint64_t cn; uint32_t cv = *q->cnt_p;
+            if ((cv > q->lst_cap || (cv % 3u)) && (cn++ < 4 || !(cn % 200))) MLOG("【红】GS 压缩：计数记录可疑 %u（列表池余量 %u 条目，只限写不写回，累计 %llu 次）", cv, q->lst_cap, (unsigned long long)cn); }
         rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         rs_sync();
         { uint32_t *rp = (uint32_t *)repb.contents; rp[0] = 0; rp[1] = 0; }
@@ -6490,7 +6507,9 @@ void gs_compact_flush(void) {
         g_gs_prev_cnt = q->cnt_p;
         static int rep = -1; if (rep < 0) rep = getenv("NIER_GS_REPORT") != NULL;   // P2 measurement: what the kernel actually wrote, read after the submission completes
         if (rep && g_commit_blocks) { uint32_t *rp = (uint32_t *)repb.contents; [g_commit_blocks addObject:^{
-            static uint64_t n; uint32_t kept = rp[0], live = rp[1]; if (n++ < 10 || !(n % 600)) MLOG("[gs-rep] 保留顶点=%u 有坐标三角形=%u/%u（%llu 次）", kept, live, q->ntri, (unsigned long long)n); }]; }
+            static uint64_t n; uint32_t kept = rp[0], live = rp[1], ovf = rp[2];
+            uint32_t cntv = q->cnt_p ? *q->cnt_p : 0xffffffffu;
+            if (n++ < 24 || !(n % 600) || cntv > q->ntri * 3u + 64u) MLOG("[gs-rep] 保留顶点=%u 有坐标三角形=%u/%u 计数=%u 窗口=%u 越界=%u（%llu 次）", kept, live, q->ntri, cntv, q->ntri * 3u, ovf, (unsigned long long)n); }]; }
     }
 }
 /* Flush parked compactions and make their counter words CPU-visible: the game consumes a GS-written count through an
