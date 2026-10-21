@@ -1,3 +1,11 @@
+## 2026-10-22 音频复测（方案 §4 预言应验）：W1c 后 guest 混音不再恒 0 —— `mix peak 4660`
+
+- 假设（方案 §4）：混音恒 0 是白屏的下游（逻辑没进发声状态），W1c 修好后复测。
+- **实测（c146，45 s，`NIER_TRACE_AUDIO=1 NIER_AUDIO_MIXPROBE=1`）**：`[audio] mix peak 4660 max 4660 (buffer 1/2, frames 1024)` —— 与修复前的 `mix peak 0 max 0` 对照，**guest 混音器在输出真实 PCM**（峰值 4660/32767）。宿主链路保持健康：`AudioOut appended 2000 buffers`、`released: asks 10000 hits 2035 queue 4`（稳定 4 缓冲在环）、`AudioOut open` 1 次。
+- mixprobe 的 `poison=0 zero=2048` 行与 `mix peak` 行不矛盾：毒化实验检查的是"宿主写入的毒值有没有被 guest 覆盖"（guest 每周期全量重写 → poison=0 正常），`zero=2048` 是探针采样窗与混音写入的相位错位；`mix peak` 直接读混音缓冲，非零即真声音。
+- **M4 判定推进**：链路 + 混音数据都在了；"听感"只差人工确认（或音量/路由问题）。白屏的下游效应按预期解除。
+
+
 ## 2026-10-22 W1 后续取证（c143/c144）：宿主事件流正常，白屏收窄到 subsdk0 movie worker 卡条件变量
 
 - **480 s 长观察（c145，无导航）**：三张 `wshot`（120/300/480 s）md5 全同（`a8138bb2…`），worker `h=0x1026` 全程 `nsvc=2` 不动、装载泵 `h=0x1027` nsvc 42764 仍在推进但仍等 `task+0x38`、播放器 `h=0x1025` nsvc 376924 正常轮询。→ **白屏是硬阻塞，不是慢自愈**；根因锁定 movie worker 的条件变量永睡（等一个从未运行的生产者）。
@@ -574,5 +582,3 @@ keys and saves are never committed. Status lives in [docs/status-1.0.3.md](docs/
 - 门条件不变：仅 HDR 源→LDR 目标、整级 level-0、无偏移、非 3D、非压缩；块压缩目标直接回退（BLOCKRT 关闭下不会出现）。
 - 验证：`NIER_T2T_CONVERT=1` + `TOTK_GPU_ALLOW_SUBMIT=1` stability.sh 13 秒 ×3 与 100 秒实跑全干净（0 fault）；整窗截图 YoRHa 启动序列完整、序章云海/字幕正常（绿色调与场景缺口为 P2/P3 已知残留，与本改动无关）；不带转换的默认路径 13 秒 ×2 干净。
 - launcher 默认 `NIER_T2T_CONVERT=1`（`make app` 重打包生效）；`docs/screens/07-composite-boot.png` 为合成路径下的启动画面。
-
-
