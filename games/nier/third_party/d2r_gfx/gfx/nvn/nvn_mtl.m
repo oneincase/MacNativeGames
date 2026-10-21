@@ -703,8 +703,12 @@ void mtl_pool_del(const void *mem) {
         pidx_query_invalidate(&g_pool_queries);
         __unsafe_unretained id<MTLBuffer> buf = (__bridge id<MTLBuffer>)ent.buf;
         lo = ent.lo; hi = ent.hi; g_pool_bytes -= hi - lo;
-        if (ent.res) { res_remove(buf); g_pool_res_n--; g_pool_res_bytes -= hi - lo; }
-        [g_keep removeObjectIdenticalTo:buf];
+        /* Diagnostic (NIER_POOL_NODEL=1): keep the wrapper buffer alive and resident when the guest destroys the pool.
+           If a GPU page fault disappears with this on, the replay still had work queued that read that guest memory. */
+        { static int nod = -1; static unsigned kept; if (nod < 0) nod = getenv("NIER_POOL_NODEL") != NULL;
+          if (nod) { if (kept++ < 20) MLOG("[pool] 保留已销毁的池 %#llx+%llu KB（累计 %u 个）", (unsigned long long)lo, (unsigned long long)((hi - lo) >> 10), kept); }
+          else { if (ent.res) { res_remove(buf); g_pool_res_n--; g_pool_res_bytes -= hi - lo; }
+                 [g_keep removeObjectIdenticalTo:buf]; } }
     }
     pthread_mutex_unlock(&g_mu);
     if (hi > lo) stor_drop_range(lo, hi);   // TOTK: storage-shared textures of this pool
@@ -3683,6 +3687,45 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
 }
+/* TOTK 诊断（NIER_ALLOC_TRACE=1，默认关、封顶 300 行）：逐帧差分显卡已分配，并把它拆成三段——零拷贝 guest 池（mtl_pool_add 的
+   newBufferWithBytesNoCopy，`guest_pool_bytes()`）、已登记（走过 res_add 的，含延迟释放队列里还没 dealloc 的）、未登记
+   （= 总值 − 前两者：命令缓冲 / 分配器 / 流水线 / 参数表等从不经 res_add 的对象）。零拷贝池在预算判定里已被剔除，所以
+   「显卡已分配」单独看会误导；这里把三段和各段增量一起打出来，用来判定是一次性台阶还是逐帧平滑涨、涨在哪一段。
+   TOTK diagnostic (NIER_ALLOC_TRACE=1, off by default, capped at 300 lines): per-frame difference of GPU allocated, split into three
+   parts — zero-copy guest pools (mtl_pool_add's newBufferWithBytesNoCopy, `guest_pool_bytes()`), registered (went through res_add,
+   including deferred objects not yet deallocated), and unregistered (= total − the first two: command buffers, allocators, pipelines,
+   argument tables, which never pass res_add). The zero-copy pools are already excluded from the budget decision, so "GPU allocated"
+   alone misleads; printing the three parts and their deltas tells a one-off step apart from a smooth per-frame climb. */
+void mtl_alloc_stats(uint64_t *, uint64_t *, int *);
+static int g_alloc_trace_env = -1;
+void mtl_alloc_probe(unsigned long long frame) {
+    if (g_alloc_trace_env < 0) { const char *e = getenv("NIER_ALLOC_TRACE"); g_alloc_trace_env = e && *e && strcmp(e, "0"); }
+    if (!g_alloc_trace_env) return;
+    static int lines; static unsigned long long lc, lz, lr, lu, lf;
+    if (lines >= 300) return;
+    unsigned long long cur = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
+    unsigned long long zp = guest_pool_bytes() >> 20;
+    pthread_mutex_lock(&g_res_mu); unsigned long long reg = g_res_live_bytes >> 20; pthread_mutex_unlock(&g_res_mu);
+    /* 两处重叠必须扣掉：零拷贝池的大小已经在 zp 里；而「在驻留集里的池」同时也被 res_add 记进了 reg。
+       所以 未登记 = 总 − zp − (reg − 在集池)。不扣就会算出负数（早期版本把它钳成 0，掩盖了增长）。
+       Two overlaps must be removed: the zero-copy pools are already in zp, and the pools that are in the residency set were also
+       counted into reg by res_add, so unregistered = total − zp − (reg − in-set pools). Without this the subtraction goes
+       negative (an earlier version clamped it to 0 and hid the growth). */
+    uint64_t pv[4]; mtl_pool_res_stats(pv);
+    unsigned long long inres = pv[3] >> 20;
+    unsigned long long rego = reg > inres ? reg - inres : 0;
+    unsigned long long unr = cur > zp + rego ? cur - zp - rego : 0;
+    long long dc = (long long)cur - (long long)lc, dz = (long long)zp - (long long)lz;
+    long long dr = (long long)reg - (long long)lr, du = (long long)unr - (long long)lu;
+    if (lines && llabs(dc) < 8 && llabs(du) < 8 && frame - lf < 300) return;
+    lines++; lc = cur; lz = zp; lr = reg; lu = unr; lf = frame;
+    uint64_t aw, ag; int an; mtl_alloc_stats(&aw, &ag, &an);
+    pthread_mutex_lock(&g_deferred_mu); unsigned long nd = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+    MLOG("[alloc] 帧 %llu：显卡 %llu MB（%+lld）＝ 零拷贝池 %llu MB（%+lld）＋ 登记 %llu MB（%+lld）＋ 未登记 %llu MB（%+lld）| 分配器 %d 个（新建 %llu / 等待 %llu）| 池登记 %llu 个 %llu MB、在集 %llu 个 %llu MB | 延迟释放 %lu | 提交错误 %d，栅栏 已提 %llu / 已完成 %llu",
+         frame, cur, dc, zp, dz, reg, dr, unr, du, an, (unsigned long long)ag, (unsigned long long)aw,
+         (unsigned long long)pv[0], (unsigned long long)(pv[1] >> 20), (unsigned long long)pv[2], (unsigned long long)(pv[3] >> 20), nd,
+         atomic_load(&g_last_commit_error), (unsigned long long)g_fence, (unsigned long long)g_done);
+}
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
 void mtl_tex_release(tex_t *t) {
@@ -6234,19 +6277,32 @@ static id<MTLRenderPipelineState> gs_capture_pso(NvProg *pr) {
 }
 static const char k_gs_compact_msl[] =
     "#include <metal_stdlib>\nusing namespace metal;\n"
-    "struct Cap { float4 c2, c3, c4, p; };\n"
-    "kernel void gs_compact(device Cap *cap [[buffer(0)]], device uint *cnt [[buffer(1)]], device uint *lst [[buffer(2)]],\n"
-    "                        constant uint2& q [[buffer(3)]], device uint *rep [[buffer(4)]], uint t [[thread_position_in_grid]]) {\n"
-    "  if (t >= q.x) return;\n"
-    "  device Cap *b = cap + q.y + t * 3;\n"
-    "  Cap a0 = b[0], a1 = b[1], a2 = b[2];\n"
-    "  uint b0 = as_type<uint>(a0.c4.x), b1 = as_type<uint>(a1.c4.x), b2 = as_type<uint>(a2.c4.x);\n"
-    "  if (rep) { if ((as_type<uint>(a0.c2.x) | as_type<uint>(a0.c2.y) | as_type<uint>(a1.c2.x) | as_type<uint>(a1.c2.y)) != 0u) atomic_fetch_add_explicit((device atomic_uint *)rep + 1u, 1u, memory_order_relaxed); }\n"
+    "struct Q { uint ntri, cap_base, itype, capn; };\n"
+    "kernel void gs_compact(device float4 *cap [[buffer(0)]], device uint *cnt [[buffer(1)]], device uint *lst [[buffer(2)]],\n"
+    "                        constant Q& q [[buffer(3)]], device uint *rep [[buffer(4)]], device uchar *idx [[buffer(5)]], uint t [[thread_position_in_grid]]) {\n"
+    "  if (t >= q.ntri) return;\n"
+    "  /* The capture pass stores three float4 per *vertex* (locn2 / locn3 / locn4 at vid*4). For an indexed draw the\n"
+    "     vertices of triangle t are the ones the index buffer names, not t*3..t*3+2: gathering through the index buffer is\n"
+    "     what the real geometry stage sees, and it keeps the vertex fetch inside the bytes the game itself indexes. */\n"
+    "  uint f0, f1, f2;\n"
+    "  if (q.itype == 0u) { uint v = q.cap_base + t * 3u; f0 = v * 4u; f1 = f0 + 4u; f2 = f0 + 8u; }\n"
+    "  else {\n"
+    "    uint i0, i1, i2;\n"
+    "    if (q.itype == 1u) { device ushort *w = (device ushort *)(idx + (ulong)t * 6ul); i0 = w[0]; i1 = w[1]; i2 = w[2]; }\n"
+    "    else { device uint *w = (device uint *)(idx + (ulong)t * 12ul); i0 = w[0]; i1 = w[1]; i2 = w[2]; }\n"
+    "    if (i0 >= q.capn || i1 >= q.capn || i2 >= q.capn) { if (rep) atomic_fetch_add_explicit((device atomic_uint *)rep + 2u, 1u, memory_order_relaxed); return; }\n"
+    "    f0 = i0 * 4u; f1 = i1 * 4u; f2 = i2 * 4u;\n"
+    "  }\n"
+    "  float4 a0c2 = cap[f0], a0c3 = cap[f0 + 1u], a0c4 = cap[f0 + 2u];\n"
+    "  float4 a1c2 = cap[f1], a1c3 = cap[f1 + 1u], a1c4 = cap[f1 + 2u];\n"
+    "  float4 a2c2 = cap[f2], a2c3 = cap[f2 + 1u], a2c4 = cap[f2 + 2u];\n"
+    "  uint b0 = as_type<uint>(a0c4.x), b1 = as_type<uint>(a1c4.x), b2 = as_type<uint>(a2c4.x);\n"
+    "  if (rep) { if ((as_type<uint>(a0c2.x) | as_type<uint>(a0c2.y) | as_type<uint>(a1c2.x) | as_type<uint>(a1c2.y)) != 0u) atomic_fetch_add_explicit((device atomic_uint *)rep + 1u, 1u, memory_order_relaxed); }\n"
     "  bool keep;\n"
     "  if ((b0 & b1 & b2) != 0u) keep = false;                            /* any common set bit -> drop */\n"
     "  else if (((b0 | b1 | b2) & 64u) == 64u) keep = true;               /* bit 6 of all lanes -> keep */\n"
     "  else {\n"
-    "    float ax = a0.c2.x, ay = a0.c2.y, bx = a1.c2.x, by = a1.c2.y, cx = a2.c2.x, cy = a2.c2.y;\n"
+    "    float ax = a0c2.x, ay = a0c2.y, bx = a1c2.x, by = a1c2.y, cx = a2c2.x, cy = a2c2.y;\n"
     "    float w1 = (cx - ax) * (by - ay), w2 = (cy - ay) * (bx - ax);\n"
     "    keep = !(w2 >= w1);                                              /* the GS drops when w2 >= w1 */\n"
     "    if (keep) {\n"
@@ -6262,9 +6318,9 @@ static const char k_gs_compact_msl[] =
     "  if (!keep) return;\n"
     "  uint i = atomic_fetch_add_explicit((device atomic_uint *)cnt, 3u, memory_order_relaxed);\n"
     "  atomic_fetch_add_explicit((device atomic_uint *)rep, 3u, memory_order_relaxed);\n"
-    "  lst[i] = as_type<uint>(a0.c3.x);\n"
-    "  lst[i + 1u] = as_type<uint>(a1.c3.x);\n"
-    "  lst[i + 2u] = as_type<uint>(a2.c3.x);\n"
+    "  lst[i] = as_type<uint>(a0c3.x);\n"
+    "  lst[i + 1u] = as_type<uint>(a1c3.x);\n"
+    "  lst[i + 2u] = as_type<uint>(a2c3.x);\n"
     "}\n";
 static id<MTLComputePipelineState> gs_compact_pso(void) {
     static id<MTLComputePipelineState> ps; static int tried;
@@ -6277,7 +6333,7 @@ static id<MTLComputePipelineState> gs_compact_pso(void) {
 }
 /* Run capture for this draw and park the compaction; the parked work flushes outside any render pass (gs_compact_flush,
    called by copy_t2t / mtl_sub_commit, the same rhythm the old cv_flush kept). draw=900 -> 300 triangles per kernel. */
-typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; } gs_cpt;
+typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; uint64_t a_cnt, a_lst; uint64_t a_idx, gpu_idx; uint32_t itype, capn; } gs_cpt;
 static gs_cpt g_gs_pend[8]; static int g_gs_pendn;
 static uint64_t g_gs_ring[256];   /* P2 diagnostic: counter records the last captures target */
 /* NieR P2: the consumer draw of a geometry-stage count. draw_resolve recognises the record, flushes the parked compaction so the
@@ -6293,16 +6349,57 @@ void gs_compact_flush(void);   /* defined after copy_t2t */
    own render pass right before the real draw, so all game state is already bound. */
 static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (g_gs_pendn >= 8) return;
-    static int failed; if (failed) return;
-    static dispatch_once_t once;
-    static id<MTLRenderPipelineState> ps;
-    dispatch_once(&once, ^{ ps = gs_capture_pso(pr); if (!ps) failed = 1; });
-    if (!ps) return;
     uint32_t vcount = dw ? (uint32_t)dw->count : (uint32_t)di->count;
+    if (!vcount) return;
+    /* Indexed draws are the normal case here, and [[vertex_id]] is the *index value*, not the triangle ordinal: capturing
+       them as a plain sequential draw makes the vertex stage fetch vertices the game never names (past the vertex buffer,
+       which is a GPU page fault in this port because every binding is a raw address). Capture through the same index
+       buffer, with the base vertex folded into the address so the slot of a vertex stays its index value, and let the
+       compaction kernel gather the three vertices of each triangle from that buffer. */
+    uint32_t itype = 0, capn_verts = vcount;
+    uint64_t gpu_idx = 0, a_idx = 0; NSUInteger idx_len = 0;
+    if (di) {
+        if (di->itype == 0) { static int once; if (!once++) MLOG("[gs] 捕获跳过：8 位索引（count=%u）", vcount); return; }
+        if (di->base_vertex < 0) { static int once; if (!once++) MLOG("[gs] 捕获跳过：负 base_vertex %d（count=%u）", di->base_vertex, vcount); return; }
+        void *mb = NULL; uint64_t mo = 0;
+        if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu_idx)) return;
+        NSUInteger isz = di->itype == 1 ? 2 : 4;
+        NSUInteger bv = di->base_vertex > 0 ? (NSUInteger)di->base_vertex : 0;
+        NSUInteger blen = ((__bridge id<MTLBuffer>)mb).length;
+        if (mo + bv * isz >= blen) return;
+        const uint8_t *src = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo + bv * isz;
+        gpu_idx += (uint64_t)(bv * isz);
+        idx_len = blen - mo - bv * isz;
+        itype = di->itype == 1 ? 1 : 2;
+        uint32_t mx = 0;
+        if (itype == 1) { const uint16_t *w = (const uint16_t *)src; for (uint32_t i = 0; i < vcount; i++) if (w[i] > mx) mx = w[i]; }
+        else { const uint32_t *w = (const uint32_t *)src; for (uint32_t i = 0; i < vcount; i++) if (w[i] > mx) mx = w[i]; }
+        capn_verts = mx + 1u;
+        a_idx = di->ibuf;
+        if (capn_verts > 65536u) { static int once; if (!once++) MLOG("【红】GS 捕获：索引跨度 %u 过大（count=%u），跳过压缩", capn_verts, vcount); return; }
+    }
     uint32_t ntri = vcount / 3;
     if (!ntri) return;
-    /* One persistent capture buffer per program VS; 900 input vertices is the observed worst case, round to 4096. */
-    NSUInteger capn = ((NSUInteger)ntri * 3 + 4095) & ~4095ul;
+    /* The capture pipeline is per program *and* per pass: it carries the pass's attachment formats, and using one pass's
+       pipeline in another is a GPU page fault (silent: the raw-address bindings mean Metal cannot bounds-check anything).
+       Cache on the vertex program plus the current pass formats. */
+    static NSMutableDictionary<NSString *, id> *cap_psos;
+    if (!cap_psos) cap_psos = [NSMutableDictionary dictionary];
+    NSString *pk = [NSString stringWithFormat:@"%s|%08x%08x%08x%08x%08x%08x%08x%08x|%u|%u|%u", pr->sh[0]->key,
+        g_pass.cfmt[0], g_pass.cfmt[1], g_pass.cfmt[2], g_pass.cfmt[3], g_pass.cfmt[4], g_pass.cfmt[5], g_pass.cfmt[6], g_pass.cfmt[7],
+        (unsigned)g_pass.dfmt, (unsigned)g_pass.sfmt, (unsigned)g_pass.samples];
+    id ps = cap_psos[pk];
+    if (!ps) {
+        if (cap_psos.count >= 64) return;
+        ps = gs_capture_pso(pr); if (!ps) ps = (id)NSNull.null;
+        cap_psos[pk] = ps;
+        if (ps != (id)NSNull.null) MLOG("[gs] 捕获管线 %lu 条（vs=%.16s 颜色格式 %08x 深度 %u 模板 %u 样本 %u）", (unsigned long)cap_psos.count,
+            pr->sh[0]->key, g_pass.cfmt[0], (unsigned)g_pass.dfmt, (unsigned)g_pass.sfmt, (unsigned)g_pass.samples);
+    }
+    if (ps == (id)NSNull.null) return;
+    /* One persistent capture buffer per program VS. Sized so that every slot the draw can name fits: for an indexed draw
+       that is max(index)+1, for a sequential one the vertex count. */
+    NSUInteger capn = ((NSUInteger)capn_verts + 4095) & ~4095ul;
     static NSMutableDictionary<NSString *, id<MTLBuffer>> *bufs;
     if (!bufs) bufs = [NSMutableDictionary dictionary];
     NSString *bk = @(pr->sh[0]->key);
@@ -6313,6 +6410,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
         res_add(capb); bufs[bk] = capb;
         MLOG("[gs] 捕获缓冲 vs=%.16s %lu 顶点（%lu KB）", pr->sh[0]->key, (unsigned long)capn, (unsigned long)(capn * 64 >> 10));
     }
+    if (capn * 64 > capb.length) return;   // never encode a capture that would write past the buffer
     uint32_t cap_base = 0;   // one draw per pass; no overlap within a pass
     id<MTL4RenderCommandEncoder> en = rp_begin();
     if (!en) return;
@@ -6321,11 +6419,13 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     enc_r_vbuf(en, g_gs_cap_slot, capb.gpuAddress + (NSUInteger)cap_base * 64);
     enc_r_pso(en, ps);
-    enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, vcount);
+    if (itype) enc_r_draw_indexed(en, MTLPrimitiveTypeTriangle, vcount, itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu_idx, idx_len, 1, 0, 0);
+    else enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, vcount);
+    { static uint64_t ni, ii; if (di) ii++; else ni++; if (((ni + ii) & 2047) == 1) MLOG("[gs] 捕获绘制：非索引 %llu 次 / 索引 %llu 次（本帧顶点 %u）", (unsigned long long)ni, (unsigned long long)ii, vcount); }
     /* Park the compaction: the counter / list / parameter bindings of the draw, read now. */
     gs_cpt *q = &g_gs_pend[g_gs_pendn++];
     *q = (gs_cpt){ .capb = capb, .parb = nil, .vs = pr->sh[0],
-        .ntri = ntri, .cap_base = cap_base };
+        .ntri = ntri, .cap_base = cap_base, .itype = itype, .capn = capn_verts, .a_idx = a_idx, .gpu_idx = gpu_idx };
     uint64_t c0 = S.ssbo[2][0].addr;              // gp_s0: the GS counter word (same record the indirect draw reads)
     uint64_t lst = S.ssbo[2][2].addr;             // gp_s1: the compaction list the GS writes (measured 900 words / 3600 B)
     if (!c0 || !lst) { static int once; if (!once++) MLOG("【红】GS 捕获：计数/列表绑定缺失（ssbo2[0]=%#llx ssbo2[2]=%#llx）", (unsigned long long)c0, (unsigned long long)lst); g_gs_pendn--; return; }
@@ -6334,6 +6434,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     }
     q->gpu_cap = capb.gpuAddress;   /* the counter word is at offset 0 of the ssbo0 record (0x14 stride, one per draw) */
     q->cnt_p = (uint32_t *)(void *)((uint8_t *)q->mb_cnt + q->mo_cnt);
+    q->a_cnt = c0; q->a_lst = lst;
     { static int rn; g_gs_ring[rn++ & 255] = c0; }
 }
 /* Flush parked compactions: one compute dispatch each, outside any render pass (the copy_t2t / commit boundary). */
@@ -6344,7 +6445,7 @@ void gs_compact_flush(void) {
     id<MTLComputePipelineState> ps = gs_compact_pso();
     if (!ps) return;
     static id<MTL4ArgumentTable> at; static MTL4ArgumentTableDescriptor *ad; static id<MTLBuffer> repb;
-    if (!at) { ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 5; at = [g_dev newArgumentTableWithDescriptor:ad error:nil]; if (!at) return; }
+    if (!at) { ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 6; at = [g_dev newArgumentTableWithDescriptor:ad error:nil]; if (!at) return; }
     if (!repb) { repb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (!repb) return; res_add(repb); }
     /* The per-compaction 16 B argument buffer used to be a fresh `newBufferWithLength:` every flush, registered in the
        residency set and only unref'd later. Measured in the flight scene that turned into 4558 live registrations and a
@@ -6354,17 +6455,33 @@ void gs_compact_flush(void) {
        2-3 frames in flight. */
     static id<MTLBuffer> g_parb; static unsigned g_parb_i;
     if (!g_parb) { g_parb = [g_dev newBufferWithLength:16 * 4096 options:MTLResourceStorageModeShared]; if (!g_parb) return; res_add(g_parb); }
+    static uint64_t stale;
     for (int i = 0; i < n; i++) {
         gs_cpt *q = &g_gs_pend[i];
+        /* The guest thread runs ahead of the replay: between parking this compaction and the flush that encodes it the
+           game can destroy the memory pool the counter / list live in (scene load does exactly that). The parked GPU
+           addresses then name freed memory and the kernel's atomicAdd / list writes fault the GPU. Re-resolve both
+           addresses and drop the compaction if they no longer name the same live buffers. */
+        { void *b1 = NULL, *b2 = NULL; uint64_t o1 = 0, o2 = 0, g1 = 0, g2 = 0;
+          int ok = mtl_gpu_addr(q->a_cnt, 4, &b1, &o1, &g1)
+                && mtl_gpu_addr(q->a_lst, (uint64_t)q->ntri * 12 + 16, &b2, &o2, &g2)
+                && b1 == q->mb_cnt && b2 == q->mb_lst;
+          if (ok && q->itype) { void *b3 = NULL; uint64_t o3 = 0, g3 = 0;
+            ok = mtl_gpu_addr(q->gpu_idx, (uint64_t)q->ntri * 3 * (q->itype == 1 ? 2 : 4) + 16, &b3, &o3, &g3) && g3 == q->gpu_idx; }
+          if (!ok) { stale++; if (stale <= 8 || !(stale % 100)) MLOG("[gs] 压缩放弃：计数/列表地址在排布后失效（累计 %llu 次，帧内 %d 个排布）", (unsigned long long)stale, n); continue; }
+          q->gpu_cnt = g1; q->gpu_lst = g2; q->cnt_p = (uint32_t *)(void *)((uint8_t *)b1 + o1); }
+        { static int nok = -1; if (nok < 0) nok = getenv("NIER_GS_NOKERN") != NULL; if (nok) { continue; } }  // 诊断：跳过压缩内核，只留捕获+间接绘制
         id<MTLBuffer> parb = g_parb;
         unsigned slot = g_parb_i++ & 4095;
         NSUInteger poff = (NSUInteger)slot * 16;
-        uint32_t *pp = (uint32_t *)(void *)((uint8_t *)parb.contents + poff); pp[0] = q->ntri; pp[1] = q->cap_base;   /* constant uint2 q */
+        uint32_t *pp = (uint32_t *)(void *)((uint8_t *)parb.contents + poff);   /* constant Q q */
+        pp[0] = q->ntri; pp[1] = q->cap_base; pp[2] = q->itype; pp[3] = q->capn;
         rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         rs_sync();
         { uint32_t *rp = (uint32_t *)repb.contents; rp[0] = 0; rp[1] = 0; }
         [at setAddress:q->gpu_cap atIndex:0]; [at setAddress:q->gpu_cnt atIndex:1]; [at setAddress:q->gpu_lst atIndex:2]; [at setAddress:parb.gpuAddress + poff atIndex:3];
         [at setAddress:repb.gpuAddress atIndex:4];
+        [at setAddress:q->itype ? q->gpu_idx : repb.gpuAddress atIndex:5];
         id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
         [ce setArgumentTable:at]; enc_c_pso(ce, ps);
         enc_c_dispatch(ce, MTLSizeMake((q->ntri + 63) / 64, 1, 1), MTLSizeMake(64, 1, 1));
@@ -10110,6 +10227,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                    dw ? dw->count : di ? di->count : 0, dw ? dw->instances : di ? di->instances : 0, b); } } }
     { static int compact = -1; if (compact < 0) compact = gs_compact_on();   // NieR P2: replay the GS compaction for this draw instead of skipping it
       if (pr && (pr->missing & (1 << 2))) {
+          { static int dropidx = -1; if (dropidx < 0) dropidx = getenv("NIER_GS_DROPIDX") != NULL;   // 诊断：整笔丢弃带索引的压缩绘制
+            if (dropidx && di && !dw) { g_draw_skip[15]++; return; } }
           if (compact && !g_defer_replaying && !g_frz_state) { gs_capture_draw(pr, dw, di); }
           else { g_draw_skip[15]++; return; } } }
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
@@ -10548,6 +10667,7 @@ frz_plain:;
     } else {
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         if (ind.kind == 2 && di) {   /* NieR P2: indexCount/indexStart read by Metal from the record the kernel wrote */
+            { static int noind = -1; if (noind < 0) noind = getenv("NIER_GS_NOIND") != NULL; if (noind) { g_gs_ind_draws++; return; } }  // 诊断：不消费压缩结果
             use_rec("buf", di->ibuf, 2, 0, NULL); use_rec("buf", ind.args, 20, 0, NULL);
             enc_r_draw_indexed_indirect(en, mp, ind.type == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, ind.gpu, (NSUInteger)ind.len, ind.args);
             g_gs_ind_draws++;
