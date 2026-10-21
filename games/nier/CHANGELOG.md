@@ -1,3 +1,17 @@
+## 2026-10-22 — 音频 P0 第 2 步：guest 的 **Wwise 文件层已初始化成功**（Init.bnk + 3 个 .wai 全返回 0），缺的只是输出设备那一跳
+
+- 探针扩展（默认关，仍是 `NIER_AUDIO_STATE_PROBE=1`）：`runtime/game_patches.c` 的 `nier_audio_state_tick()` 多读一组 Wwise 静态 —— 缓冲指针槽 `main+0x12c6768`、四个注册结果指针槽 `0x12c6778/+0x6780/+0x6790/+0x6798`，打一行 `[audstate] wwise buf=… text="…" st=…,…,…,…`（同样只读、`mach_vm_read_overwrite` 取宿主/镜像外的目标，读不到不会崩）。
+- **c80 实测（40 s 到标题，帧 900，0 崩）**：`[audstate] wwise buf=0x10af71434 text="sound/Init.bnk" st=0,0,0,0`，`F=60` 与 `F=600` 两行完全一致 → **guest 的 Wwise 音库注册在启动早期就跑完且全部成功**。
+- 静态定位（本轮新增，偏移均相对 `main`）：
+  - `0x8c9870` 把 `sound/Init.bnk`（字符串 `0xf85fa8`）格式化进 `*(0x12c6768)` 的 0x200 缓冲（`0x9aca90`），再四次 `0x983b80(handle, 0, path, allocator, 0, 0)` 注册 `sound/Init.bnk` / `sound/WwiseInfo.wai`（`0xf90c3a`）/ `sound/WwiseStreamInfo.wai`（`0xfcf7b0`）/ `sound/WwiseVoiceInfo.wai`（`0xf9e826`），返回值写进 `*(0x12c6778/80/90/98)`；实测四个都是 0 = 成功。
+  - 唯一调用者 `0x58f814`，属 core 数据装载函数 `0x58f7ec`（同函数还 snprintf `core/core.dat`、`core/core.dtt`），再上一层 `0x58f75c`。→ 声音的文件层是随 **core 资源装载**一起初始化的，不依赖音频设备。
+  - 因此阻塞点收窄为**唯一一跳**：引擎对 `AudioOut::Initialize`（vtable `+0x98` = `0xd8c508`；open 在 `+0xc8` = `0xd8c548`）的派发。静态上 `0xd8c508`/`0xd8c548`/`0xd8c8b0`/`0xd8cc4c`/`0xd8ccc8`/`0xd8ccf4` 的 BL 调用者全为 0（只能经 vtable 派发），动态上 c73 的 vtable+0xc8 桩 0 次调用 → **guest 从不请求输出**，与文件层无关。
+- **工具修正（重要，之前白花时间）**：历史上三轮"adrp+add 字符串 xref"全 0 命中是**扫描器 bug** —— 掩码写成 `w & 0x9F00001F == 0x90000000`，把 Rd 位也纳入比较，于是所有 **Rd≠0 的 adrp 都被漏检**（编译器几乎总用 x8/x19 等）。改为 `(w & 0x9F000000) == 0x90000000` 后立刻在 `0x8c9888` 命中 `sound/Init.bnk` 的唯一引用。脚本留在 `/tmp/xref.py`（`imm` 模式 = adrp+add 取精确地址；`slot` 模式 = adrp+ldr 取指针槽）。
+- **P4 数据点（顺带）**：`logs/c801.png` 在 **40 s** 就复现标题副标题行白块；而且不止"两端"：`The End of YoRHa Edition` 行内有两段被白块吞掉、`Automata™` 右侧也有块状碎片 —— 形态更像"某张纹理的取用/步长错位"，不是纯矩形遮挡。这个 40 s 短跑脚本（`logs/c80.sh`，无导航、只 wshot 一张）可直接当 P4 的快速迭代夹具。
+- **c78（`hletrace 2` 宿主调用普查）的另一发现**：帧 2734 被**我们自己的 GPU 预算闸**中止 —— `FATAL 提交驻留集：显卡已分配 8418 MB（零拷贝 guest 池 1913 MB，实际 6505 MB）超过预算 6500 MB`，之前连续多帧 `ser=1388` 反复重传（累计 1539 张）、Metal 报 `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`。同一帧段（2730–2780）也是 c73/c74 SIGSEGV（`main+0x996d84`）的位置，而 c76/c77 能过 → **该帧段的不稳定是共性问题**（重传/提交压力），不是音频探针专属。普查本身：启动期宿主调用 228 项，`nn::codec::GetHardwareOpusDecoderWorkBufferSize` 在 **0.338 s** 就被调用（编解码层启动过），全程**没有任何 `nn::audio` AudioOut 条目**，与"输出设备初始化没走"一致。
+- 回归：`stability.sh 3 13` = `STABLE`（探针默认关）。
+- **下一手**：沿 `0x8c9870 ← 0x58f7ec ← 0x58f75c` 向上找 Wwise 引擎 `Init` 的入口，用同样的"读结果静态"手法钉死它停在哪一步返回；或给 vtable `+0x98`/`+0xa8` 加 SINK 式转发行桩、在桩里打 `x30`，直接抓到派发者。
+
 ## 2026-10-22 — 音频 P0：设备对象**建好了、ready=1**，卡在「open 输出」这一步没人调用（探针 + 修正上一条结论）
 
 - 新增诊断（默认关）`NIER_AUDIO_STATE_PROBE=1`：`runtime/game_patches.c` 的 `nier_audio_state_tick()` 由 `runtime/gfx_bridge.c` 的 `runtime_watch_tick()` 每帧驱动，每 60 帧读一次 guest 静态内存并打一行 `[audstate]`（值变化时打、每 600 帧再打一次证明活着，总行数封顶 64）；对象指针/门控字都顺着 `*(base+got)` 的 `R_AARCH64_RELATIVE` 重定位值取，不写 guest、不改文本。

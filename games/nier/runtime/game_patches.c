@@ -121,8 +121,25 @@ void nier_audio_state_tick(uint64_t frame) {
     if (aud_at(b, 0x12cd3e8, 0, 1, &off)) acq = b[off];
     if (aud_at(b, 0x12cc948, 0, 1, &off)) flag = b[off];
     if (aud_at(b, 0x12cd3f0, 0, 32, &off)) for (int i = 0; i < 4; i++) ev[i] = aud_r64(b, off + 8 * i);
+    /* Wwise sound-system boot. The function at main+0x8c9870 (only caller main+0x58f814) formats "<rom>/sound/Init.bnk"
+       plus the three index paths sound/WwiseInfo.wai, sound/WwiseStreamInfo.wai and sound/WwiseVoiceInfo.wai into the
+       scratch buffer whose address sits in the slot main+0x12c6768, then stores the result of each registration in the
+       dword behind slots main+0x12c6778/+0x6780/+0x6790/+0x6798. Reading that buffer answers "did the guest's sound
+       system ever start" without hooking guest code, and a non-zero registration result names the first failing file. */
+    char wtext[65] = {0}; uint64_t wbuf = 0; uint32_t st[4] = {0, 0, 0, 0};
+    memcpy(&wbuf, b + 0x12c6768, 8);               /* the slots hold plain pointers, not image offsets */
+    if (wbuf) {
+        aud_peek(wbuf, wtext, sizeof wtext - 1);
+        for (size_t i = 0; i < sizeof wtext; i++) if (wtext[i] && (wtext[i] < 0x20 || wtext[i] > 0x7e)) wtext[i] = '.';
+    }
+    static const uint64_t stslot[4] = {0x12c6778, 0x12c6780, 0x12c6790, 0x12c6798};
+    for (int i = 0; i < 4; i++) {
+        uint64_t p = 0; memcpy(&p, b + stslot[i], 8);
+        if (p) aud_peek(p, &st[i], 4);
+    }
     uint64_t fp = ((uint64_t)ch << 32) ^ ready ^ ((uint64_t)a7 << 8) ^ ((uint64_t)at2c << 12) ^ ((uint64_t)acq << 20)
-                ^ ((uint64_t)flag << 24) ^ ev[0] ^ ev[1] ^ ev[2] ^ ev[3] ^ obj ^ ((uint64_t)vo << 48);
+                ^ ((uint64_t)flag << 24) ^ ev[0] ^ ev[1] ^ ev[2] ^ ev[3] ^ obj ^ ((uint64_t)vo << 48)
+                ^ wbuf ^ st[0] ^ ((uint64_t)st[1] << 20) ^ ((uint64_t)st[2] << 40) ^ ((uint64_t)st[3] << 50);
     if (frame % 600 && fp == last_fp) return;      /* print on change, and once every 10 s to show liveness */
     last_fp = fp; lines++;
     fprintf(stderr, "[audstate] F=%llu obj=%#llx ok=%d vt=%#llx ch=%u ready=%u a7=%#x at2c=%#x acq=%u flag=%u "
@@ -130,6 +147,8 @@ void nier_audio_state_tick(uint64_t frame) {
             (unsigned long long)frame, (unsigned long long)obj, vo, (unsigned long long)vt, ch, ready, a7, at2c, acq,
             flag, (unsigned long long)ev[0], (unsigned long long)ev[1], (unsigned long long)ev[2],
             (unsigned long long)ev[3]);
+    fprintf(stderr, "[audstate] wwise buf=%#llx text=\"%s\" st=%#x,%#x,%#x,%#x\n", (unsigned long long)wbuf, wtext,
+            st[0], st[1], st[2], st[3]);
     if (vo && obj != last_obj) {                   /* first sight of an object (or a new one): full 0x110 bytes */
         last_obj = obj;
         for (int row = 0; row < 0x110; row += 0x20) {
