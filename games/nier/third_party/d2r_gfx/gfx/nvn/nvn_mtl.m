@@ -6295,7 +6295,7 @@ static id<MTLRenderPipelineState> gs_capture_pso(NvProg *pr) {
 }
 static const char k_gs_compact_msl[] =
     "#include <metal_stdlib>\nusing namespace metal;\n"
-    "struct Q { uint ntri, cap_base, itype, capn, lst_cap; };\n"
+    "struct Q { uint ntri, cap_base, itype, capn, lst_cap, bv; };\n"
     "kernel void gs_compact(device float4 *cap [[buffer(0)]], device uint *cnt [[buffer(1)]], device uint *lst [[buffer(2)]],\n"
     "                        constant Q& q [[buffer(3)]], device uint *rep [[buffer(4)]], device uchar *idx [[buffer(5)]], uint t [[thread_position_in_grid]]) {\n"
     "  if (t >= q.ntri) return;\n"
@@ -6306,8 +6306,8 @@ static const char k_gs_compact_msl[] =
     "  if (q.itype == 0u) { uint v = q.cap_base + t * 3u; f0 = v * 4u; f1 = f0 + 4u; f2 = f0 + 8u; }\n"
     "  else {\n"
     "    uint i0, i1, i2;\n"
-    "    if (q.itype == 1u) { device ushort *w = (device ushort *)(idx + (ulong)t * 6ul); i0 = w[0]; i1 = w[1]; i2 = w[2]; }\n"
-    "    else { device uint *w = (device uint *)(idx + (ulong)t * 12ul); i0 = w[0]; i1 = w[1]; i2 = w[2]; }\n"
+    "    if (q.itype == 1u) { device ushort *w = (device ushort *)(idx + (ulong)t * 6ul); i0 = w[0] + q.bv; i1 = w[1] + q.bv; i2 = w[2] + q.bv; }\n"
+    "    else { device uint *w = (device uint *)(idx + (ulong)t * 12ul); i0 = w[0] + q.bv; i1 = w[1] + q.bv; i2 = w[2] + q.bv; }\n"
     "    if (i0 >= q.capn || i1 >= q.capn || i2 >= q.capn) { if (rep) atomic_fetch_add_explicit((device atomic_uint *)rep + 2u, 1u, memory_order_relaxed); return; }\n"
     "    f0 = i0 * 4u; f1 = i1 * 4u; f2 = i2 * 4u;\n"
     "  }\n"
@@ -6356,7 +6356,7 @@ static id<MTLComputePipelineState> gs_compact_pso(void) {
 }
 /* Run capture for this draw and park the compaction; the parked work flushes outside any render pass (gs_compact_flush,
    called by copy_t2t / mtl_sub_commit, the same rhythm the old cv_flush kept). draw=900 -> 300 triangles per kernel. */
-typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; uint64_t a_cnt, a_lst; uint64_t a_idx, gpu_idx; uint32_t itype, capn, idx_off, lst_cap; } gs_cpt;
+typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; uint64_t a_cnt, a_lst; uint64_t a_idx, gpu_idx; uint32_t itype, capn, idx_off, lst_cap, bv; } gs_cpt;
 static gs_cpt g_gs_pend[8]; static int g_gs_pendn;
 static uint64_t g_gs_ring[256];   /* P2 diagnostic: counter records the last captures target */
 /* NieR P2: the consumer draw of a geometry-stage count. draw_resolve recognises the record, flushes the parked compaction so the
@@ -6379,7 +6379,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
        which is a GPU page fault in this port because every binding is a raw address). Capture through the same index
        buffer, with the base vertex folded into the address so the slot of a vertex stays its index value, and let the
        compaction kernel gather the three vertices of each triangle from that buffer. */
-    uint32_t itype = 0, capn_verts = vcount, idx_off = 0;
+    uint32_t itype = 0, capn_verts = vcount, idx_off = 0; NSUInteger bv = 0;
     uint64_t gpu_idx = 0, a_idx = 0; NSUInteger idx_len = 0;
     if (di) {
         if (di->itype == 0) { static int once; if (!once++) MLOG("[gs] 捕获跳过：8 位索引（count=%u）", vcount); return; }
@@ -6387,17 +6387,21 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
         void *mb = NULL; uint64_t mo = 0;
         if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu_idx)) return;
         NSUInteger isz = di->itype == 1 ? 2 : 4;
-        NSUInteger bv = di->base_vertex > 0 ? (NSUInteger)di->base_vertex : 0;
+        bv = di->base_vertex > 0 ? (NSUInteger)di->base_vertex : 0;
         NSUInteger blen = ((__bridge id<MTLBuffer>)mb).length;
         if (mo + bv * isz >= blen) return;
-        const uint8_t *src = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo + bv * isz;
-        gpu_idx += (uint64_t)(bv * isz); idx_off = (uint32_t)(bv * isz);
-        idx_len = blen - mo - bv * isz;
+        const uint8_t *src = (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo;
+        /* base vertex is a per-index addition, not a shift of the index source: shifting it reads other index entries and
+           makes the vertex fetch name (index) instead of (index + base vertex), i.e. addresses base_vertex*stride too low --
+           before the pool when the stream starts at its base, which is a GPU page fault. Keep the address and pass the base
+           vertex to the capture draw, exactly as the game's own draw does. */
+        idx_len = blen - mo; idx_off = 0;
         itype = di->itype == 1 ? 1 : 2;
         uint32_t mx = 0;
         if (itype == 1) { const uint16_t *w = (const uint16_t *)src; for (uint32_t i = 0; i < vcount; i++) if (w[i] > mx) mx = w[i]; }
         else { const uint32_t *w = (const uint32_t *)src; for (uint32_t i = 0; i < vcount; i++) if (w[i] > mx) mx = w[i]; }
-        capn_verts = mx + 1u;
+        capn_verts = mx + 1u + (uint32_t)bv;
+        if (bv) { static uint64_t nbv; if (nbv++ < 4 || !(nbv % 500)) MLOG("[gs] 捕获：base vertex %lu 的绘制（count=%u 槽 %u，累计 %llu 笔）", (unsigned long)bv, vcount, capn_verts, (unsigned long long)nbv); }
         /* The kernel gathers through this index buffer outside the draw call, so it has to be long enough for the indices
            the draw names: a count past the buffer the game declared would be a read past the pool (raw addresses again). */
         if (idx_len < (NSUInteger)vcount * isz) { static uint64_t once; if (once++ < 4) MLOG("【红】GS 捕获：索引缓冲区不够 %u 个索引（%lu 字节，已有 %lu 字节），跳过压缩", vcount, (unsigned long)((NSUInteger)vcount * isz), (unsigned long)idx_len); return; }
@@ -6449,7 +6453,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     enc_r_vbuf(en, g_gs_cap_slot, capb.gpuAddress + (NSUInteger)cap_base * 64);
     enc_r_pso(en, ps);
-    if (itype) enc_r_draw_indexed(en, MTLPrimitiveTypeTriangle, vcount, itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu_idx, idx_len, 1, 0, 0);
+    if (itype) enc_r_draw_indexed(en, MTLPrimitiveTypeTriangle, vcount, itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu_idx, idx_len, 1, (NSInteger)bv, 0);
     else enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, vcount);
     { static uint64_t ni, ii; if (di) ii++; else ni++; if (((ni + ii) & 2047) == 1) MLOG("[gs] 捕获绘制：非索引 %llu 次 / 索引 %llu 次（本帧顶点 %u）", (unsigned long long)ni, (unsigned long long)ii, vcount); }
     /* Park the compaction: the counter / list / parameter bindings of the draw, read now. */
@@ -6457,7 +6461,7 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     gs_bind_add(2, 0, capb.gpuAddress + (NSUInteger)cap_base * 64, (uint64_t)capn * 64);   /* 捕获缓冲：捕获 pass 写、内核读 */
     gs_cpt *q = &g_gs_pend[g_gs_pendn++];
     *q = (gs_cpt){ .capb = capb, .parb = nil, .vs = pr->sh[0],
-        .ntri = ntri, .cap_base = cap_base, .itype = itype, .capn = capn_verts, .a_idx = a_idx, .gpu_idx = gpu_idx, .idx_off = idx_off };
+        .ntri = ntri, .cap_base = cap_base, .itype = itype, .capn = capn_verts, .a_idx = a_idx, .gpu_idx = gpu_idx, .idx_off = idx_off, .bv = (uint32_t)bv };
     uint64_t c0 = S.ssbo[2][0].addr;              // gp_s0: the GS counter word (same record the indirect draw reads)
     uint64_t lst = S.ssbo[2][2].addr;             // gp_s1: the compaction list the GS writes (measured 900 words / 3600 B)
     if (!c0 || !lst) { static int once; if (!once++) MLOG("【红】GS 捕获：计数/列表绑定缺失（ssbo2[0]=%#llx ssbo2[2]=%#llx）", (unsigned long long)c0, (unsigned long long)lst); g_gs_pendn--; return; }
@@ -6511,7 +6515,7 @@ void gs_compact_flush(void) {
         NSUInteger poff = (NSUInteger)slot * 32;
         uint32_t *pp = (uint32_t *)(void *)((uint8_t *)parb.contents + poff);   /* constant Q q */
         if (!q->lst_cap) continue;
-        pp[0] = q->ntri; pp[1] = q->cap_base; pp[2] = q->itype; pp[3] = q->capn; pp[4] = q->lst_cap;   /* lst_cap: list entries left in the pool */
+        pp[0] = q->ntri; pp[1] = q->cap_base; pp[2] = q->itype; pp[3] = q->capn; pp[4] = q->lst_cap; pp[5] = q->bv;   /* lst_cap: list entries left in the pool */
         /* A garbage counter word only bounds what the kernel may *write*: it is not written back here. Writing the guest's
            record from the host is not ours to do -- c35 (which reset super-pool counts to 0) crashed the guest at
            main+0x9bbebc with fault=0xccfd28, i.e. a corrupted pointer read, so the reset is gone. */
@@ -10853,6 +10857,11 @@ static int draw_resolve(const op_hdr *h, void *rec, int indexed) {
     if (t.args && gs_compact_on() && !g_defer_replaying) {
         for (int r = 0; r < 256; r++) if (g_gs_ring[r] == t.args) {
             uint32_t cur = *(const uint32_t *)(uintptr_t)t.args;
+            /* A count this large cannot come from appended triangles (a world frame appends a few 10k). The record is guest
+               memory this port does not own, so a stale/garbage word there used to become the indirect draw's indexCount and
+               sent the GPU reading gigabytes past the list -- that is the intermittent page fault (c37: 2144566592).
+               Skipping the draw costs one pass of geometry; reading through it costs the whole queue. */
+            if (cur > 64u * 1024u * 1024u) { static uint64_t gn; if (gn++ < 4 || !(gn % 200)) MLOG("【红】GS 消费端：计数记录不可信 %u（跳过这笔间接绘制，累计 %llu 次）", cur, (unsigned long long)gn); return 0; }
             if (!cur) {
                 gs_compact_flush();
                 if (indexed) {
