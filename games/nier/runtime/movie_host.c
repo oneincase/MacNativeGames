@@ -206,6 +206,11 @@ static int decode_one(Movie *m, Signals *s, const Pending *p) {
                 int slot = free_out(m); if (slot < 0) runtime_fail("movie decoder: output slots counted wrong");
                 if (!m->format_sent) { m->format_sent = 1; if (negative() != 2) note(m, s, EV_FORMAT); }
                 to_nv12(img, m->out[slot], m->w, m->h);
+                if (m->frames < 3) {   /* first frames: is the plane we hand over actually picture, or an even fill? */
+                    const uint8_t *y = m->out[slot]; unsigned mn = 255, mx = 0; uint64_t sum = 0, n = (uint64_t)m->w * m->h;
+                    for (uint64_t i = 0; i < n; i++) { unsigned v = y[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+                    LOG("[movie] frame %llu Y plane: mean %.1f min %u max %u (%llu px)", (unsigned long long)m->frames, (double)sum / (double)n, mn, mx, (unsigned long long)n);
+                }
                 push_ready(m, s, slot, 0, p->time, frame_bytes(m));
                 m->frames++;
             }
@@ -312,28 +317,32 @@ static int h_get_output_format(void *obj, void *md) {
     set_format(m, md); return ST_OK;
 }
 typedef int (*int_fn)(void *);
+static void mvlog(const char *what, void *obj, const char *extra) {   /* bounded: first 24 lifecycle events */
+    static int on = -1, n; if (on < 0) on = getenv("NIER_MOVIE_LOG") != NULL;
+    if (on && n++ < 24) LOG("[movie] %s obj=%p %s", what, obj, extra);
+}
 static int h_start(void *obj) {
     Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_START])(obj);
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     if (!m->configured) { pthread_mutex_unlock(&m->mu); return ST_NOT_CONFIGURED; }
-    m->started = 1; note(m, &s, EV_INPUT);
+    m->started = 1; note(m, &s, EV_INPUT); mvlog("start", obj, "");
     pthread_mutex_unlock(&m->mu); fire(&s);
     return ST_OK;
 }
 static int h_stop(void *obj) {
     Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_STOP])(obj);
-    pthread_mutex_lock(&m->mu); LOG("stop after %llu frames (%llu dropped to keep time)", (unsigned long long)m->frames, (unsigned long long)m->dropped); release_codec(m); pthread_mutex_unlock(&m->mu);
+    pthread_mutex_lock(&m->mu); mvlog("stop", obj, ""); LOG("stop after %llu frames (%llu dropped to keep time)", (unsigned long long)m->frames, (unsigned long long)m->dropped); release_codec(m); pthread_mutex_unlock(&m->mu);
     return ST_OK;
 }
 static int h_reset(void *obj) {
     Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_RESET])(obj);
-    pthread_mutex_lock(&m->mu); release_codec(m); m->last_error = 0; pthread_mutex_unlock(&m->mu);
+    pthread_mutex_lock(&m->mu); mvlog("reset", obj, ""); release_codec(m); m->last_error = 0; pthread_mutex_unlock(&m->mu);
     return ST_OK;
 }
 static int h_flush(void *obj) {
     Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_FLUSH])(obj);
-    pthread_mutex_lock(&m->mu);
+    pthread_mutex_lock(&m->mu); mvlog("flush", obj, "");
     if (m->configured) {   /* drop queued work; the next input starts a new decode (after a seek: a key frame) */
         vpx_codec_destroy(&m->vpx); m->vpx_live = 0;
         vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)m->w, .h = (unsigned)m->h};
