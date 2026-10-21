@@ -137,9 +137,30 @@ void nier_audio_state_tick(uint64_t frame) {
         uint64_t p = 0; memcpy(&p, b + stslot[i], 8);
         if (p) aud_peek(p, &st[i], 4);
     }
+    /* The game's own SoundSystem::Env init (main+0x8c9b40 area) is the layer above Wwise: it reads the three .wai
+       index files, keeps their handles in the slots main+0x12c66c8/+0x12c6788/+0x12c66d0 (a zero handle makes it log
+       "[SoundSystem::Env] Wwise … 読み込みエラー"), then drives the engine object at main+0x12c66d8 with the GameSync
+       names Volume_Master / SE_ListenerPreset / SE_ListenerPresetFadeTime and records each result in
+       main+0x12c66e8/+0x12c67a8/+0x12c67b0. Reading those answers whether the info files loaded and whether the
+       engine accepted the syncs. */
+    uint64_t envh[3] = {0, 0, 0}, envy[3] = {0, 0, 0}, envobj = 0; uint32_t envst[3] = {0, 0, 0};
+    static const uint64_t hslot[3] = {0x12c66c8, 0x12c6788, 0x12c66d0};
+    for (int i = 0; i < 3; i++) {                  /* slot -> object (possibly on the host heap) -> handle */
+        memcpy(&envy[i], b + hslot[i], 8);
+        if (envy[i]) aud_peek(envy[i], &envh[i], 8);
+    }
+    memcpy(&envobj, b + 0x12c66d8, 8);
+    static const uint64_t eslot[3] = {0x12c66e8, 0x12c67a8, 0x12c67b0};
+    for (int i = 0; i < 3; i++) {
+        uint64_t p = 0; memcpy(&p, b + eslot[i], 8);
+        if (p) aud_peek(p, &envst[i], 4);
+    }
     uint64_t fp = ((uint64_t)ch << 32) ^ ready ^ ((uint64_t)a7 << 8) ^ ((uint64_t)at2c << 12) ^ ((uint64_t)acq << 20)
                 ^ ((uint64_t)flag << 24) ^ ev[0] ^ ev[1] ^ ev[2] ^ ev[3] ^ obj ^ ((uint64_t)vo << 48)
-                ^ wbuf ^ st[0] ^ ((uint64_t)st[1] << 20) ^ ((uint64_t)st[2] << 40) ^ ((uint64_t)st[3] << 50);
+                ^ wbuf ^ st[0] ^ ((uint64_t)st[1] << 20) ^ ((uint64_t)st[2] << 40) ^ ((uint64_t)st[3] << 50)
+                ^ envh[0] ^ envh[1] ^ envh[2] ^ envobj ^ envst[0] ^ ((uint64_t)envst[1] << 12)
+                ^ envy[0] ^ envy[1] ^ envy[2]
+                ^ ((uint64_t)envst[2] << 28);
     if (frame % 600 && fp == last_fp) return;      /* print on change, and once every 10 s to show liveness */
     last_fp = fp; lines++;
     fprintf(stderr, "[audstate] F=%llu obj=%#llx ok=%d vt=%#llx ch=%u ready=%u a7=%#x at2c=%#x acq=%u flag=%u "
@@ -158,6 +179,10 @@ void nier_audio_state_tick(uint64_t frame) {
             fprintf(stderr, "%s\n", line);
         }
     }
+    fprintf(stderr, "[audstate] env y=%#llx,%#llx,%#llx h=%#llx,%#llx,%#llx obj=%#llx st=%#x,%#x,%#x\n",
+            (unsigned long long)envy[0], (unsigned long long)envy[1], (unsigned long long)envy[2],
+            (unsigned long long)envh[0], (unsigned long long)envh[1], (unsigned long long)envh[2],
+            (unsigned long long)envobj, envst[0], envst[1], envst[2]);
     fflush(stderr);
 }
 

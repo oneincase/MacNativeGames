@@ -1,3 +1,16 @@
+## 2026-10-22 — 音频 P0 第 3 步：**修正上一条**——四个音库装载其实**全失败**，卡点在更上游的 guest `Hw::DvdSystem` 路径查找
+
+- 探针再扩一组（仍 `NIER_AUDIO_STATE_PROBE=1`、只读）：游戏自己的 `SoundSystem::Env` 状态。对象三层读法 —— 槽 `main+0x12c66c8/+0x12c6788/+0x12c66d0` 是**对象指针**（堆上 0x10 字节结构，首字段才是文件句柄），槽 `main+0x12c66d8` 是引擎对象，`main+0x12c66e8/+0x12c67a8/+0x12c67b0` 存 GameSync 的返回；新增输出行 `[audstate] env y=…, h=…, obj=…, st=…`（`y` = 三个对象指针，便于区分"指针在/不在"与"字段为 0"）。
+- **c83 实测（40 s 到标题，帧 900，0 崩，`logs/c83.log`）**：`y=0x10a349658,0x10a349668,0x10a349678`（三个对象 0x10 相邻、确实分配过）、`h=0,0,0`、`obj=0x10a349680`、`st=0,0x3e3a8bf9,0x6c2a37cc`。`F=60` 与 `F=600` 完全一致 → 状态从启动起就定格。
+- **修正上一条（`f920685`）的语义错误**：`0x983b80` 的返回值 **0 = 失败**，不是成功。静态读法（`main+0x983b80`）：成功路径 `0x983c08 str x24,[x20]`（把读到的缓冲写回**对象首字段**）+ `0x983c10 str x23,[x19]`（文件对象写回出参），返回 `0x9834a0` 的非零值；失败路径 `0x983c34/c68 mov w0,wzr` + `str xzr,[x20]`。c80/c83 的 `st=0,0,0,0` 与 `h=0,0,0` 因此是同一条事实的两面：**`sound/Init.bnk` 与三个 `.wai` 全部没装进来**。
+- 失败时会打的两条串（`0x983b80` 内）：`[Hw::DvdSystem] %sは見つかりません`（`0xf94827`，来自 `0x982330` 返回 0）与 `[Hw::DvdSystem] メモリ不足が発生(%s)`（`0xfb7c29`，来自 `0x9974d4` 返回 0）——两者都带路径，指向"查表不到"而非读失败。
+- 更上游的 `SoundSystem::Env` 初始化（`main+0x8c9b40` 区域，已反汇编）：先 `0x9acad0(*(0x12c6768))`，再逐个检查那三个对象首字段，为 0 就打 `[SoundSystem::Env] Wwise Info / Stream Info / Voice Info 読み込みエラー`（`0xfd6787`/`0xf78bc4`/`0xf78bff`）；随后用 `0x9ae220`/`0x9ad7c0` 取 `Volume_Master`/`SE_ListenerPreset`/`SE_ListenerPresetFadeTime` 的 ID —— 实测后两个是 `0x3e3a8bf9`/`0x6c2a37cc`（AkUniqueID 哈希，不是状态码），第一个是 0。另有 `main+0x8c8570`/`0x8c85cc` 一组会把这三个句柄**清零**的复位路径。
+- **因此本轮把结论上移一层**：音频卡点不是"vtable+0x98/+0xc8 没人派发"，而是**声音资源一个都没进 guest 的 `Hw::DvdSystem` 表**（bank + 3 个索引全失败）→ 没有音库 → Wwise 引擎不初始化 → 自然不会去要输出设备。上一轮"缺的只是输出设备那一跳"作废。
+- 旁证（`TOTK_FS_LOG=1` 的 c77，帧 7200）：整个启动只枚举过**一次目录**（`rom:/` → 34 项），**从未 open 任何 `sound/` 路径**；另有 9 个 cpk 打开失败（`data200.cpk`…`data207.cpk`、`data300.cpk`）—— 这 9 个名字在 660 条 RomFS 索引里**不存在**，而 `data%03d.cpk` 是格式化出来的（main 里没有字面串）。这三个 `sound/*.wai` 与 `sound/Init.bnk` 在索引里**有真实条目**（`sound/WwiseInfo.wai` size 234336 @0x272df1a20 等）→ 端口侧能供，guest 侧没查到。
+- **环境坑（本轮白跑一次）**：这个卷（`/Volumes/bit2t`）上编辑 `runtime/*.c` 后**必须 `touch`** 再 `make runtime`，否则 mtime 粒度让 make 判 `Nothing to be done for 'runtime'`，会拿旧二进制白跑一轮（本轮就白跑了 c82）。
+- 回归：`stability.sh 3 13` = `STABLE`（探针默认关）。
+- **下一手**：把 `Hw::DvdSystem` 的注册表读出来 —— `*(main+0x12c7890)` 指向 `{计数; 记录[0x70]…}`、另有一个计数在 `*(main+0x12c78b0)`/`*(main+0x12c7898)`（`0x982330` 的两级查找），打前 N 条记录的路径名即可判定"表里到底有没有 sound/*"；若没有，再顺着往"谁负责注册"（多半是 core 资源清单/`data000.cpk` 的表）追。这条路一旦通了，音频很可能直接跨过前面所有猜测。
+
 ## 2026-10-22 — 音频 P0 第 2 步：guest 的 **Wwise 文件层已初始化成功**（Init.bnk + 3 个 .wai 全返回 0），缺的只是输出设备那一跳
 
 - 探针扩展（默认关，仍是 `NIER_AUDIO_STATE_PROBE=1`）：`runtime/game_patches.c` 的 `nier_audio_state_tick()` 多读一组 Wwise 静态 —— 缓冲指针槽 `main+0x12c6768`、四个注册结果指针槽 `0x12c6778/+0x6780/+0x6790/+0x6798`，打一行 `[audstate] wwise buf=… text="…" st=…,…,…,…`（同样只读、`mach_vm_read_overwrite` 取宿主/镜像外的目标，读不到不会崩）。
