@@ -88,7 +88,12 @@ static void to_stereo(const int16_t *in, int16_t *out, uint64_t frames, uint32_t
 uint64_t nier_audio_open_default(void *out_raw, const void *param_raw) {
     AudioOut *o = out_raw;
     uint32_t rate = 48000, channels = 2, p0 = 0, p1 = 0;
-    if (param_raw) { const uint32_t *p = param_raw; p0 = p[0]; p1 = p[1]; if (p[0] >= 8000 && p[0] <= 192000) rate = p[0]; if (p[1] == 1 || p[1] == 2 || p[1] == 6) channels = p[1]; }
+    /* SDK 12.3.9 InitializeAudioOutParameter writes {u32 rate@0; u16 channelCount@4; u16 0xCAFE@6}; the game stores the
+       channel count with a halfword at param+4, so reading p[1] as u32 yields 0xCAFE0000 and silently falls back to 2. */
+    if (param_raw) { const unsigned char *b = param_raw; uint32_t w0; uint16_t ch; memcpy(&w0, b, 4); memcpy(&ch, b + 4, 2);
+        p0 = w0; p1 = ch; if (w0 >= 8000 && w0 <= 192000) rate = w0; if (ch == 1 || ch == 2 || ch == 6) channels = ch; }
+    fprintf(stderr, "[audio] OpenDefaultAudioOut parameter u32(+0) %u u16(+4) %u u16(+6) %u -> using %u Hz x%u\n",
+            (unsigned)p0, (unsigned)p1, (unsigned)(param_raw ? ((const uint16_t *)param_raw)[3] : 0), rate, channels);
     trace("OpenDefaultAudioOut parameter words %#x %#x -> using %u Hz x%u", p0, p1, rate, channels);
     HostOut *h = calloc(1, sizeof *h);
     if (!h) return 0x815;

@@ -747,7 +747,13 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
     case 1: case 7: device_volume = IPC_ARG(rq, float, 0); return;                                    /* SetAudioDeviceOutputVolume(Auto) */
     case 2: case 8: {float volume=atomic_load(&device_volume);IPC_OUT(rs,volume);return;}             /* GetAudioDeviceOutputVolume(Auto) */
     case 3: case 10: { IpcBuffer b = out_buffer(rq, &pointer); put_name(&b, rs, pointer); return; }  /* GetActiveAudioDeviceName(Auto) */
-    case 5: { const char *ch = getenv("NIER_AUDIO_CHANNELS"); int32_t n = ch ? atoi(ch) : 2; IPC_OUT(rs, n); return; }                                               /* GetActiveChannelCount */
+    case 5: { const char *ch = getenv("NIER_AUDIO_CHANNELS"); int32_t n = ch ? atoi(ch) : 2;
+        /* Diagnostic: the guest's only state-dependent branch is "if (count != obj+0x108) notify the engine", which has
+           never been taken because both queries always agree. NIER_AUDIO_DEVICE_COUNT_FIRST=n answers the first query
+           differently, so one boot tells us whether that branch is what creates the audio sink. */
+        { const char *f = getenv("NIER_AUDIO_DEVICE_COUNT_FIRST"); static int first; if (f && !first++) n = atoi(f); }
+        fprintf(stderr, "[audiodev] cmd 5 GetActiveChannelCount -> %d\n", n);
+        IPC_OUT(rs, n); return; }                                               /* GetActiveChannelCount */
     case 13: { IpcBuffer b = out_buffer(rq, &pointer); put_name(&b, rs, pointer); return; }          /* GetActiveAudioOutputDeviceName [13.0.0+] */
     case 14: { IpcBuffer b = out_buffer(rq, &pointer); int32_t n = b.size >= 0x100 ? 1 : 0; if (n) put_name(&b, rs, pointer); IPC_OUT(rs, n); return; }   /* ListAudioOutputDeviceName [13.0.0+] */
     case 4: case 11: case 12: {
