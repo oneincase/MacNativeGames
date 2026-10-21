@@ -1,3 +1,10 @@
+## 2026-10-22 W4：uplog 升级为字节统计，裁决"池里是 0xFF"——**错**，池里就是解码数据
+
+- 改动：`nvn_mtl.m` 的 `DM_NVN_UPLOG` 块单遍统计 `wff`（全 FF 字）、`ff/n`（FF 字节占比）、`min/max/mean`、前 16 字节 hex。默认关不变。
+- **实测（c142，`DM_NVN_UPLOG=1600x904`，30 s）**：`ser=1502 … wff=0 ff=0/1446400 mean=16.0 min=16 max=16 head=10101010…`（= Y 平面 0x10 填充 = 解码 frame 0 的 mean 16.0，逐帧吻合）；随后 `mean=184.2 head=baba…`、`mean=226.7 head=e5e5…` 是淡入曲线的第 2、3 帧。**影片平面池子里就是解码结果，不是 0xFF**。c118 的"nz8 全非零 → 池被填白"正式作废（nz8 区分不了 0x10 重复与 0xFF——W4 就是为了堵这个）。
+- 因此白屏的剩余成因收窄为：(a) 画面静止 = 播放器停在 EOS 后的最后一帧（淡入到亮场的 logo 结尾），(b) 真正没推进的是**任务完成方**：`h=0x1026`（movie 库 worker，entry 在 subsdk0）卡在条件变量 `key=…38efa4`，`nsvc=2` 后再没醒过（c139/c140 一致）——装载泵 `h=0x1027` 等的 `task+0x38` 信号量正该由它 release。下一轮假设：查谁该 signal 这个条件变量（`svc 0x1D` 丢唤醒的又一形态，或 worker 在等宿主 IO 完成回调）。
+
+
 ## 2026-10-22 W3：REUP_MAX_BYTES 1 MB→4 MB，影片平面不再每帧新建纹理
 
 - 缺陷：`reup_offer()` 的 1 MB 门槛恰好挡住影片 Y 平面（1600x904 R8，Metal `allocatedSize` 1728 KB）——每帧 `nvnTextureInitialize` 换新 serial、`reup_take` 永不命中、`pkg_upload_` 每帧新建一张纹理。实测（c115，修复前）：至帧 10212 累计 **10200 次 / 17208 MB** 分配流水。

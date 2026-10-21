@@ -3369,10 +3369,17 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
         if (!mt) { RED_ONCE(2, "建 MTLTexture 失败 %ux%u 格式 %#x 目标 %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
         res_add(mt);   // 首传与重传都在这里登记驻留（Metal 4 不自动驻留；漏登 = GPU 地址页错误；复用的贴图一直驻留） | Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault; reused textures stay resident)
     }
-    { static int ul = -1; static unsigned ulw, ulh; if (ul < 0) { const char *e = getenv("DM_NVN_UPLOG"); ul = e != NULL; if (e && sscanf(e, "%ux%u", &ulw, &ulh) != 2) ulw = ulh = 0; }   // TOTK: DM_NVN_UPLOG=1：每次上传记源内存非零字节数（判断贴图数据是否已到内存池）；=宽x高 只记该尺寸
-        if (ul && (!ulw || (t->d.width == ulw && t->d.height == ulh))) { uint64_t nz = 0, n = t->L.size; const uint8_t *m = t->mem; for (uint64_t i = 0; i < n; i += 8) if (*(const uint64_t *)(m + i)) nz++;
-            MLOG("[uplog] ser=%llu fmt=%#x %ux%u lv=%u tgt=%d size=%llu nz8=%llu/%llu pool=%p flags=%#x host=%p off=%lld frame=%llu", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.levels, t->d.target,
-                 (unsigned long long)n, (unsigned long long)nz, (unsigned long long)(n / 8), (void *)t->pool, t->pool ? t->pool->flags : 0, t->pool ? (void *)t->pool->host : NULL, (long long)t->off, (unsigned long long)atomic_load(&g_cur_frame)); } }
+    { static int ul = -1; static unsigned ulw, ulh; if (ul < 0) { const char *e = getenv("DM_NVN_UPLOG"); ul = e != NULL; if (e && sscanf(e, "%ux%u", &ulw, &ulh) != 2) ulw = ulh = 0; }   // TOTK: DM_NVN_UPLOG=1：每次上传记源内存统计（判断贴图数据是否已到内存池）；=宽x高 只记该尺寸
+        // W4: nz8 alone cannot tell a real picture from a 0xFF fill (a Y=16..65 plane has every 8-byte word
+        // non-zero too). One pass now also counts all-FF words, FF bytes, and byte min/max/mean, plus the first
+        // 16 bytes in hex — "is the pool holding the decode or a white fill" reads off one line.
+        if (ul && (!ulw || (t->d.width == ulw && t->d.height == ulh))) { uint64_t nz = 0, wff = 0, nff = 0, sum = 0, n = t->L.size; const uint8_t *m = t->mem; unsigned bmin = 255, bmax = 0;
+            for (uint64_t i = 0; i < n; i += 8) { uint64_t w = *(const uint64_t *)(m + i);
+                if (w) nz++; if (w == ~0ull) wff++;
+                for (int k = 0; k < 8; k++) { unsigned b = (unsigned)(unsigned char)(w >> (8 * k)); if (b < bmin) bmin = b; if (b > bmax) bmax = b; if (b == 0xFF) nff++; sum += b; } }
+            char head[40]; for (int k = 0; k < 16; k++) snprintf(head + 2 * k, 3, "%02x", n >= (uint64_t)(k + 1) ? m[k] : 0);
+            MLOG("[uplog] ser=%llu fmt=%#x %ux%u lv=%u tgt=%d size=%llu nz8=%llu/%llu wff=%llu ff=%llu/%llu mean=%.1f min=%u max=%u head=%s pool=%p flags=%#x host=%p off=%lld frame=%llu", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.levels, t->d.target,
+                 (unsigned long long)n, (unsigned long long)nz, (unsigned long long)(n / 8), (unsigned long long)wff, (unsigned long long)nff, (unsigned long long)n, (double)sum / (double)(n ? n : 1), bmin, bmax, head, (void *)t->pool, t->pool ? t->pool->flags : 0, t->pool ? (void *)t->pool->host : NULL, (long long)t->off, (unsigned long long)atomic_load(&g_cur_frame)); } }
     *stamp = nvn_dirty_now();   // TOTK (#90): before protecting, as in wb_note: a write that faults during the protect or the copy is newer than it
     if (pk && pk->edge_want) pkg_edge_snap(t, pk);
     if (!pkg_hashed(t)) nvn_dirty_protect(t->mem, t->L.size);
