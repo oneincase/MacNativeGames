@@ -47,16 +47,21 @@ static void trace(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); fputs("[audio] ", stderr); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap);
 }
 
-static void release_head(HostOut *h) {
-    if (!h->nqueue) return;
+static uint64_t release_head(HostOut *h) {
+    if (!h->nqueue) return 0;
     const Queued head = h->queue[0];
     memmove(h->queue, h->queue + 1, (--h->nqueue) * sizeof *h->queue);
     if (h->nreleased < QUEUE_MAX) h->released[h->nreleased++] = head.tag;
     h->played_samples += head.bytes / (2ull * h->owner->channels);
+    return head.tag;
 }
 static void played(void *user, AudioQueueRef q, AudioQueueBufferRef b) {   /* Core Audio thread */
     HostOut *h = user;
-    pthread_mutex_lock(&h->lock); release_head(h); pthread_mutex_unlock(&h->lock);
+    pthread_mutex_lock(&h->lock); uint64_t tg = release_head(h); uint64_t n = h->played_samples; pthread_mutex_unlock(&h->lock);
+    static unsigned rel; if (getenv("NIER_TRACE_AUDIO") && rel < 4 && ++rel) fprintf(stderr, "[audio] callback released tag %#llx host %p\n", (unsigned long long)tg, (void *)h);
+    static unsigned shots; if (getenv("NIER_TRACE_AUDIO") && (++shots <= 4)) {
+        UInt32 run = 0, sz = sizeof run; AudioQueueGetProperty(q, kAudioQueueProperty_IsRunning, &run, &sz);
+        fprintf(stderr, "[audio] played callback %u q=%p running=%u samples %llu\n", shots, (void *)q, run, (unsigned long long)n); }
     AudioQueueFreeBuffer(q, b);
 }
 static void *silent_playback(void *arg) {
@@ -106,7 +111,9 @@ uint64_t nier_audio_open_default(void *out_raw, const void *param_raw) {
         AudioStreamBasicDescription f = {.mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM,
             .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked, .mBytesPerPacket = 4, .mFramesPerPacket = 1,
             .mBytesPerFrame = 4, .mChannelsPerFrame = 2, .mBitsPerChannel = 16};
-        if (AudioQueueNewOutput(&f, played, h, NULL, kCFRunLoopCommonModes, 0, &h->aq)) { fprintf(stderr, "[audio] no Core Audio output; continuing silent\n"); h->silent = 1; }
+        OSStatus nq = AudioQueueNewOutput(&f, played, h, NULL, kCFRunLoopCommonModes, 0, &h->aq);
+        if (nq) { fprintf(stderr, "[audio] no Core Audio output (new %d); continuing silent\n", (int)nq); h->silent = 1; }
+        else if (getenv("NIER_TRACE_AUDIO")) fprintf(stderr, "[audio] queue created ok\n");
     }
     if (h->silent) pthread_create(&h->thread, NULL, silent_playback, h);
     trace("AudioOut open %u Hz x%u PCM16 -> %s", rate, channels, h->silent ? "silent sink" : "Core Audio (stereo)");
@@ -115,7 +122,11 @@ uint64_t nier_audio_open_default(void *out_raw, const void *param_raw) {
 uint64_t nier_audio_start(void *out_raw) {
     AudioOut *o = out_raw; if (!o || !o->host) return 0;
     HostOut *h = o->host; o->state = STATE_STARTED;
-    if (h->aq) AudioQueueStart(h->aq, NULL);
+    if (h->aq) {
+        OSStatus rc = AudioQueueStart(h->aq, NULL);
+        UInt32 running = 0, sz = sizeof running; AudioQueueGetProperty(h->aq, kAudioQueueProperty_IsRunning, &running, &sz);
+        if (getenv("NIER_TRACE_AUDIO")) fprintf(stderr, "[audio] AudioQueueStart rc=%d running=%u\n", (int)rc, running);
+    }
     trace("AudioOut start");
     return 0;
 }
@@ -142,7 +153,10 @@ uint64_t nier_audio_append(void *out_raw, void *buf_raw) {
     uint64_t bytes = b->data_size;
     pthread_mutex_lock(&h->lock);
     if (h->nqueue >= QUEUE_MAX) { pthread_mutex_unlock(&h->lock); return 0x8a5; }   /* queue full */
-    h->queue[h->nqueue++] = (Queued){b->next, bytes};
+    /* The released tag the SDK hands back is the guest AudioOutBuffer object itself (the game matches it against the
+       four buffers it keeps); the buffer's "next" field is the SDK's own linkage and is 0 in the game's buffers, so
+       reporting that made every release look like "no buffer" and the engine re-created the output every second. */
+    h->queue[h->nqueue++] = (Queued){(uint64_t)(uintptr_t)buf_raw, bytes};
     pthread_mutex_unlock(&h->lock);
     if (h->silent) return 0;
     uint32_t channels = o->channels;
@@ -153,7 +167,8 @@ uint64_t nier_audio_append(void *out_raw, void *buf_raw) {
     to_stereo((const int16_t *)(uintptr_t)(b->sample_buffer + offset), qb->mAudioData, frames, channels);
     qb->mAudioDataByteSize = (UInt32)(frames * 4);
     if (!frames) { memset(qb->mAudioData, 0, 4); qb->mAudioDataByteSize = 4; }
-    if (AudioQueueEnqueueBuffer(h->aq, qb, 0, NULL)) return 0x8a5;
+    OSStatus eq = AudioQueueEnqueueBuffer(h->aq, qb, 0, NULL);
+    if (eq) { static unsigned fails; if (++fails <= 3 || fails % 200 == 0) fprintf(stderr, "[audio] enqueue failed rc=%d (n=%u)\n", (int)eq, fails); return 0x8a5; }
     static unsigned appends; if (++appends == 1 || appends % 500 == 0) trace("AudioOut appended %u buffers, %llu frames each", appends, (unsigned long long)frames);
     return 0;
 }
@@ -163,6 +178,10 @@ uint64_t nier_audio_released(void *out_raw) {
     pthread_mutex_lock(&h->lock);
     if (h->nreleased) { tag = h->released[0]; memmove(h->released, h->released + 1, (--h->nreleased) * sizeof *h->released); }
     pthread_mutex_unlock(&h->lock);
+    static unsigned asks, hits; asks++; if (tag) hits++;
+    if (getenv("NIER_TRACE_AUDIO") && hits <= 3 && tag) fprintf(stderr, "[audio] guest took tag %#llx host %p (ask %u)\n", (unsigned long long)tag, (void *)h, asks);
+    if (getenv("NIER_TRACE_AUDIO") && (asks == 1 || asks % 2000 == 0))
+        fprintf(stderr, "[audio] released: asks %u hits %u queue %u\n", asks, hits, h->nqueue);
     return tag;
 }
 uint64_t nier_audio_played_samples(void *out_raw) {

@@ -1,3 +1,25 @@
+## 2026-10-22 音频 P0：`GetReleasedAudioOutBuffer` 返还的 tag 用了 `buffer->next`（恒为 0）—— 引擎以为"没有空闲缓冲"，每秒把输出拆掉重建，改返缓冲区对象本身后输出变成一条持续流
+
+**一句话**：`runtime/audio_public.c` 的 `nier_audio_append()` 把 `(Queued){b->next, bytes}` 存进队列，播完再把这个 `tag` 交给 guest 的 `GetReleasedAudioOutBuffer`。但 guest 的 `AudioOutBuffer::next` 是 SDK 自己的链指针、游戏填 0，于是**每次"释放"都报告 tag=0**。引擎据此认定没有缓冲区播完 → 立刻 stop/close 再重开，形成每秒一次的重试循环，声音永远只播几毫秒就被掐断。
+
+**怎么定位的（`hletrace 2` 窗口普查，`logs/c97.log`）**：一个 8 s 窗口里 `GetReleasedAudioOutBuffer` 被调 **1530 次**，而 `OpenDefaultAudioOut`/`StartAudioOut`/`StopAudioOut`/`CloseAudioOut` 各 **8 次**（每 8 s 一个 open→start→stop→close 周期）、`AppendAudioOutBuffer` **32 次**（每周期 4 个 1024 帧缓冲）。也就是说游戏确实每周期提交了 4 个缓冲、然后 24 次/周期地等释放 —— 只是永远等不到。
+
+**逐层证据**：
+- `[audio] played callback 1 q=0x… running=1 samples 1024` → 1,2,3,4 次回调、`samples` 1024→4096，Core Audio 真在播（不是静音旁路）。
+- `[audio] callback released tag 0 host 0x…` ×4 → 播放线程推给 FIFO 的 tag 全是 **0**。
+- `[audio] guest took tag` 在修复前一次都不出现（`hits 0`），修复后立刻出现：`guest took tag 0x71c55d0080 … (ask 9)`。
+
+**修复**（`runtime/audio_public.c`）：队列里存 guest 传进来的 `AudioOutBuffer*` 本身（`(Queued){(uint64_t)(uintptr_t)buf_raw, bytes}`），播完把它作为 tag 返还 —— 这正是 SDK 语义（`GetReleasedAudioOutBuffer(AudioOut*)` 返回可复用的缓冲区对象指针）。
+
+**修复后实测（c101 标题 26 s / c102 全导航 250 s）**：
+- c101：`AudioOut open` **1 次**（修复前每秒 1 次）、`guest took tag` 正常、`released: asks 2000 hits **424** queue 4`。
+- c102（250 s 到飞行场景）：`AudioOut open` 仍**只有 1 次**（输出保持打开整场），`AudioOut appended` 日志行 23（每 1/500 次打点 ⇒ ≥11000 次提交），`released: asks 54000 hits **11140** queue **4**`（稳定 4 缓冲在环），0 崩、0 `signal=`。
+- 回归 `sh scripts/stability.sh 3 13` = `run 1/2/3: faults=0` → `STABLE`。
+
+**顺带记录**：本轮前一步的 `GetDirectoryEntryCount` 句柄 bug（`29a4983`）让音库能装载、输出能打开；这一步让输出能真正持续跑。两个 bug 串起来才是"完全没声音"的完整原因。
+
+**诊断开关**（都受 `NIER_TRACE_AUDIO` 门控，默认关）：`[audio] queue created ok`、`[audio] AudioQueueStart rc=%d running=%u`、`[audio] played callback %u q=%p running=%u samples %llu`（前 4 次）、`[audio] callback released tag %#llx host %p`（前 4 次）、`[audio] guest took tag %#llx host %p (ask %u)`（前 3 次）、`[audio] released: asks %u hits %u queue %u`（每 2000 次）、`[audio] enqueue failed rc=%d`（前 3 次与每 200 次）。
+
 ## 2026-10-22 音频 P0：根因是 `GetDirectoryEntryCount` 把句柄当路径 —— 一句签名错误让整张文件表为空，音库和音频输出全没了
 
 **一句话**：`runtime/fs_host.c` 的 `dir_entry_count(int64_t *out, const char *path)` 把 `nn::fs::GetDirectoryEntryCount(s64*, DirectoryHandle)` 的**第二个参数当成路径**。guest 传进来的是句柄（`0x300000000`+i），我们把它当 `char *` 去 `strlen/opendir` → 垃圾路径 → 返回错误 → 引擎挂载 `rom:/` 时"列举到 0 个条目"，于是整棵 `Hw::DvdSystem` 路径树是空的，`sound/Init.bnk` 与三个 `.wai` 全部"見つかりません"，Wwise 无音库、音频输出也从不初始化。
