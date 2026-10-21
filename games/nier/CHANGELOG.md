@@ -1,3 +1,21 @@
+# 2026-10-22 白屏根因重估：不是渲染，是 guest 线程挂起（`svc 0x18` 等 0 个句柄 + `AcquireSemaphore` 等任务完成）
+
+本轮不改行为，只把"白屏"的病因从"影片池被填 0xFF"改判为"推进影片/装载状态机的线程根本没在跑"。执行方案迁到 `docs/plan-2026-10-22.md`。
+
+- **推翻上一条的证据**：`DM_NVN_UPLOG` 的 `nz8=180800/180800` 统计的是"8 字节字非零"。解码输出 Y=16..65 时填充字是 `0x1010101010101010`，**同样非零**——nz8 全非零与"池里是 0xFF（白）"之间没有推理关系。上一条"游戏侧池子被填成 0xFF"作废。
+- **线程转储（c122，白屏 30 s，`logs/c122.log:296` 起）**：
+  - 影片事件线程 `h=0x1025`：`wait=4`（WaitSynchronization）、**`waiting on 0 handle(s)`**、`last_svc=0x18`、`nsvc=105` 后不再动。栈：`sdk+0xdb6b68（gates 表：svc 24=0x18）← sdk+0x342a74 ← sdk+0x342ed0 ← sdk+0x340054 ← main+0xa68aa8`。
+  - `ExecStartupShader` 线程 `h=0x1027`：`sdk+0xdb6c08(svc 28) ← main+0x9a62a8 ← main+0x58ff30 ← main+0x58fa70`。
+- **反汇编定名（`main.patched.bin` + `analysis/runtime-layout.json` 的 relocs 把 GOT stub 还原成符号）**：
+  - `main+0x9a62a4 = bl main+0xd9a840`，GOT 槽 `0x12b6148` = **`nn::os::AcquireSemaphore(SemaphoreType*)`**；`0x9a62a8` 是它的返回地址。该线程是 `ExecStartupShader`（线程名串 `0xf8bcca`，入口 `main+0x58fa10` 注册于线程表 `0xf3da28`）。pump 函数 `main+0x9a6234` 的结构：置任务状态 `[task+0x28]=3` → `ReleaseSemaphore(task+0x68)`（`0x9a629c`，唤醒 worker）→ `AcquireSemaphore(task+0x38)`（`0x9a62a4`，**等完成**）→ 返回后复查状态 `==5` 才跑完成回调；完成方 `Release(+0x38)` 站点在 `main+0x9a6af8/0x9a6bc8`。**这条链是 core 装载的消费半段（等任务完成），不是此前文档说的"注册 bnk 那条链"**（生产半段 `0x58f7ec→0x8c9870→0x983b80→0x9974d4`，两者经同一任务池 `[0x12c7df0]` 耦合）。
+  - `main+0xa68aa4 = bl main+0xd9afa0` = **`nn::os::WaitAny(MultiWaitType*)`**；其前是 `movie::MediaData::FindInt32/FindRect/Clear/D1`，其后 `cmp x0,x22` + `cbnz w0, #0xa68aa0` 重试循环，且 `0xa68aa8` 起用返回值与 `x21/x22/x23/[sp+0x10]/[sp+8]` 五个值逐一比较派发——**游戏代码自己就在处理 WaitAny 的多种非成功结果**。
+  - 我们的 `runtime/threads.c:523` 对 `n==0` 的校验是 `(!hs&&n)` → 放行，随后 `block(t,4,-1)` 且 `wh[]` 为空 ⇒ 任何 signal 都扫不到它 ⇒ **永久挂起**。
+- **两种解释，本轮不下结论**（承重论断"真实内核对 `count==0` 立即返回错误"我未能在本机验证 Atmosphère 实现，故只作假设）：**H-A** 宿主语义与内核不同；**H-B** `count==0` 是症状，上游本该挂进来的事件句柄没进来（旁证：`nsvc=105` 不是 1，说明该线程此前正常等待过，后来才变空）。区分手段见方案 W0（默认关的 `n` 值轨迹 + `MultiWaitType` 对象 dump，一次跑定性）。
+- **`h=0x1025` 的 `nsvc=105` 定格与 hletrace 里没有任何 `movie::*` 互相印证**：挂起的线程不产生宿主调用。上一条"游戏此刻不再调解码器"描述成立、因果反了。
+- **画面静止的实测**：`c121_1/2/3.png` 与 `c122_a.png` md5 全同（`a8138bb2…`，跨 222 s），主色 `(250,248,241)` 占 94.4%；主线程每帧重放同一帧（`passdump` 的 2 次绘制）。
+- **顺带核实（W3 依据）**：`reup_offer()` 复用键只含描述符、无内容哈希，但 `pkg_upload_` 每次全量覆写所有 level×layer ⇒ `REUP_MAX_BYTES` 从 1 MB 提到 4 MB 安全（1728 KB 影片平面因此可进缓存，消掉每帧新建）。
+- 待办排序改为：**W0** 先取证区分 H-A/H-B（零行为改动）→ **W1a/W1b** 按结论二选一 → **W2** 影片 EOS 后推进 → **W3** REUP 提额 → **W4** uplog 统计修正（nz8 升级为字节 min/max/mean + 0xFF 占比，防再次误判）。音频混音恒 0 判为白屏下游，不单独追；M4 改回"链路达成、听感未达成"。
+
 # 白屏：解码输出正确，白来自游戏自己每帧重传的 YUV 影片平面
 
 本次只加诊断，不改行为，为了把"白屏"从"我们的解码器给了白帧"里摘出去。
