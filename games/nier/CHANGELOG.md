@@ -1,3 +1,10 @@
+## 2026-10-22 W3：REUP_MAX_BYTES 1 MB→4 MB，影片平面不再每帧新建纹理
+
+- 缺陷：`reup_offer()` 的 1 MB 门槛恰好挡住影片 Y 平面（1600x904 R8，Metal `allocatedSize` 1728 KB）——每帧 `nvnTextureInitialize` 换新 serial、`reup_take` 永不命中、`pkg_upload_` 每帧新建一张纹理。实测（c115，修复前）：至帧 10212 累计 **10200 次 / 17208 MB** 分配流水。
+- 改动：`nvn_mtl.m:3303` `REUP_MAX_BYTES` 1 MB → 4 MB。安全性（subagent 审计 + 本次复看）：复用键只含描述符、无内容哈希，但 `pkg_upload_` 每次**全量覆写**所有 level×layer，复用不会读到旧内容；上限滞留 = 256 槽 × 4 MB，`REUP_IDLE=600` 提交后退。
+- **实测（c141，40 s，W3 判据）**：`[tex-new] 1728 KB 1600x904` 累计 **8 次 / 10 MB**（此前同窗口约 1200 次）；`重传贴图复用 522 次（留存 524 张，现存 2 张）`；`显卡已分配 2070 MB` 平稳。回归 `stability.sh 3 13` = STABLE。
+
+
 ## 2026-10-22 W1 实施：白屏的线程挂起解除（svc 0x18 空句柄轮询化）+ W0/osinit 取证探针
 
 **实测链（c130→c138，同脚本只差开关）**

@@ -3300,7 +3300,7 @@ uint64_t mtl_upload_bytes(void) { return g_bp_up_bytes; }   // 贴图上传累�
    An upload writes every level and layer, so nothing of the earlier content survives. Unused entries are retired after
    REUP_IDLE submissions; TOTK_REUP_RECYCLE=0 turns it off. */
 #define REUP_MAX 256
-#define REUP_MAX_BYTES (1u << 20)
+#define REUP_MAX_BYTES (4u << 20)   // TOTK (nier W3): the movie planes (1600x904 R8 = 1728 KB allocated) were re-created every frame at the old 1 MB cap; reuse is safe because pkg_upload_ overwrites every level and layer (the key holds no content hash). Ceiling: REUP_MAX x this = 1 GiB parked, retired after REUP_IDLE submissions.
 #define REUP_IDLE 600
 typedef struct { void *tex; uint64_t fence; reup_key k; } reup_ent;   // tex: CFBridgingRetain'd MTLTexture
 static reup_ent g_reup[REUP_MAX]; static int g_nreup; static os_unfair_lock g_reup_lk = OS_UNFAIR_LOCK_INIT;
