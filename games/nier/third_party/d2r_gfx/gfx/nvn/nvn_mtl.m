@@ -5591,6 +5591,13 @@ static struct {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
     float blend_color[4]; int64_t copy_stride;
 } S;
+/* NVNcommandBufferSetAlphaRef 的参考值（由 totk_nvn_ext.c 写入；alpha test 在片元着色器里做，Metal 没有固定功能 alpha test）
+   The alpha test reference set by NVNcommandBufferSetAlphaRef (written by totk_nvn_ext.c; the test is done in the
+   fragment shader because Metal has no fixed-function alpha test). */
+float g_nvn_alpha_ref = 0.0f;   /* NVN default reference: 0 (GREATER 0 = drop fully transparent fragments) */
+/* 参考值变了就要重取管线（管线键里带着 alpha test 变体函数）
+   A changed reference means the pipeline must be fetched again (the pipeline key carries the alpha test variant function). */
+void nvn_mtl_alpha_ref(float r) { { static int n; if (n++ < 8) MLOG("[totk] alpha ref %g", (double)r); } if (r == g_nvn_alpha_ref) return; g_nvn_alpha_ref = r; g_pso_dirty = 1; }
 // No render target set: no colour target and no depth / stencil (a pass of rasterization only, see rp_begin_ex)
 static int rt_none(void) {
     if (!R.has_rt || R.rt.depth) return 0;
@@ -5970,6 +5977,61 @@ static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
         if (!fn) MDIE("fragment shader %s with emulated sampler border colour: %s", fs->key, err.localizedDescription.UTF8String);
         if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
         fs->bpatch[key] = fn;
+    }
+    os_unfair_lock_unlock(&lock);
+    return fn;
+}
+/* 片元着色器的 [[color(0)]] 输出字段名（alpha test 的补丁需要它）
+   The [[color(0)]] output field name of a fragment shader (the alpha test patch needs it). */
+static NSString *fs_color0_field(NSString *src) {
+    NSRange st = [src rangeOfString:@"struct main0_out"];
+    if (st.location == NSNotFound) return nil;
+    NSUInteger lim = MIN((NSUInteger)4000, src.length - st.location);
+    NSRange br = [src rangeOfString:@"{" options:0 range:NSMakeRange(st.location, lim)];
+    if (br.location == NSNotFound) return nil;
+    lim = MIN((NSUInteger)4000, src.length - br.location);
+    NSRange en = [src rangeOfString:@"};" options:0 range:NSMakeRange(br.location, lim)];
+    if (en.location == NSNotFound) return nil;
+    NSString *body = [src substringWithRange:NSMakeRange(br.location, en.location - br.location)];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"([A-Za-z_]\\w*)\\s*\\[\\[color\\(0\\)\\]\\]" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+    return m ? [body substringWithRange:[m rangeAtIndex:1]] : nil;
+}
+/* NVN alpha test 的 Metal 实现：Metal 没有固定功能 alpha test，把它补进片元着色器（失败即 discard_fragment）。
+   变体按（函数, 参考值位模式）缓存；参考值以 as_type<float> 内联，避免浮点字面量的精度与格式问题。
+   Metal's implementation of the NVN alpha test: Metal has no fixed-function alpha test, so it is patched into the
+   fragment shader (discard_fragment on failure). Variants are cached per (function, reference bit pattern); the
+   reference is inlined as as_type<float> to avoid float literal precision and formatting issues. */
+static id<MTLFunction> fs_fn_alpha(NvShader *fs, int func, float ref) {
+    if (!fs || !sh_has_src(fs) || !func || func == NVN_ALPHA_FUNC_ALWAYS) return nil;
+    uint32_t rb; memcpy(&rb, &ref, sizeof rb);
+    NSString *key = [NSString stringWithFormat:@"alpha:%d:%08x", func, rb];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; os_unfair_lock_lock(&lock);
+    id<MTLFunction> fn = fs->bpatch[key];
+    if (!fn) {
+        NSString *src = sh_src(fs), *field = fs_color0_field(src);
+        if (!field) { os_unfair_lock_unlock(&lock); RED_ONCE(71, "alpha test: fragment shader %s has no [[color(0)]] output", fs->key); return nil; }
+        NSString *a = [NSString stringWithFormat:@"out.%@.a", field], *r = [NSString stringWithFormat:@"as_type<float>(0x%08xu)", rb], *cond = nil;
+        switch (func) {
+        case NVN_ALPHA_FUNC_NEVER: cond = @"false"; break;
+        case NVN_ALPHA_FUNC_LESS: cond = [NSString stringWithFormat:@"%@ < %@", a, r]; break;
+        case NVN_ALPHA_FUNC_EQUAL: cond = [NSString stringWithFormat:@"%@ == %@", a, r]; break;
+        case NVN_ALPHA_FUNC_LEQUAL: cond = [NSString stringWithFormat:@"%@ <= %@", a, r]; break;
+        case NVN_ALPHA_FUNC_GREATER: cond = [NSString stringWithFormat:@"%@ > %@", a, r]; break;
+        case NVN_ALPHA_FUNC_NOTEQUAL: cond = [NSString stringWithFormat:@"%@ != %@", a, r]; break;
+        case NVN_ALPHA_FUNC_GEQUAL: cond = [NSString stringWithFormat:@"%@ >= %@", a, r]; break;
+        }
+        if (!cond) { os_unfair_lock_unlock(&lock); return nil; }
+        NSMutableString *patched = [NSMutableString stringWithString:src];
+        NSString *ins = [NSString stringWithFormat:@"{ if (!(%@)) discard_fragment(); return out; }", cond];
+        NSUInteger n = [patched replaceOccurrencesOfString:@"return out;" withString:ins options:0 range:NSMakeRange(0, patched.length)];
+        if (!n) { os_unfair_lock_unlock(&lock); RED_ONCE(72, "alpha test: fragment shader %s has no 'return out;' to guard", fs->key); return nil; }
+        NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(patched, &err);
+        fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+        if (!fn) MDIE("fragment shader %s with alpha test: %s", fs->key, err.localizedDescription.UTF8String);
+        if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
+        fs->bpatch[key] = fn;
+        { static int said; if (said++ < 8) MLOG("[totk] alpha test: fragment shader %s patched (func %d, ref %g, %lu return paths)", fs->key, func, (double)ref, (unsigned long)n); }
     }
     os_unfair_lock_unlock(&lock);
     return fn;
@@ -6557,6 +6619,16 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0) : nil;   // TOTK: sampler border colour emulation
+    /* TOTK alpha test：Metal 没有固定功能 alpha test，换成补了 discard 的片元变体（按 函数+参考值 缓存）
+       TOTK alpha test: Metal has no fixed-function alpha test, so a fragment variant with the discard patched in is used
+       (cached per function + reference). */
+    if (!g_pso_lmap && !g_mfx.role && S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) {
+        id<MTLFunction> afn = fs_fn_alpha(fs, S.color.alpha_func, g_nvn_alpha_ref);
+        if (afn) {
+            if (bfn) RED_ONCE(73, "alpha test 与采样器边界色仿真落在同一次绘制：用 alpha test 变体（边界色仿真缺席）");
+            bfn = afn;
+        }
+    }
     if (bfn) k.fsfn = (__bridge void *)bfn;
     { float bc[8][4]; int ba[8], bn; if (border_key(vs, 0, bc, ba, &bn)) k.a2c |= PSO_VBORDER; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
