@@ -449,6 +449,11 @@ static int h_release_output(void *obj, int index) {
     Movie *m = find(obj); if (!m) return ((i_fn)G.orig[MOVIE_RELEASE_OUTPUT])(obj, index);
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
+    { static int on = -1; static unsigned nrel;   /* W2: does the player return the slots it acquires? The decoder
+           finished 74 frames (so most slots came back), but acquiring stopped at total=53 with the EOS still
+           queued — the release rate around that point tells "8 slots held = starved" from "player moved on". */
+      if (on < 0) on = getenv("NIER_MOVIE_LOG") != NULL;
+      if (on && (++nrel <= 3 || nrel % 20 == 0)) LOG("[movie] release #%u idx=%d", nrel, index); }
     int st = ST_ERROR;
     if (index >= 0 && index < OUT_BUFS && m->out_held[index]) {
         int queued = 0; for (int i = 0; i < m->nready; i++) queued |= m->ready[i].index == index;
