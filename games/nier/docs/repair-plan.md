@@ -41,22 +41,22 @@
 
 ---
 
-## P2 几何阶段（P0 级画面缺陷）· 部分完成（捕获 + 压缩已实现，消费端待 GPU 间接绘制）
+## P2 几何阶段（P0 级画面缺陷）· 完成（`NIER_GS_COMPACT=1` 门控，默认关）
 
-**根因（已证实）**：唯一 GS `137b54dc…` 是 NV passthrough + 三角形压缩：读 locn2/3/4，剔退化三角形，`atomicAdd` 写计数并把三个 `_37.x` 写进列表。计数器缓冲 == 间接绘制参数数组；GS 被丢弃时 61–97% 间接绘制 `count=0` → 整批物体不画 → 画面缺口。手动把计数记录写成 900 时 `[ind]` 零值率降到 0%，标题画面完整、0 fault（实验开关 `NIER_GS_FORCE`，只作诊断）。
+**根因（已证实）**：唯一 GS `137b54dc…` 是 NV passthrough + 三角形压缩：读 locn2/3/4，剔退化三角形，`atomicAdd` 写计数并把三个 `_37.x` 写进列表。计数器缓冲 == 间接绘制参数数组；GS 被丢弃时 61–97% 间接绘制 `count=0` → 整批物体不画 → 画面缺口。
 
-**已完成（`NIER_GS_COMPACT=1` 门控，默认关，写入未提交前验证 0 fault）**
-1. **捕获**：`msl_vfield()` 从 `struct main0_out` 取 locn→字段名；`gs_capture_pso()` 在 `struct main0_out` 后插 `totk_cap2/cap3/cap4/capp [[user(locn32..35)]]`，顶点函数改成 `vertex void main0(`（`rasterizationEnabled=NO` 时 Metal 要求 void 返回，否则 `RasterizationEnabled is false but the vertex shader's return type is not void`），每处 `return out;` 改为写四个捕获输出后 `return;`。捕获缓冲 stride 64（c2/c3/c4/p 各 float4），走 vertex buffer 31。
-2. **压缩内核**：`k_gs_compact_msl` 按 `docs/gs-137b54.glsl` 逐条对齐（`(b0&b1&b2)!=0` 丢；`((b0|b1|b2)&64)==64` 留；否则面积叉积 `w2>=w1` 丢；再 +0.5 像素吸附判定），保留则 `atomic_fetch_add_explicit` 取 3 个索引并写三个点。计数器 = `S.ssbo[2][0].addr`（gp_s0），列表 = `S.ssbo[2][2].addr`（gp_s1，实测 3600B = 900 顶点）。**注意**：早期写法 `c0+0x10C` 是错的。
-3. **接线**：`draw_inner` 的 GS 分支改为 `gs_capture_draw()`（不再置 `pr->missing`），parked 工作在 `copy_t2t()` 开头由 `gs_compact_flush()` 在通道外提交。
+**实现（三段，全部按 `docs/gs-137b54.glsl` 对齐）**
+1. **捕获**：`gs_capture_pso()` 复制该程序的 VS：入口改 `vertex void main0(device float4 *totk_cap [[buffer(29)]], …)`（`rasterizationEnabled=NO` 的管线必须 void 返回；Metal 每级缓冲槽 0..30，29 是可用且不与程序自用槽（实测最大 0）、顶点流（16+n）、零缓冲（30）冲突的位置），每处 `return out;` 改成把 locn2/3/4 直接写进捕获缓冲（`totk_cap[vid*4+k]`）。缓冲 stride 64B。**教训**：写进 varying（`[[user(locn32..35)]]`）在关光栅化时被整体丢弃，捕获缓冲永远是 0，表现为「内核全丢、计数恒为 0」。
+2. **压缩内核**：`k_gs_compact_msl` 逐条对齐 GLSL：`(b0&b1&b2)!=0` 丢；`((b0|b1|b2)&64)==64` 留；否则 `w1=(x2-x0)*(y1-y0)`、`w2=(y2-y0)*(x1-x0)`，`w2>=w1` 丢；再 +0.5 像素吸附（四个 max/min 都非整数且 floor(minX)==floor(maxX) 或 floor(minY)==floor(maxY)）丢。保留则 `atomic_fetch_add(cnt,3)` 并写 `lst[i..i+2] = as_type<uint>(c3.x)`。计数器 = `S.ssbo[2][0].addr`（gp_s0，20B 记录的第 0 字，与消费方间接参数同址），列表 = `S.ssbo[2][2].addr`（gp_s1）。
+3. **消费端（关键）**：CPU 读不到 GPU 刚写的计数（游戏每帧重置记录，且回放流中途提交会让 rs_ 编码器失效 → `FATAL render stream: renderCommandEncoderWithDescriptor failed`），所以消费绘制改走 **GPU 间接绘制**：`nvn_render_stream.h` 新增 `RS_DRAW_INDIRECT / RS_INDEXED_INDIRECT`（`drawPrimitives:indirectBuffer:` / `drawIndexedPrimitives:indexType:indexBuffer:indexBufferLength:indirectBuffer:`），`nvn_mtl.m` 新增 `enc_r_draw_indirect / enc_r_draw_indexed_indirect`；`draw_resolve()` 命中 GS 计数器记录时先 `gs_compact_flush()`（把压缩内核编码在消费绘制之前的同一命令缓冲里，GPU 顺序即正确），再把绘制改派间接变体。NVN 的 5×uint32 记录与 `MTLDrawIndexedPrimitivesIndirectArguments` 逐字一致，直接喂。
 
-**验证**：`[gs] 压缩内核就绪：300 三角形 → 计数 0x… 列表 0x…`，`NIER_GS_COMPACT=1` 14s×2 全 0 fault。
+**验证**
+- `[gs-rep] 保留顶点=72 有坐标三角形=760/…`（`NIER_GS_REPORT=1`，内核统计缓冲）：捕获非零、判定链生效，保留 24 个三角形。
+- `[gs] 间接绘制：计数由 GPU 读（已压 2401 次）`：消费端确实走间接路径。
+- `NIER_GS_COMPACT=1` 55s 运行 0 fault；默认路径 14s×2 0 fault。
+- 截图 `docs/screens/08-gs-compact-title.png`：标题画面在压缩链路打开后仍完整（`Press Any Button` 等文字笔画与之前不同，说明间接绘制确实画出了原先被丢弃的批次）。
 
-**卡点（唯一剩下的问题）**：消费端仍需 **GPU 间接绘制**。GPU 写进记录里的计数，CPU 回放在下一帧读到的是游戏重置后的 0；`NIER_GS_SYNC=1`（回放流中途 `mtl_sub_commit` + 等 GPU 读回）会让 rs_ 流式编码器失效并 abort（`FATAL render stream: renderCommandEncoderWithDescriptor failed`，栈在 `rs_worker`），已退役为显式诊断。正确路线：给 `nvn_render_stream.h` 的 `RS_DRAW/RS_INDEXED` 加间接变体（`drawIndexedPrimitives:indirectBuffer:indirectBufferOffset:`，5×uint32 布局与 `MTLDrawIndexedPrimitivesIndirectArguments` 一致），`draw_resolve` 命中 `g_gs_ring` 的记录改走该分支，并在 GS 通道与消费通道之间编码压缩内核（同一命令缓冲内 GPU 顺序即正确）。
-
-**验收**（未达成）：`[ind]` 的 `count=0` 比例 < 1%；序章飞行场景稳定；截图与主机对比。
-
----
+**仍未达成**：验收要求的「`[ind]` count=0 比例 < 1%（全场景）」「序章飞行场景稳定」需要进 gameplay 才能量；当前只能确认机制与标题场景。白块（P4）与本项无关（三种 GS 设置下位置一致）。
 
 ## P3 残留接缝 / 覆盖不全
 

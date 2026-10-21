@@ -1,3 +1,10 @@
+## 2026-10-21 — P2 收尾：几何阶段压缩走 GPU 间接绘制
+
+- **捕获改直写缓冲**：`gs_capture_pso()` 早前把 locn2/3/4 写进 varying（`[[user(locn32..35)]]`），而捕获管线 `rasterizationEnabled=NO`，顶点输出整体丢弃 → 捕获缓冲恒为 0 → 内核全丢、计数恒 0。改成 `vertex void main0(device float4 *totk_cap [[buffer(29)]], …)` 直接写缓冲：槽 29 避开程序自用（实测最大 0）、顶点流 16+n、零缓冲 30；Metal 每级缓冲槽上限 0..30，31 会报 `'buffer' attribute parameter is out of bounds`。
+- **消费端改 GPU 间接绘制**：`nvn_render_stream.h` 增 `RS_DRAW_INDIRECT`/`RS_INDEXED_INDIRECT`；`nvn_mtl.m` 增 `enc_r_draw_indirect`/`enc_r_draw_indexed_indirect`；`draw_resolve()` 命中 GS 计数器时先编码压缩内核（`gs_compact_flush()`）再用间接变体绘制，计数由 GPU 读，不再需要 CPU 同步（`NIER_GS_SYNC` 仍保留为显式诊断，会 abort）。
+- 诊断：`NIER_GS_REPORT=1` 在提交完成回调里读内核统计缓冲（`保留顶点/有坐标三角形`），区分「捕获为空」与「判定全丢」。
+- 实测：`[gs-rep] 保留顶点=72 有坐标三角形=760/300`、`[gs] 间接绘制：计数由 GPU 读（已压 2401 次）`、`NIER_GS_COMPACT=1` 55s 0 fault、默认路径 14s×2 0 fault。
+- 仍未达成：全场景 `[ind]` 零值率与序章场景验收需要进 gameplay（`TOTK_INPUT_SCRIPT` 盲按键仍不稳定）。
 ## 2026-10-21 (later) — P2: the geometry-stage capture and the compaction kernel are implemented; the consumer draw still needs a GPU indirect draw. P4's white blocks are not the geometry stage.
 
 - **P2, implemented and verified (default off, `NIER_GS_COMPACT=1`).** `nvn_mtl.m` now has three pieces:
