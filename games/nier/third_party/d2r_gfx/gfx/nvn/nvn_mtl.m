@@ -297,12 +297,13 @@ static uint64_t gpu_budget_bytes(void) {
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize;
-    /* guest memory pools are wrapped with newBufferWithBytesNoCopy:, so they are reported by currentAllocatedSize but do
-       not consume device memory; counting them made a 2.3 GB scene-pool allocation look like a 5 GB显存 blow-up. */
+    /* guest memory pools are wrapped with newBufferWithBytesNoCopy:, so currentAllocatedSize reports them even though they
+       are the guest's own RAM; a 6.9 GB scene-pool burst once looked like a 5 GB device-memory blow-up. Judge the real
+       allocation only, and print all three numbers. */
     uint64_t zp = guest_pool_bytes(), real = cur > zp ? cur - zp : 0;
     if (real <= budget) return;
     res_site_report(16);
-    MDIE("%s：显卡已分配 %llu MB（其中零拷贝 guest 池 %llu MB，实际 %llu MB）超过预算 %llu MB；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）", where, (unsigned long long)(cur >> 20), (unsigned long long)(cur >> 20), (unsigned long long)(zp >> 20), (unsigned long long)(real >> 20), (budget >> 20));
+    MDIE("%s：显卡已分配 %llu MB（零拷贝 guest 池 %llu MB，实际 %llu MB）超过预算 %llu MB；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）", where, (unsigned long long)(cur >> 20), (unsigned long long)(zp >> 20), (unsigned long long)(real >> 20), (unsigned long long)(budget >> 20));
 }
 // DM_RES_CHECK=1（诊断）：着色器经参数块访问的贴图 / 缓冲若不在驻留集里，打出前 40 个（贴图按父贴图 / 底层缓冲归到实际分配）
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
