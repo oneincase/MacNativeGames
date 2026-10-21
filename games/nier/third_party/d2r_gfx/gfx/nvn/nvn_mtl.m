@@ -157,6 +157,7 @@ static int nogpu(void) {
 - (void)addFeedbackHandler:(MTL4CommitFeedbackHandler)block { if (!handlers) handlers = [NSMutableArray array]; [handlers addObject:[block copy]]; [super addFeedbackHandler:block]; }
 @end
 static void gpu_budget_check(const char *where);
+static uint64_t guest_pool_bytes(void);   /* zero-copy guest memory pools: mapped into Metal, not allocated from device memory */
 static void dead_put_flush(void);
 static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp);
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]);
@@ -295,9 +296,13 @@ static uint64_t gpu_budget_bytes(void) {
 }
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
-    uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;
+    uint64_t cur = (uint64_t)g_dev.currentAllocatedSize;
+    /* guest memory pools are wrapped with newBufferWithBytesNoCopy:, so they are reported by currentAllocatedSize but do
+       not consume device memory; counting them made a 2.3 GB scene-pool allocation look like a 5 GB显存 blow-up. */
+    uint64_t zp = guest_pool_bytes(), real = cur > zp ? cur - zp : 0;
+    if (real <= budget) return;
     res_site_report(16);
-    MDIE("%s：显卡已分配 %llu MB 超过预算 %llu MB；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20));
+    MDIE("%s：显卡已分配 %llu MB（其中零拷贝 guest 池 %llu MB，实际 %llu MB）超过预算 %llu MB；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）", where, (unsigned long long)(cur >> 20), (unsigned long long)(cur >> 20), (unsigned long long)(zp >> 20), (unsigned long long)(real >> 20), (budget >> 20));
 }
 // DM_RES_CHECK=1（诊断）：着色器经参数块访问的贴图 / 缓冲若不在驻留集里，打出前 40 个（贴图按父贴图 / 底层缓冲归到实际分配）
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
@@ -664,6 +669,7 @@ static void pool_res(pidx_ent *p) {   // caller holds g_mu
     res_add((__bridge id<MTLBuffer>)p->buf); res_commit();
     p->res = 1; g_pool_res_n++; g_pool_res_bytes += p->hi - p->lo;
 }
+static uint64_t guest_pool_bytes(void) { return g_pool_bytes; }
 void mtl_pool_res_stats(uint64_t v[4]) {   // registered pools, their bytes, pools / bytes in the residency set
     pthread_mutex_lock(&g_mu); v[0] = (uint64_t)g_pools.n; v[1] = g_pool_bytes; v[2] = g_pool_res_n; v[3] = g_pool_res_bytes; pthread_mutex_unlock(&g_mu);
 }
