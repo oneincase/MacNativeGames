@@ -105,6 +105,14 @@
 2. 脚本化补丁必须带 `assert old in s` 与"替换后行数变化上限"检查（截断事故的教训）。
 3. 稳定性测试固化：`scripts/stability.sh`（13 秒 ×N，统计 `fault=`），每个改动前后各跑一次。
 4. 诊断重打清单（丢失项）：`pass_log`、`cover_log`、`TOTK_LOG_SBUF`、`TOTK_LOG_INDIRECT`、`NIER_GS_COUNTER_HINT`、`TOTK_FULL_VIEWPORT` —— 做法在 `CHANGELOG.md`。
+5. 本轮新增/沿用的诊断开关（全部默认关，只用于定位，不改变默认画面）：
+   - `NIER_T2T_CONVERT=1`：HDR→窗口换格式合成（P0 的修复本体，launcher 已默认打开）。
+   - `NIER_GS_COMPACT=1`：GS 捕获+压缩内核（P2，默认关；打开后 0 fault，但消费端计数仍需 GPU 间接绘制）。
+   - `NIER_GS_FORCE=<n>`：把 GS 计数记录强制成 n 个顶点（只作诊断，会画出错误几何，见 P2 的强制计数实验）。
+   - `NIER_LOG_ALPHATEST`：记录 `logic op / alpha test` 命中的绘制与片元键（P4 排查用）。
+   - `NIER_LOG_GSKEYS`、`NIER_GS_COUNTER_HINT`：记录唯一带 GS 的程序键与每次 GS 绘制的 ssbo2 绑定。
+   - `TOTK_WINDOW_SHOT=<present>[,<present>]:<pattern>`：整窗截图（`%d` 换成 present 号），验证窗口画面的最快手段。
+   - `DM_NVN_PASSDUMP[=<frame>]` + `DM_NVN_PASSDUMP_ALL=1`：抓一帧的全部 pass/绘制/采样器。
 
 ---
 
