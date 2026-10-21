@@ -6408,6 +6408,20 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
         a_idx = di->ibuf;
         if (capn_verts > 65536u) { static int once; if (!once++) MLOG("【红】GS 捕获：索引跨度 %u 过大（count=%u），跳过压缩", capn_verts, vcount); return; }
     }
+    /* A draw may name vertices far past what its bound vertex streams actually cover (the scene load had 300 triangles naming
+       slot 65535). The capture vertex stage fetches vertex (index + base vertex) through raw addresses, so such a draw reads
+       past the pool and the GPU takes a page fault. Clamp the capture window to the streams' extent: the kernel then drops
+       the triangles whose indices fall outside it (its `i0 >= q.capn` branch, counted in `越界`), which is a lost mesh, not a
+       lost queue. */
+    { uint32_t max_valid = 0xffffffffu; int have = 0;
+      for (int st = 0; st < 16; st++) { uint64_t stride = S.stream[st].stride; void *mb = NULL; uint64_t mo = 0, g = 0;
+          if (!S.vbuf[st].address || !stride) continue;
+          /* The fault boundary is the mapped pool, not the declared stream size: a stream that declares one element still
+             lives inside a big pool, and reading past its declaration is harmless. */
+          if (!mtl_gpu_addr(S.vbuf[st].address, 1, &mb, &mo, &g)) continue;
+          uint64_t plen = ((__bridge id<MTLBuffer>)mb).length; if (mo >= plen) continue;
+          uint64_t n = (plen - mo) / stride; if (n < max_valid) max_valid = (uint32_t)n; have = 1; }
+      if (have && capn_verts > max_valid) { static uint64_t cl; if (cl++ < 8 || !(cl % 200)) MLOG("[gs] 捕获：跨度截断 %u → 顶点流覆盖 %u 槽（累计 %llu 笔）", capn_verts, max_valid, (unsigned long long)cl); capn_verts = max_valid; } }
     /* Diagnostic: cap by *index span* (the scene load names 57344/61440/65536 slots for a few hundred triangles, so a
        triangle cap never fires). NIER_GS_MAXCAP=<slots>; 0/absent = no cap. */
     { static long maxcap = -1; if (maxcap < 0) { const char *e = getenv("NIER_GS_MAXCAP"); maxcap = e ? atol(e) : 0; }
