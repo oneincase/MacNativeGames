@@ -121,7 +121,7 @@
 | 里程碑 | 内容 | 判定 |
 |---|---|---|
 | M1 | P0+P1 | **已达成 2026-10-21**：转换默认开（launcher 设 `NIER_T2T_CONVERT=1`）、`stability.sh 10 13` 全 0 fault、标题/序章/菜单画面恢复（截图 `docs/screens/07-composite-boot.png`、`/tmp/nier-shots/noforce1200.png`） |
-| M2 | P2 | `count=0` <1%、飞行场景无缺口 |
+| M2 | P2 | **机制已达成 2026-10-21**（捕获→内核→GPU 间接绘制全链路跑通、0 fault）：`[gs-rep] 保留顶点=72 有坐标三角形=760`、`[gs] 间接绘制：计数由 GPU 读`。**全场景 `count=0`<1% 与飞行场景验收未量**（进 gameplay 的 `TOTK_INPUT_SCRIPT` 盲按键仍不稳定） |
 | M3 | P3+P4 | 无接缝、无白块 |
 | M4 | P5 | 有声 |
 | M5 | 打包验收 | `make app` + 30 分钟连续游玩无 abort/panic |
