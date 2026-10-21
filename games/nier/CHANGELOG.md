@@ -1,5 +1,7 @@
 ## 2026-10-22 W1 后续取证（c143/c144）：宿主事件流正常，白屏收窄到 subsdk0 movie worker 卡条件变量
 
+- **480 s 长观察（c145，无导航）**：三张 `wshot`（120/300/480 s）md5 全同（`a8138bb2…`），worker `h=0x1026` 全程 `nsvc=2` 不动、装载泵 `h=0x1027` nsvc 42764 仍在推进但仍等 `task+0x38`、播放器 `h=0x1025` nsvc 376924 正常轮询。→ **白屏是硬阻塞，不是慢自愈**；根因锁定 movie worker 的条件变量永睡（等一个从未运行的生产者）。
+
 - 探针两处（默认关）：`threads.c` 的 `threads` 转储对 kind-2 等待者补打**条件键字**（`word=`，此前只读 kind-1 的锁字，条件变量等待者的关键判据一直是瞎的）；`movie_host.c` 的 `fire()` 加宿主→客户事件 signal 计数（`NIER_MOVIE_LOG`，前 12 条）。
 - **c143（双次 dump，间隔 4 s）**：全部 kind-2 等待者 `word=0x1` —— 这是 0x1C 的设计（先置键再挂链），不是丢唤醒形态；装载泵 `h=0x1027` 的 nsvc 1248→1510 在推进。**唯独 movie worker `h=0x1026`（entry 在 subsdk0，卡 `main+0xb2fb5c` 的 WaitConditionVariable，key=`…38efa4`）nsvc=2 两次都不动** —— 线程创建后只做过 2 次 svc，第二次就是这次永睡。
 - **c144（fire 计数）**：宿主 decoder 的事件在**持续发出**（`fire #1..#12`，ev0 主要是 EV_INPUT=`…0eb8`），播放器线程 `h=0x1025` 轮询消费正常（nsvc 13780 在涨）。post-EOS acquire total=42/43：播放器拿到 EOS 后只再调 2 次就停手 —— 与"播放器进入影片结束路径"一致。
@@ -570,3 +572,4 @@ keys and saves are never committed. Status lives in [docs/status-1.0.3.md](docs/
 - 门条件不变：仅 HDR 源→LDR 目标、整级 level-0、无偏移、非 3D、非压缩；块压缩目标直接回退（BLOCKRT 关闭下不会出现）。
 - 验证：`NIER_T2T_CONVERT=1` + `TOTK_GPU_ALLOW_SUBMIT=1` stability.sh 13 秒 ×3 与 100 秒实跑全干净（0 fault）；整窗截图 YoRHa 启动序列完整、序章云海/字幕正常（绿色调与场景缺口为 P2/P3 已知残留，与本改动无关）；不带转换的默认路径 13 秒 ×2 干净。
 - launcher 默认 `NIER_T2T_CONVERT=1`（`make app` 重打包生效）；`docs/screens/07-composite-boot.png` 为合成路径下的启动画面。
+
