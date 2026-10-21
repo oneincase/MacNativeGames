@@ -41,18 +41,20 @@
 
 ---
 
-## P2 几何阶段（P0 级画面缺陷）
+## P2 几何阶段（P0 级画面缺陷）· 部分完成（捕获 + 压缩已实现，消费端待 GPU 间接绘制）
 
-**根因（已证实）**：唯一 GS `137b54dc…` 是 NV passthrough + 三角形压缩：读 locn2/3/4，剔退化三角形，`atomicAdd` 写计数并把三个 `_37.x` 写进列表。计数器缓冲 == 间接绘制参数数组；GS 被丢弃时 61% 间接绘制 `count=0` → 整批物体不画 → 画面缺口。手动写计数器可把 0% 归零（已验证）。
+**根因（已证实）**：唯一 GS `137b54dc…` 是 NV passthrough + 三角形压缩：读 locn2/3/4，剔退化三角形，`atomicAdd` 写计数并把三个 `_37.x` 写进列表。计数器缓冲 == 间接绘制参数数组；GS 被丢弃时 61–97% 间接绘制 `count=0` → 整批物体不画 → 画面缺口。手动把计数记录写成 900 时 `[ind]` 零值率降到 0%，标题画面完整、0 fault（实验开关 `NIER_GS_FORCE`，只作诊断）。
 
-**改法（三步，全部新增、默认关）**
-1. **捕获**：用 `vs_fn_for` 的 MSL 打补丁机制给该 VS 生成一个变体，额外 `device float4 *cap [[buffer(21)]]`，把 `m_36/m_34/m_38` 按 `gl_VertexIndex` 写出；绑定用 `MTL4ArgumentTable`（`maxBufferBindCount` 足够），缓冲挂在 `res_add` 上。
-2. **压缩内核**：`kernel void gs_compact(device float4 *cap, device float4 *lst, device atomic_uint *cnt, constant uint&n)`，每线程一个三角形：退化则写 `gl_BuiltIn_5253=0`；否则 `i=atomicAdd(cnt,3)` 后写三个点。计数器地址取 `S.ssbo[2][0].addr`，列表取 `c0+0x10C`。
-3. **接线**：在 `draw_inner` 的 GS 分支里，先跑 capture(draw 前) → compact(draw 后，同一通道外 flush 点)，`pr->missing` 不再置位。
+**已完成（`NIER_GS_COMPACT=1` 门控，默认关，写入未提交前验证 0 fault）**
+1. **捕获**：`msl_vfield()` 从 `struct main0_out` 取 locn→字段名；`gs_capture_pso()` 在 `struct main0_out` 后插 `totk_cap2/cap3/cap4/capp [[user(locn32..35)]]`，顶点函数改成 `vertex void main0(`（`rasterizationEnabled=NO` 时 Metal 要求 void 返回，否则 `RasterizationEnabled is false but the vertex shader's return type is not void`），每处 `return out;` 改为写四个捕获输出后 `return;`。捕获缓冲 stride 64（c2/c3/c4/p 各 float4），走 vertex buffer 31。
+2. **压缩内核**：`k_gs_compact_msl` 按 `docs/gs-137b54.glsl` 逐条对齐（`(b0&b1&b2)!=0` 丢；`((b0|b1|b2)&64)==64` 留；否则面积叉积 `w2>=w1` 丢；再 +0.5 像素吸附判定），保留则 `atomic_fetch_add_explicit` 取 3 个索引并写三个点。计数器 = `S.ssbo[2][0].addr`（gp_s0），列表 = `S.ssbo[2][2].addr`（gp_s1，实测 3600B = 900 顶点）。**注意**：早期写法 `c0+0x10C` 是错的。
+3. **接线**：`draw_inner` 的 GS 分支改为 `gs_capture_draw()`（不再置 `pr->missing`），parked 工作在 `copy_t2t()` 开头由 `gs_compact_flush()` 在通道外提交。
 
-**验收**：`[ind]` 的 `count=0` 比例 < 1%；序章飞行场景稳定；截图与主机对比（云/水/机体齐全）。
+**验证**：`[gs] 压缩内核就绪：300 三角形 → 计数 0x… 列表 0x…`，`NIER_GS_COMPACT=1` 14s×2 全 0 fault。
 
-**风险**：共享层（TotK/by3 也用同一 `nvn_mtl.m`），新代码必须全部 env 门控（`NIER_GS_COMPACT=1`），默认不影响其它游戏。
+**卡点（唯一剩下的问题）**：消费端仍需 **GPU 间接绘制**。GPU 写进记录里的计数，CPU 回放在下一帧读到的是游戏重置后的 0；`NIER_GS_SYNC=1`（回放流中途 `mtl_sub_commit` + 等 GPU 读回）会让 rs_ 流式编码器失效并 abort（`FATAL render stream: renderCommandEncoderWithDescriptor failed`，栈在 `rs_worker`），已退役为显式诊断。正确路线：给 `nvn_render_stream.h` 的 `RS_DRAW/RS_INDEXED` 加间接变体（`drawIndexedPrimitives:indirectBuffer:indirectBufferOffset:`，5×uint32 布局与 `MTLDrawIndexedPrimitivesIndirectArguments` 一致），`draw_resolve` 命中 `g_gs_ring` 的记录改走该分支，并在 GS 通道与消费通道之间编码压缩内核（同一命令缓冲内 GPU 顺序即正确）。
+
+**验收**（未达成）：`[ind]` 的 `count=0` 比例 < 1%；序章飞行场景稳定；截图与主机对比。
 
 ---
 
@@ -66,11 +68,19 @@
 
 ---
 
-## P4 标题白块（GS 放大三角形）
+## P4 标题白块 · 未解（已排除三个假设，改用证据推进）
 
-**根因**：`NIER_KEEP_GS_DRAWS=1` 时把 GS 程序按 VS+PS 画，顶点未放大 → 大三角形糊成白块（标题 logo 最明显）。
+**现象**：标题画面 `NieR:Automata` logo 右侧、`The End of YoRHa Edition` 两侧、`Press Any Button` 附近出现亮白方块，方块内可见字形轮廓（像反白文字/低分辨率放大）。同一画面背景下城市/水面/其余文字都正常。
 
-**改法**：P2 完成后该开关应只剩"draw 是否包含压缩后的列表"的区别；届时删掉 `NIER_KEEP_GS_DRAWS`，统一走 P2 路径。若 P2 未完成，保持默认丢弃。
+**已排除（2026-10-21 实测，截图与日志都可以复现）**
+1. **与 GS 无关**：`NIER_GS_COMPACT=1` 前后、`NIER_GS_FORCE=900` 强制计数、完全不开 GS 三条路都出现同一白块；`NIER_GS_COMPACT=0` 与 `=1` 的标题截图逐像素差异只有 2.1%，白块位置不变。原计划把 P4 归因于 `NIER_KEEP_GS_DRAWS=1` 的放大三角形不成立。
+2. **不是移植的泛光 1/4 叠加**：`DM_NVN_BLOOM_Q=0`（关掉移植自己的泛光捷径、走游戏原链）白块一模一样。
+3. **不是 alpha test / logic op 那批绘制**：新增诊断 `NIER_LOG_ALPHATEST` 显示命中 `logic=3 afunc=5` 的绘制全是 4 顶点全屏四边形（`fs=f7dfe9e1…-1178a6955197_b`，`blend=15` 已开），不是文字批次，且只影响 1920x1080 全屏后处理。
+
+**下一步（按证据推进，不要再猜）**
+1. 用 `TOTK_GPU_HILITE1=<fs key>` 逐个替换可疑片元着色器为纯色，定位真正画白块的批次；先用 `DM_NVN_PASSDUMP_ALL` 抓一帧标题画面的完整 `d` 行（vs/fs key + blend + cmask），按 pass 顺序取最后几个 UI 通道。
+2. 白块内的方块尺寸与「字体图集被按低层 mip / 错误行距采样」吻合，优先查该批次的纹理：`TOTK_TEX_CHECK_ONCE`、纹理 serial 与 format、以及 sampler 的 `mag/min`（`DM_NVN_PASSDUMP` 的 `B … samp` 行）。
+3. 若确认是某张贴图内容没上传（采样到白）：查 `tex_mtl()` 的上传条件与该贴图的 `has_layout`/`mem`。
 
 **验收**：标题 logo 完整、无白块。
 

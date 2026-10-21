@@ -5124,6 +5124,8 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
     }
     if (p->serial) serial_put(p->serial, o);
+    { static int gskeys = -1; if (gskeys < 0) gskeys = getenv("NIER_LOG_GSKEYS") != NULL;   // P2 diagnostic: every program carrying the geometry stage, with its paired VS/FS keys
+      if (gskeys && (o->missing & (1 << 2))) MLOG("[gskeys] prog=%p vs=%s fs=%s gs=%s missing=%#x", (void *)p, o->sh[0] ? o->key[0].UTF8String : "-", o->sh[1] ? o->key[1].UTF8String : "-", o->key[2].UTF8String, o->missing); }
     return o;
 }
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
@@ -5869,6 +5871,20 @@ static NSDictionary<NSNumber *, NSString *> *msl_varyings(NvShader *sh) {
     }
     sh->io = d; return d;
 }
+/* TOTK: msl_varyings maps locn -> declared type; the GS capture patch also needs the FIELD NAME holding that locn. */
+static NSString *msl_vfield(NvShader *sh, int locn) {
+    NSString *src0 = sh ? sh_src(sh) : nil;
+    if (!src0) return nil;
+    NSRange r = [src0 rangeOfString:@"struct main0_out\n{"];
+    if (r.location == NSNotFound) return nil;
+    NSRange e = [src0 rangeOfString:@"};" options:0 range:NSMakeRange(r.location, src0.length - r.location)];
+    if (e.location == NSNotFound) return nil;
+    NSString *body = [src0 substringWithRange:NSMakeRange(r.location, e.location - r.location)];
+    NSString *pat = [NSString stringWithFormat:@"^\\s*(\\w+)\\s+(\\w+)\\s*\\[\\[user\\(locn%d\\)", locn];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:NSRegularExpressionAnchorsMatchLines error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+    return m ? [body substringWithRange:[m rangeAtIndex:2]] : nil;
+}
 /* TOTK: in a layered pass the vertex function also writes the render target array index. The translated entry gets a
    constant at buffer LAY_BUF_INDEX holding the draw's layer within the pass, stored to the output before every return
    of the entry point (SPIRV-Cross names the entry output `out`). Its point-size output is kept in a local instead:
@@ -6000,6 +6016,203 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
     }
     os_unfair_lock_unlock(&lk);
     return f;
+}
+/* ---------- NieR P2: geometry-stage stream compaction (docs/repair-plan.md P2, all gated behind NIER_GS_COMPACT=1).
+   The game's only NVN stage-2 program (GS 137b54dc…) is an NV passthrough that culls degenerate triangles and compacts
+   the surviving vertices' location-3 .x into a storage buffer; the counter word is the indirect-draw parameter record of
+   the same draw, so dropping the GS leaves the draw at count=0 (measured 97% of indirect draws) and whole scene regions
+   stay at the previous frame. Metal has no geometry stage, so the compaction is replayed in two passes:
+   capture — a patched copy of the program's own VS writes, per input vertex, the location-2/3 varyings and its
+   position (a vertex would read it back as a varying only via passthrough, which the GS never emits) into a capture
+   buffer at [vertex_index * 4];
+   compact — a compute kernel runs the GS's own rule per triangle (degenerate when all three location-2 .x have the
+   sign bit set, or the xy cross products in either winding are non-negative, or the +-0.5 pixel-snap test of the GLSL),
+   keeps the survivors in game order with atomicAdd on the counter, and writes their location-3 .x values into the list
+   at c0+0x10C (3 words per triangle). The counter and list addresses are the ones the game bound for the draw. */
+static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap);
+static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged);
+static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs);
+static uint64_t lay_gpu(int offset);
+static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex);
+static int gs_compact_on(void);
+void gs_compact_flush(void);
+static void gs_compact_drain(void);
+static MTLRenderPipelineDescriptor *pso_desc_for_capture(NvProg *pr, id<MTLFunction> cfn) {
+    NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+    pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
+    MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, nil, 0);
+    d.vertexFunction = cfn;
+    d.rasterizationEnabled = NO;   // capture writes the vertex-stage buffer only; nothing rasterises
+    return d;
+}
+/* Patched copy of the program's own VS: after every `return out;` the GS's two read varyings (locn2 / locn3, whatever
+   the translated names are) and the clip position are stored into the extra capture outputs. SPIRV-Cross's GLSL names
+   m_36 / m_34 line up with the MSL fields of locn2 / locn3 (same translated SPIR-V). */
+static id<MTLRenderPipelineState> gs_capture_pso(NvProg *pr) {
+    NvShader *vs = pr->sh[0];
+    NSString *vsrc0 = sh_src(vs);
+    NSString *f2 = msl_vfield(vs, 2), *f3 = msl_vfield(vs, 3), *f4 = msl_vfield(vs, 4);
+    if (!vsrc0 || !f2 || !f3 || !f4) { MLOG("【红】GS 捕获：VS %s 源码或 locn2/3/4 varying 缺失", vs->key); return nil; }
+    static const char *cap_msl =
+        "    float4 totk_cap2 [[user(locn32)]];\n"
+        "    float4 totk_cap3 [[user(locn33)]];\n"
+        "    float4 totk_cap4 [[user(locn34)]];\n"
+        "    float4 totk_capp [[user(locn35)]];\n";
+    NSString *head = @"struct main0_out\n{\n";
+    NSRange r = [vsrc0 rangeOfString:head];
+    if (r.location == NSNotFound) { MLOG("【红】GS 捕获：VS %s 无 main0_out", vs->key); return nil; }
+    NSString *src = [vsrc0 stringByReplacingCharactersInRange:r withString:[head stringByAppendingString:@(cap_msl)]];
+    /* A pipeline with rasterization disabled must have a void vertex entry (Metal rejects a struct return). */
+    src = [src stringByReplacingOccurrencesOfString:@"vertex main0_out main0(" withString:@"vertex void main0("];
+    src = [src stringByReplacingOccurrencesOfString:@"return out;"
+        withString:[NSString stringWithFormat:@"{ out.totk_cap2 = out.%@; out.totk_cap3 = out.%@; out.totk_cap4 = out.%@; out.totk_capp = out.gl_Position; return; }", f2, f3, f4]];
+    NSError *e = nil;
+    id<MTLLibrary> lib = totk_msl_library(src, &e);
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:vs->fn.name] : nil;
+    if (!fn) { MLOG("【红】GS 捕获变体编译失败 vs=%s：%s", vs->key, e.localizedDescription.UTF8String); return nil; }
+    MTLRenderPipelineDescriptor *d = pso_desc_for_capture(pr, fn);
+    if (!d) return nil;
+    id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+    if (!ps) { MLOG("【红】GS 捕获管线建不出 vs=%s：%s", vs->key, e.localizedDescription.UTF8String); return nil; }
+    return ps;
+}
+static const char k_gs_compact_msl[] =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct Cap { float4 c2, c3, c4, p; };\n"
+    "kernel void gs_compact(device Cap *cap [[buffer(0)]], device uint *cnt [[buffer(1)]], device uint *lst [[buffer(2)]],\n"
+    "                        constant uint2& q [[buffer(3)]], uint t [[thread_position_in_grid]]) {\n"
+    "  if (t >= q.x) return;\n"
+    "  device Cap *b = cap + q.y + t * 3;\n"
+    "  Cap a0 = b[0], a1 = b[1], a2 = b[2];\n"
+    "  uint b0 = as_type<uint>(a0.c4.x), b1 = as_type<uint>(a1.c4.x), b2 = as_type<uint>(a2.c4.x);\n"
+    "  bool keep;\n"
+    "  if ((b0 & b1 & b2) != 0u) keep = false;                            /* any common set bit -> drop */\n"
+    "  else if (((b0 | b1 | b2) & 64u) == 64u) keep = true;               /* bit 6 of all lanes -> keep */\n"
+    "  else {\n"
+    "    float ax = a0.c2.x, ay = a0.c2.y, bx = a1.c2.x, by = a1.c2.y, cx = a2.c2.x, cy = a2.c2.y;\n"
+    "    float w1 = (cx - ax) * (by - ay), w2 = (cy - ay) * (bx - ax);\n"
+    "    keep = !(w2 >= w1);                                              /* the GS drops when w2 >= w1 */\n"
+    "    if (keep) {\n"
+    "      float mx = max(ax, max(bx, cx)) + 0.5f, nx = min(ax, min(bx, cx)) + 0.5f;\n"
+    "      float my = max(ay, max(by, cy)) + 0.5f, ny = min(ay, min(by, cy)) + 0.5f;\n"
+    "      bool frac = (mx != floor(mx) || isnan(mx) || isnan(floor(mx)))\n"
+    "               && (nx != floor(nx) || isnan(nx) || isnan(floor(nx)))\n"
+    "               && (my != floor(my) || isnan(my) || isnan(floor(my)))\n"
+    "               && (ny != floor(ny) || isnan(ny) || isnan(floor(ny)));\n"
+    "      if (frac && (floor(ny) == floor(my) || floor(nx) == floor(mx))) keep = false;  /* +-0.5 pixel-snap degenerate */\n"
+    "    }\n"
+    "  }\n"
+    "  if (!keep) return;\n"
+    "  uint i = atomic_fetch_add_explicit((device atomic_uint *)cnt, 3u, memory_order_relaxed);\n"
+    "  lst[i] = as_type<uint>(a0.c3.x);\n"
+    "  lst[i + 1u] = as_type<uint>(a1.c3.x);\n"
+    "  lst[i + 2u] = as_type<uint>(a2.c3.x);\n"
+    "}\n";
+static id<MTLComputePipelineState> gs_compact_pso(void) {
+    static id<MTLComputePipelineState> ps; static int tried;
+    if (!tried) { tried = 1; NSError *e = nil;
+        id<MTLLibrary> lib = totk_msl_library(@(k_gs_compact_msl), &e);
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"gs_compact"] : nil;
+        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+        if (!ps) MLOG("【红】GS 压缩内核编译失败：%s", e.localizedDescription.UTF8String); }
+    return ps;
+}
+/* Run capture for this draw and park the compaction; the parked work flushes outside any render pass (gs_compact_flush,
+   called by copy_t2t / mtl_sub_commit, the same rhythm the old cv_flush kept). draw=900 -> 300 triangles per kernel. */
+typedef struct { id<MTLBuffer> capb, parb; NvShader *vs; void *mb_cap, *mb_cnt, *mb_lst; uint64_t mo_cap, mo_cnt, mo_lst; uint64_t gpu_cap, gpu_cnt, gpu_lst; uint32_t ntri, cap_base; uint32_t *cnt_p; } gs_cpt;
+static gs_cpt g_gs_pend[8]; static int g_gs_pendn;
+static uint64_t g_gs_ring[256];   /* P2 diagnostic: counter records the last captures target */
+static uint32_t *g_gs_prev_cnt;   /* P2 diagnostic: counter of the last compaction, read back at the next flush */
+static int gs_compact_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("NIER_GS_COMPACT"); v = e && e[0] == '1'; } return v; }
+void gs_compact_flush(void);   /* defined after copy_t2t */
+/* Encode the capture draw for one GS-carrying draw. Same argument-table bindings as the game's own draw (the patched VS
+   reads the same attribute streams / uniforms), plus the capture buffer at vertex-buffer slot 31; runs inside the draw's
+   own render pass right before the real draw, so all game state is already bound. */
+static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    if (g_gs_pendn >= 8) return;
+    static int failed; if (failed) return;
+    static dispatch_once_t once;
+    static id<MTLRenderPipelineState> ps;
+    dispatch_once(&once, ^{ ps = gs_capture_pso(pr); if (!ps) failed = 1; });
+    if (!ps) return;
+    uint32_t vcount = dw ? (uint32_t)dw->count : (uint32_t)di->count;
+    uint32_t ntri = vcount / 3;
+    if (!ntri) return;
+    /* One persistent capture buffer per program VS; 900 input vertices is the observed worst case, round to 4096. */
+    NSUInteger capn = ((NSUInteger)ntri * 3 + 4095) & ~4095ul;
+    static NSMutableDictionary<NSString *, id<MTLBuffer>> *bufs;
+    if (!bufs) bufs = [NSMutableDictionary dictionary];
+    NSString *bk = @(pr->sh[0]->key);
+    id<MTLBuffer> capb = bufs[bk];
+    if (!capb || capb.length < capn * 64) {
+        capb = [g_dev newBufferWithLength:capn * 64 options:MTLResourceStorageModeShared];
+        if (!capb) return;
+        res_add(capb); bufs[bk] = capb;
+        MLOG("[gs] 捕获缓冲 vs=%.16s %lu 顶点（%lu KB）", pr->sh[0]->key, (unsigned long)capn, (unsigned long)(capn * 64 >> 10));
+    }
+    uint32_t cap_base = 0;   // one draw per pass; no overlap within a pass
+    id<MTL4RenderCommandEncoder> en = rp_begin();
+    if (!en) return;
+    bind_vertex_streams(en, pr->sh[0]);
+    if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));
+    if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
+    enc_r_vbuf(en, 31, capb.gpuAddress + (NSUInteger)cap_base * 64);
+    enc_r_pso(en, ps);
+    enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, vcount);
+    /* Park the compaction: the counter / list / parameter bindings of the draw, read now. */
+    gs_cpt *q = &g_gs_pend[g_gs_pendn++];
+    *q = (gs_cpt){ .capb = capb, .parb = nil, .vs = pr->sh[0],
+        .ntri = ntri, .cap_base = cap_base };
+    uint64_t c0 = S.ssbo[2][0].addr;              // gp_s0: the GS counter word (same record the indirect draw reads)
+    uint64_t lst = S.ssbo[2][2].addr;             // gp_s1: the compaction list the GS writes (measured 900 words / 3600 B)
+    if (!c0 || !lst) { static int once; if (!once++) MLOG("【红】GS 捕获：计数/列表绑定缺失（ssbo2[0]=%#llx ssbo2[2]=%#llx）", (unsigned long long)c0, (unsigned long long)lst); g_gs_pendn--; return; }
+    if (!mtl_gpu_addr(c0, 4, &q->mb_cnt, &q->mo_cnt, &q->gpu_cnt) || !mtl_gpu_addr(lst, (NSUInteger)ntri * 3 * 4 + 16, &q->mb_lst, &q->mo_lst, &q->gpu_lst)) {
+        g_gs_pendn--; return;
+    }
+    q->gpu_cap = capb.gpuAddress;   /* the counter word is at offset 0 of the ssbo0 record (0x14 stride, one per draw) */
+    q->cnt_p = (uint32_t *)(void *)((uint8_t *)q->mb_cnt + q->mo_cnt);
+    { static int rn; g_gs_ring[rn++ & 255] = c0; }
+}
+/* Flush parked compactions: one compute dispatch each, outside any render pass (the copy_t2t / commit boundary). */
+void gs_compact_flush(void) {
+    { static int pn; if (g_gs_prev_cnt) { uint32_t v = *g_gs_prev_cnt; if (pn++ < 6) MLOG("[gs] 上次压缩后计数=%u", v); g_gs_prev_cnt = nil; } }
+    if (!g_gs_pendn) return;
+    int n = g_gs_pendn; g_gs_pendn = 0;
+    id<MTLComputePipelineState> ps = gs_compact_pso();
+    if (!ps) return;
+    static id<MTL4ArgumentTable> at; static MTL4ArgumentTableDescriptor *ad;
+    if (!at) { ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 5; at = [g_dev newArgumentTableWithDescriptor:ad error:nil]; if (!at) return; }
+    for (int i = 0; i < n; i++) {
+        gs_cpt *q = &g_gs_pend[i];
+        id<MTLBuffer> parb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];   /* constant uint2 q = {ntri, cap_base} */
+        if (!parb) continue;
+        uint32_t *pp = (uint32_t *)parb.contents; pp[0] = q->ntri; pp[1] = q->cap_base;   /* constant uint2 q */
+        res_add(parb);
+        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        rs_sync();
+        [at setAddress:q->gpu_cap atIndex:0]; [at setAddress:q->gpu_cnt atIndex:1]; [at setAddress:q->gpu_lst atIndex:2]; [at setAddress:parb.gpuAddress atIndex:3];
+        id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
+        [ce setArgumentTable:at]; enc_c_pso(ce, ps);
+        enc_c_dispatch(ce, MTLSizeMake((q->ntri + 63) / 64, 1, 1), MTLSizeMake(64, 1, 1));
+        enc_c_end(ce);
+        defer_obj_unref(parb);
+        static int once; if (!once++) MLOG("[gs] 压缩内核就绪：%u 三角形 → 计数 %#llx 列表 %#llx", q->ntri, (unsigned long long)q->gpu_cnt, (unsigned long long)q->gpu_lst);
+        g_gs_prev_cnt = q->cnt_p;
+    }
+}
+/* Flush parked compactions and make their counter words CPU-visible: the game consumes a GS-written count through an
+   indirect draw whose arguments this port resolves on the CPU, and the record is rewritten (zeroed) every frame, so the
+   GPU value must be waited for at the point the resolver reads it. Called from draw_resolve only when that record is one
+   of our counters, so ordinary draws never pay for it. */
+static void gs_compact_drain(void) {
+    if (!g_gs_pendn) return;
+    static int on = -1; if (on < 0) on = getenv("NIER_GS_SYNC") != NULL;
+    if (!on) return;
+    /* Measured and retired: a commit from inside the replay of the render stream makes the stream's encoder state fail
+       (rs_worker: "renderCommandEncoderWithDescriptor failed"), so the counter a consumer draw needs cannot be read on the
+       CPU. The correct route is a GPU indirect draw that reads the record after our dispatch, which needs the indirect
+       variants in nvn_render_stream.h; until then this switch reports itself instead of pretending to work. */
+    RED_ONCE(72, "NIER_GS_SYNC 已退役：回放流中途提交会让编码器失效；GS 计数的正确消费端是 GPU 间接绘制（见 repair-plan P2）");
 }
 // MSL of a depth-exporting fragment function with the depth output kept as a local (see fs_fn_without_depth).
 static NSString *fs_src_without_depth(NvShader *fs) {
@@ -9697,7 +9910,21 @@ static int mfxup_draw(NvProg *pr) {
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
-    if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
+    { static int hint = -1; if (hint < 0) hint = getenv("NIER_GS_COUNTER_HINT") != NULL;   // P2 diagnostic: draws of programs whose geometry stage is skipped — the bindings the GS would have used
+      if (hint && pr && (pr->missing & (1 << 2)) && !g_defer_replaying) { static uint64_t n;
+          if (n++ < 24 || !(n % 2000)) {
+              uint64_t c0 = S.ssbo[2][0].addr;
+              uint32_t cnt = c0 ? *(const uint32_t *)(uintptr_t)c0 : 0;
+              char b[700]; size_t o = 0;
+              for (int r = 0; r < 16 && o < sizeof b - 80; r++) if (S.ubo[2][r].addr) o += snprintf(b + o, sizeof b - o, " ubo%d=%#llx/%u", r, (unsigned long long)S.ubo[2][r].addr, S.ubo[2][r].size);
+              for (int r = 0; r < 16 && o < sizeof b - 80; r++) if (S.ssbo[2][r].addr) o += snprintf(b + o, sizeof b - o, " ssbo%d=%#llx/%u", r, (unsigned long long)S.ssbo[2][r].addr, S.ssbo[2][r].size);
+              MLOG("[gs-hint] F%llu vs=%.16s fs=%.16s count=%u draw=%u inst=%u%s", (unsigned long long)atomic_load(&g_cur_frame),
+                   pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-", cnt,
+                   dw ? dw->count : di ? di->count : 0, dw ? dw->instances : di ? di->instances : 0, b); } } }
+    { static int compact = -1; if (compact < 0) compact = gs_compact_on();   // NieR P2: replay the GS compaction for this draw instead of skipping it
+      if (pr && (pr->missing & (1 << 2))) {
+          if (compact && !g_defer_replaying && !g_frz_state) { gs_capture_draw(pr, dw, di); }
+          else { g_draw_skip[15]++; return; } } }
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
     { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
@@ -9820,8 +10047,18 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         for (int r = 0; r < 4; r++) if (S.tex[1][r]) { int tid = (int)(S.tex[1][r] & 0xfffff); const treg_t *t = tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL;
             MLOG("[draw]   ps slot %d handle %#llx tid %d %s %ux%u fmt=%#x tgt=%d layout=%d mem=%p ser=%llu", r, (unsigned long long)S.tex[1][r], tid, t ? "ok" : "UNREGISTERED",
                  t ? t->t.d.width : 0, t ? t->t.d.height : 0, t ? t->t.d.format : 0, t ? t->t.d.target : 0, t ? t->t.has_layout : 0, t ? (void *)t->t.mem : NULL, t ? (unsigned long long)t->t.serial : 0ull); } } }
-    if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS))
+    if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS)) {
         RED_ONCE(70, "TOTK: logic op %u / alpha test %u not implemented on Metal (drawn without it)", S.color.logic_op, S.color.alpha_func);
+        {   /* TOTK diagnostic NIER_LOG_ALPHATEST: what these draws are (fs key, target, pass, first vertex count) */
+            static int at = -1, n;
+            if (at < 0) at = getenv("NIER_LOG_ALPHATEST") != NULL;
+            if (at && n < 24) { n++;
+                MLOG("[atest] #%d logic=%u afunc=%u fs=%s vs=%s pass=%llu tgt=%ux%u blend=%d vc=%d inst=%d", n, S.color.logic_op, S.color.alpha_func,
+                     pr->sh[1] ? pr->sh[1]->key : "-", pr->sh[0] ? pr->sh[0]->key : "-", (unsigned long long)g_stat_pass,
+                     R.has_rt && R.rt.color[0] ? R.rt.color[0]->d.width : 0, R.has_rt && R.rt.color[0] ? R.rt.color[0]->d.height : 0,
+                     S.color.blend_en, dw ? dw->count : (di ? di->count : 0), dw ? 1 : (di ? di->instances : 0)); }
+        }
+    }
     if (S.render_disabled || S.raster_discard) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_draw_skip[5]++; return; }
     if (exp_skip_fs(pr)) return;   // TOTK_EXP_SKIP_FS (measurement only)
@@ -9975,8 +10212,18 @@ frz_plain:;
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
     }
     enc_r_scissor(en, sc);
-    if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS))
+    if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS)) {
         RED_ONCE(70, "TOTK: logic op %u / alpha test %u not implemented on Metal (drawn without it)", S.color.logic_op, S.color.alpha_func);
+        {   /* TOTK diagnostic NIER_LOG_ALPHATEST: what these draws are (fs key, target, pass, first vertex count) */
+            static int at = -1, n;
+            if (at < 0) at = getenv("NIER_LOG_ALPHATEST") != NULL;
+            if (at && n < 24) { n++;
+                MLOG("[atest] #%d logic=%u afunc=%u fs=%s vs=%s pass=%llu tgt=%ux%u blend=%d vc=%d inst=%d", n, S.color.logic_op, S.color.alpha_func,
+                     pr->sh[1] ? pr->sh[1]->key : "-", pr->sh[0] ? pr->sh[0]->key : "-", (unsigned long long)g_stat_pass,
+                     R.has_rt && R.rt.color[0] ? R.rt.color[0]->d.width : 0, R.has_rt && R.rt.color[0] ? R.rt.color[0]->d.height : 0,
+                     S.color.blend_en, dw ? dw->count : (di ? di->count : 0), dw ? 1 : (di ? di->instances : 0)); }
+        }
+    }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) return;
     /* TOTK diagnostic TOTK_GPU_NOCULL_FROM=<frame>: from that frame on, face culling is disabled for every draw. */
     { static long nocull_from = -2; if (nocull_from == -2) { const char *e = getenv("TOTK_GPU_NOCULL_FROM"); nocull_from = e ? atol(e) : -1; }
@@ -10236,9 +10483,17 @@ static int draw_resolve(const op_hdr *h, void *rec, int indexed) {
     if (h->size < 8 + at + sizeof(p_draw_indirect)) return 1;
     p_draw_indirect t; memcpy(&t, (uint8_t *)rec + at, sizeof t);
     if (t.magic != DRAW_INDIRECT_MAGIC) return 1;
+    if (t.args) { for (int r = 0; r < 256; r++) if (g_gs_ring[r] == t.args) { gs_compact_drain(); static int force = -1; if (force < 0) force = atoi(getenv("NIER_GS_FORCE") ?: "0"); if (force) { uint32_t *fv = (uint32_t *)(uintptr_t)t.args; static int once; if (!once++) MLOG("[gs-force] 把 GS 计数记录强制成 %d 个顶点（args=%#llx 原值 %u）", force, (unsigned long long)t.args, fv[0]); memcpy(fv, (uint32_t[]){ (uint32_t)force, 1, 0, 0, 0 }, 20); } break; } }
     if (t.count_addr) { uint32_t cnt; if (g_nupd) upd_guard(t.count_addr, t.count_addr + 4); memcpy(&cnt, (const void *)(uintptr_t)t.count_addr, 4); if (t.index >= cnt) return 0; }
+    { static int gsmatch; if (t.args) { for (int r = 0; r < 256; r++) if (g_gs_ring[r] == t.args) { gsmatch++; if (gsmatch <= 4 || !(gsmatch % 500)) MLOG("[ind-gs] 间接记录与 GS 计数器同址：args=%#llx 命中 %d 次（当前值 %u）", (unsigned long long)t.args, gsmatch, *(const uint32_t *)(uintptr_t)t.args); break; } } }
     if (g_nupd) upd_guard(t.args, t.args + 20);
     uint32_t v[5]; memcpy(v, (const void *)(uintptr_t)t.args, indexed ? 20 : 16);
+    { static int indlog = -1; if (indlog < 0) indlog = getenv("TOTK_LOG_INDIRECT") != NULL;   // P2 diagnostic: what the CPU-resolved indirect draw actually read, and the running zero-count ratio
+      if (indlog) { static uint64_t total, zero;
+          uint32_t n = t.count_addr ? *(const uint32_t *)(uintptr_t)t.count_addr : v[0];
+          total++; if (!n) zero++;
+          static uint64_t next = 1;
+          if (total == next) { next = total * 2; MLOG("[ind] n=%llu zero=%llu (%.1f%%) args=%#llx count@=%#llx count=%u v0=%u", (unsigned long long)total, (unsigned long long)zero, 100.0 * zero / total, (unsigned long long)t.args, (unsigned long long)t.count_addr, n, v[0]); } } }
     if (!v[0] || !v[1]) return 0;
     if (indexed) {
         p_draw_idx *d = rec; unsigned isz = d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE ? 1 : d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4;
@@ -10616,6 +10871,7 @@ static int copy_t2t_convert(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, uns
     return 1;
 }
 static void copy_t2t(const p_copy_t2t *c) {
+    if (gs_compact_on()) gs_compact_flush();   // NieR P2: parked GS compactions run at a pass boundary, in game order
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
     rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);

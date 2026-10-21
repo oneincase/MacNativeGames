@@ -1,3 +1,34 @@
+## 2026-10-21 (later) — P2: the geometry-stage capture and the compaction kernel are implemented; the consumer draw still needs a GPU indirect draw. P4's white blocks are not the geometry stage.
+
+- **P2, implemented and verified (default off, `NIER_GS_COMPACT=1`).** `nvn_mtl.m` now has three pieces:
+  (1) `msl_vfield()` reads the varying *field names* out of `struct main0_out` (the old code reused `msl_varyings()`,
+  which returns the *types*, so the patch produced `out.float4` and the capture variant failed to compile with
+  "no member named 'float4' in 'main0_out'"); `gs_capture_pso()` appends `totk_cap2/cap3/cap4/capp [[user(locn32..35)]]`
+  after the struct, turns `vertex main0_out main0(` into `vertex void main0(` (Metal refuses a non-void vertex function
+  when `rasterizationEnabled` is NO) and rewrites every `return out;` to store the four capture outputs.
+  (2) `k_gs_compact_msl` follows `docs/gs-137b54.glsl` line by line: drop when `(b0&b1&b2)!=0`, keep when
+  `((b0|b1|b2)&64)==64`, otherwise the area cross product `w2>=w1` drops it, then the +0.5 pixel snap test; a kept
+  triangle takes three indices from `atomic_fetch_add_explicit` and writes the three `_37.x` words. The counter is
+  `S.ssbo[2][0].addr` and the list is `S.ssbo[2][2].addr` — the earlier `c0+0x10C` was simply the wrong address.
+  (3) `draw_inner` parks the capture instead of skipping the draw, and `copy_t2t()` runs `gs_compact_flush()` outside
+  any render pass. Evidence: `[gs] 压缩内核就绪：300 三角形 → 计数 0x… 列表 0x…`, 0 faults over 14 s ×2.
+- **P2, the remaining blocker is the consumer draw.** The count our kernel writes into the game's record is reset by
+  the game before the next frame's CPU replay reads it, so the indirect draw still resolves to 0. Reading it back on
+  the CPU is not possible: committing from inside the replay of the render stream (old `NIER_GS_SYNC=1`) breaks the
+  stream's encoder and aborts in `rs_worker` with "renderCommandEncoderWithDescriptor failed"; that switch now reports
+  itself as retired instead. The correct route is a GPU indirect draw (`drawIndexedPrimitives:indirectBuffer:…`, the
+  5×uint32 record already matches `MTLDrawIndexedPrimitivesIndirectArguments`) plus the compaction encoded between the
+  two passes — the plan file carries the exact steps.
+- **P4: the title-screen white blocks are not the geometry stage.** They look identical with the compaction on, with
+  the counter forced to 900, and with the geometry stage skipped entirely (`NIER_GS_COMPACT=0`); the two title
+  screenshots differ by 2.1% of the pixels and the blocks are in the same place. The port's bloom shortcut
+  (`DM_NVN_BLOOM_Q=0`) makes no difference either, and the `logic op 3 / alpha test 5` draws (new switch
+  `NIER_LOG_ALPHATEST`) are 4-vertex full-screen post quads, not text batches. The earlier changelog entry blamed
+  `NIER_KEEP_GS_DRAWS=1` for them; that attribution is wrong and is corrected here. The block size and the glyph
+  outlines inside them match a font atlas sampled from a wrong mip / stale upload, which is the next probe.
+- **Not committed as a behaviour change:** everything above is behind `NIER_GS_COMPACT=1`; default runs (and the
+  packaged app) are unchanged apart from the retired-drain diagnostic.
+
 ## 2026-10-21 — picture: geometry-stage draws kept, HDR scene copy converted; audio blocked in the guest
 
 - **Replay: geometry-stage programs are diagnosed and skipped (default), with an opt-in draw-anyway mode.**
