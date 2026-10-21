@@ -1009,6 +1009,23 @@ static void cap_step(void) {   // at the start of every submission
         NSError *e = nil; if ([m startCaptureWithDescriptor:d error:&e]) { g_cap_on = 1; g_cap_at = f; } else { MLOG("【红】[capture] could not start: %s", e.localizedDescription.UTF8String); g_cap_at = -1; }
     }
 }
+/* GS 绑定台账：记录本次提交里几何阶段压缩用到的 *guest* 地址与绑给 GPU 的地址，出错时逐个回查池
+   (guest 地址是否仍在映射池里)。页故障来自裸地址绑定，Metal 不会告诉我们是哪一条，所以自己记。 */
+typedef struct { uint64_t ga, gpu, len; uint32_t kind; } gs_bind_rec;
+static gs_bind_rec g_gs_bind[64]; static int g_gs_bindn;
+static void gs_bind_add(uint32_t kind, uint64_t ga, uint64_t gpu, uint64_t len) {
+    if (g_gs_bindn >= 64) return;
+    g_gs_bind[g_gs_bindn++] = (gs_bind_rec){ ga, gpu, len, kind };
+}
+static void gs_bind_dump(const char *where) {
+    static int once; if (once++ >= 3 || !g_gs_bindn) return;
+    MLOG("【红】GS 绑定核对（%s，本次提交 %d 条）：", where, g_gs_bindn);
+    for (int i = 0; i < g_gs_bindn; i++) { void *b = NULL; uint64_t o = 0, g = 0;
+        int ok = g_gs_bind[i].ga ? mtl_gpu_addr(g_gs_bind[i].ga, 1, &b, &o, &g) : -1;
+        MLOG("【红】  #%d 类 %u guest %#llx gpu %#llx 长 %llu → %s", i, g_gs_bind[i].kind,
+             (unsigned long long)g_gs_bind[i].ga, (unsigned long long)g_gs_bind[i].gpu, (unsigned long long)g_gs_bind[i].len,
+             ok < 0 ? "无 guest 地址" : ok ? "池在" : "池已不在"); }
+}
 void mtl_sub_begin(void) {
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     cap_step();
@@ -1016,6 +1033,7 @@ void mtl_sub_begin(void) {
        thread has no pool of its own that drains (frontend.m's lasts the whole game), so what defer_drain, defer_reset,
        warm_claim and pt_apply_request autoreleased before it piled up every submission (nxnative found the same leak:
        an iPhone killed for memory in a shrine, docs/agents/04-graphics.md). */
+    g_gs_bindn = 0;
     g_sub_pool = objc_autoreleasePoolPush();
     if (g_cg.ng) { static int once; if (!once++) MLOG("【红】[cube-merge] 上次提交结束时还有 %d 组没落地（不应发生）", g_cg.ng); g_cg.ng = 0; } g_cg_pending = 0; g_cg.take_seq = ~0ull;
     mtl_init(); g_sub_serial++;
@@ -1942,7 +1960,7 @@ static void mtl_sub_split(void) {
     TotkCommitOptions *o = [TotkCommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         gpu_tag_done(gpu_f, f.GPUStartTime, f.GPUEndTime);
-        if (f.error) { atomic_store(&g_last_commit_error, 1); static int n; if (n++ < 8) MLOG("【红】分段命令缓冲错误 fence=%llu：%s", (unsigned long long)fence_next, f.error.description.UTF8String); }
+        if (f.error) { atomic_store(&g_last_commit_error, 1); static int n; if (n++ < 8) MLOG("【红】分段命令缓冲错误 fence=%llu：%s", (unsigned long long)fence_next, f.error.description.UTF8String); gs_bind_dump("分段"); }
     }];
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 0);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
@@ -6388,6 +6406,10 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     }
     uint32_t ntri = vcount / 3;
     if (!ntri) return;
+    /* Diagnostic: cap which draws are captured, so a fault can be attributed to the large-mesh path (scene load) or to small
+       draws. NIER_GS_MAXTRIS=<triangles>; 0/absent = no cap. */
+    { static long maxn = -1; if (maxn < 0) { const char *e = getenv("NIER_GS_MAXTRIS"); maxn = e ? atol(e) : 0; }
+      if (maxn > 0 && (long)ntri > maxn) { static uint64_t sk; if (sk++ < 8 || !(sk % 200)) MLOG("[gs] 捕获跳过：%u 三角形超过上限 %ld（累计 %llu 笔）", ntri, maxn, (unsigned long long)sk); return; } }
     /* The capture pipeline is per program *and* per pass: it carries the pass's attachment formats, and using one pass's
        pipeline in another is a GPU page fault (silent: the raw-address bindings mean Metal cannot bounds-check anything).
        Cache on the vertex program plus the current pass formats. */
@@ -6431,6 +6453,8 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     else enc_r_draw(en, MTLPrimitiveTypeTriangle, 0, vcount);
     { static uint64_t ni, ii; if (di) ii++; else ni++; if (((ni + ii) & 2047) == 1) MLOG("[gs] 捕获绘制：非索引 %llu 次 / 索引 %llu 次（本帧顶点 %u）", (unsigned long long)ni, (unsigned long long)ii, vcount); }
     /* Park the compaction: the counter / list / parameter bindings of the draw, read now. */
+    gs_bind_add(1, a_idx, gpu_idx, idx_len);              /* 索引缓冲：捕获 pass 与内核都读它 */
+    gs_bind_add(2, 0, capb.gpuAddress + (NSUInteger)cap_base * 64, (uint64_t)capn * 64);   /* 捕获缓冲：捕获 pass 写、内核读 */
     gs_cpt *q = &g_gs_pend[g_gs_pendn++];
     *q = (gs_cpt){ .capb = capb, .parb = nil, .vs = pr->sh[0],
         .ntri = ntri, .cap_base = cap_base, .itype = itype, .capn = capn_verts, .a_idx = a_idx, .gpu_idx = gpu_idx, .idx_off = idx_off };
@@ -6499,6 +6523,7 @@ void gs_compact_flush(void) {
         [at setAddress:q->gpu_cap atIndex:0]; [at setAddress:q->gpu_cnt atIndex:1]; [at setAddress:q->gpu_lst atIndex:2]; [at setAddress:parb.gpuAddress + poff atIndex:3];
         [at setAddress:repb.gpuAddress atIndex:4];
         [at setAddress:q->itype ? q->gpu_idx : repb.gpuAddress atIndex:5];
+        gs_bind_add(3, q->a_cnt, q->gpu_cnt, 4); gs_bind_add(4, q->a_lst, q->gpu_lst, (uint64_t)q->ntri * 12 + 16);
         id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
         [ce setArgumentTable:at]; enc_c_pso(ce, ps);
         enc_c_dispatch(ce, MTLSizeMake((q->ntri + 63) / 64, 1, 1), MTLSizeMake(64, 1, 1));
@@ -10687,6 +10712,7 @@ frz_plain:;
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         if (ind.kind == 2 && di) {   /* NieR P2: indexCount/indexStart read by Metal from the record the kernel wrote */
             { static int noind = -1; if (noind < 0) noind = getenv("NIER_GS_NOIND") != NULL; if (noind) { g_gs_ind_draws++; return; } }  // 诊断：不消费压缩结果
+            gs_bind_add(5, ind.args, ind.gpu, ind.len);
             use_rec("buf", di->ibuf, 2, 0, NULL); use_rec("buf", ind.args, 20, 0, NULL);
             enc_r_draw_indexed_indirect(en, mp, ind.type == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, ind.gpu, (NSUInteger)ind.len, ind.args);
             g_gs_ind_draws++;
