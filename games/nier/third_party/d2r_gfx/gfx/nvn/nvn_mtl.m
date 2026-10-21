@@ -6408,6 +6408,10 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
         a_idx = di->ibuf;
         if (capn_verts > 65536u) { static int once; if (!once++) MLOG("【红】GS 捕获：索引跨度 %u 过大（count=%u），跳过压缩", capn_verts, vcount); return; }
     }
+    /* Diagnostic: cap by *index span* (the scene load names 57344/61440/65536 slots for a few hundred triangles, so a
+       triangle cap never fires). NIER_GS_MAXCAP=<slots>; 0/absent = no cap. */
+    { static long maxcap = -1; if (maxcap < 0) { const char *e = getenv("NIER_GS_MAXCAP"); maxcap = e ? atol(e) : 0; }
+      if (maxcap > 0 && (long)capn_verts > maxcap) { static uint64_t sk; if (sk++ < 8 || !(sk % 200)) MLOG("[gs] 捕获跳过：索引跨度 %u 槽超过上限 %ld（累计 %llu 笔）", capn_verts, maxcap, (unsigned long long)sk); return; } }
     uint32_t ntri = vcount / 3;
     if (!ntri) return;
     /* Diagnostic: cap which draws are captured, so a fault can be attributed to the large-mesh path (scene load) or to small
