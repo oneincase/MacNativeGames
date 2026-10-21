@@ -1,3 +1,13 @@
+## 2026-10-22 — 音频 P0 收口：**动态**证明设备构造函数从未被调用（槽指向确认 + 零调用）
+
+- 新增诊断（默认关）`NIER_AUDIO_SINK_PROBE=1`：`runtime/game_patches.c` 在重定位之后、`main` 封页之前，把设备管理器 vtable 槽 `main+0x12b4428+0xf8 = main+0x12b4520` 改写成宿主桩 `nier_audio_sink_stub`，桩打 `[audiosink] main+0x12b4520 called this=… a1=… a2=… a3=…` 再转发给原函数。
+- **c73 实测（帧 2700，越过装载瞬间）**：
+  - `[audiosink] patched slot main+0x12b4520: main+0xd8c548 -> host stub` —— **槽里原本就是 `main+0xd8c548`**，静态分析里"这个槽指向构造函数"当场成立，偏移没算错；
+  - `grep -c "called this="` = **0**，`audout` 仍 **0** —— 真实游戏流程里这个构造函数**一次都没被调用**。
+- **意义**：这是"guest 从不请求输出"的**第一条动态证据**（此前只有静态的零 BL 调用者 + 日志里没有 `[audio]`/`audout:u`）。结论坐实：在 `audout:u`/HLE 侧做任何事都不会出声，阻塞点在 guest 自己的声音引擎初始化路径里。
+- **下一手**：查"谁该创建这个 manager 对象/走这条 vtable" —— 该槽是 `.data.rel.ro` 里静态初始化的（重定位直接指向 `0xd8c548`），所以不是"对象没建"，而是**调用点所在的引擎状态机没走到**。下一步用 `NIER_AUDIO_SINK_PROBE` 常开 + `passdump`/`runtime_trace_guest` 之外的办法：在 `main+0xd8ad0c`（稳态轮询，文档已定位）入口加同样形式的桩，比较"轮询在跑但没有 sink"这件事的两侧状态。
+- 回归：`stability.sh 3 13` = `STABLE`（探针默认关，不影响运行）。
+
 ## 2026-10-22 — 音频 P0：设备通道数变化**不能**让 guest 请求输出（`COUNT_FIRST` 假设被证伪）
 
 - 前置证据（现成日志，三次运行 c66/c68/c70 一致）：`audout=0` 行、`[audio]=0` 行、`audren=5` 行、`audiodev=2` 行 —— guest 从未打开 `audout:u`，我们的 `nier_audio_open_default` 从未进入（与 `docs/audio-root-cause.md` 的根因一致）。

@@ -37,7 +37,36 @@ static void apply_file(Module *m, const char *slug) {
     fclose(f);
     fprintf(stderr, "[by3] game patch %s: %u sites\n", slug, applied);
 }
+/* NIER audio probe: the engine's audio device constructor (main+0xd8c548) is only reachable through the device manager
+   vtable slot main+0x12b4428+0xf8 = main+0x12b4520, and static analysis says that slot is never called (zero BL callers,
+   no 8-byte data reference). Rewrite the slot, after relocation and before main is sealed, to a host stub that logs the call
+   and forwards to the original: one boot then answers whether the slot is ever taken (and with what `this`). */
+static void *g_audio_sink_orig;
+uint64_t nier_audio_sink_stub(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    fprintf(stderr, "[audiosink] main+0x12b4520 called this=%#llx a1=%#llx a2=%#llx a3=%#llx\n",
+            (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+    fflush(stderr);
+    if (!g_audio_sink_orig) return 0;
+    return ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t))g_audio_sink_orig)(a0, a1, a2, a3);
+}
+static void audio_sink_probe(Module *m) {
+    if (!getenv("NIER_AUDIO_SINK_PROBE")) return;
+    const uint64_t slot_off = 0x12b4520;
+    void **slot = (void **)(m->base + slot_off);
+    uintptr_t orig = (uintptr_t)*slot;
+    if (orig < (uintptr_t)m->base || orig >= (uintptr_t)m->base + m->text_end) {
+        fprintf(stderr, "[audiosink] slot main+%#llx holds %#llx (not text in main); not patched\n",
+                (unsigned long long)slot_off, (unsigned long long)orig);
+        return;
+    }
+    g_audio_sink_orig = (void *)orig;
+    *slot = (void *)nier_audio_sink_stub;
+    fprintf(stderr, "[audiosink] patched slot main+%#llx: main+%#llx -> host stub\n",
+            (unsigned long long)slot_off, (unsigned long long)(orig - (uintptr_t)m->base));
+    sys_icache_invalidate(slot, sizeof *slot);
+}
 void runtime_game_patches(Module *main_module) {
+    audio_sink_probe(main_module);
     const char *list = getenv("BY3_PATCHES");
     if (!list || !*list) { fprintf(stderr, "[by3] game patches: none (BY3_PATCHES)\n"); return; }
     char buf[1024]; snprintf(buf, sizeof buf, "%s", list);
