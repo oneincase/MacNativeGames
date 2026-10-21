@@ -1,3 +1,36 @@
+## 2026-10-22 音频 P0：根因是 `GetDirectoryEntryCount` 把句柄当路径 —— 一句签名错误让整张文件表为空，音库和音频输出全没了
+
+**一句话**：`runtime/fs_host.c` 的 `dir_entry_count(int64_t *out, const char *path)` 把 `nn::fs::GetDirectoryEntryCount(s64*, DirectoryHandle)` 的**第二个参数当成路径**。guest 传进来的是句柄（`0x300000000`+i），我们把它当 `char *` 去 `strlen/opendir` → 垃圾路径 → 返回错误 → 引擎挂载 `rom:/` 时"列举到 0 个条目"，于是整棵 `Hw::DvdSystem` 路径树是空的，`sound/Init.bnk` 与三个 `.wai` 全部"見つかりません"，Wwise 无音库、音频输出也从不初始化。
+
+**证据（`TOTK_FS_LOG=1` 实测，c91 → c93 对照）**
+- 修复前 c91：`[totk-fs] OpenDirectory rom:/ mode 3 raw=726f6d3a2f000000` 成功并列出 34 条，随后第二条 `OpenDirectory u�� mode 3 raw=75a5f5121e0f0000`（就是句柄 `0x300000000` 被当字符串读出的字节）失败 → 之后**没有任何** `GetDirectoryEntryCount`/`ReadDirectory` 调用。
+- 修复后 c93：
+```
+[totk-fs] GetDirectoryEntryCount rom:/ handle=12884901888 -> 34
+[totk-fs] ReadDirectory rom:/ pos=0 n=34 max=34
+[totk-fs] GetDirectoryEntryCount rom:/Enlighten/ -> 364
+[totk-fs] GetDirectoryEntryCount rom:/movie/ -> 158
+[totk-fs] GetDirectoryEntryCount rom:/sound/ -> 9
+[totk-fs] GetDirectoryEntryCount rom:/sound/English(US)/ -> 19
+…
+```
+- 修复后首次真正打开音库：`0.083 rom rom:/sound/bgm/BGM.bnk`、`0.097 WwiseVoiceInfo.wai`、`0.100 WwiseStreamInfo.wai`、`0.101 WwiseInfo.wai`、`0.102 Init.bnk`、`5.870 sound/Japanese/vo_core.bnk`。
+- `[audstate] env` 从 `h=0,0,0` 变成 **`h=0x75f8005a00,0x75f803ee00,0x75f8072800`**（三个音库句柄非 0），`dvdB0` 根节点从空变成有子项（`Enlighten/`、`movie/` …）。
+- 音频输出首次被真正打开（c94，`NIER_TRACE_AUDIO=1`）：
+```
+[audio] OpenDefaultAudioOut parameter u32(+0) 48000 u16(+4) 2 u16(+6) 51966 -> using 48000 Hz x2
+[audio] AudioOut open 48000 Hz x2 PCM16 -> Core Audio (stereo)
+[audio] AudioOut appended 1 buffers, 1024 frames each
+[audio] AudioOut start / stop / close
+```
+启动阶段这种"开→塞 1 个 1024 帧缓冲→start→stop→close"的探测**重复 38 次**（c93 里 `OpenDefaultAudioOut` 38 次，全在启动窗口内），之后不再有音频调用。
+
+**修复**：`dir_entry_count(int64_t *out, uint64_t h)` 改成按**句柄**计数 —— RomFS 句柄直接返回 `d->nrom`，宿主目录在旁路 `opendir` 重数列出（不移动句柄读位置），并按 `TOTK_FS_LOG` 打 `GetDirectoryEntryCount <path> handle=<n> -> <count>`。
+
+**回归**：`sh scripts/stability.sh 3 13` = `run 1/2/3: faults=0` → `STABLE`；c93/c94 均 40 s 到标题、0 崩、无 `signal=`。
+
+**下一手**：①跑完整导航（飞行场景 + BGM/SFX）看 `AppendAudioOutBuffer` 是否持续流动（现在只有启动探测的 38 次）；②若启动探测后仍不持续，检查 Wwise 的缓冲数/延迟要求（探测里每次只塞 1 个 1024 帧缓冲就 stop/close，可能是 Wwise 在测延迟后放弃）。**注意**：这条修复同时也解释了为什么"路径树是空的"和"guest 从不 open sound/"——它们是同一个 bug 的下游。
+
 ## 2026-10-22 音频 P0：声音资源一个都没进 `Hw::DvdSystem`（`sound/Init.bnk` + 3 个 `.wai` 全失败；表结构已 dump）
 
 **工具**：`NIER_AUDIO_STATE_PROBE=1`（只读，`runtime/game_patches.c`，`mach_vm_read_overwrite` 读宿主堆）新增两段：①`SoundSystem::Env` 状态 `[audstate] env y=… h=… obj=… st=…`；②DvdSystem 表 dump `[audstate] dvdA/dvdB/dvdC …`。`logs/c83.sh`（40 s 到标题、帧 900、0 崩）与 `logs/c89.sh`（帧 918）为实测轮。

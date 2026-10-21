@@ -305,7 +305,12 @@ static unsigned open_rom_directory(uint64_t *out, const char *path, int mode) {
     pthread_mutex_unlock(&lock); runtime_fail("host directory handle table full");
 }
 static unsigned open_directory(uint64_t *out, const char *path, int mode) {
-    if (getenv("TOTK_FS_LOG")) fprintf(stderr, "[totk-fs] OpenDirectory %s mode %d\n", path ? path : "(null)", mode);
+    if (getenv("TOTK_FS_LOG")) {
+        if (path) fprintf(stderr, "[totk-fs] OpenDirectory %s mode %d raw=%02x%02x%02x%02x%02x%02x%02x%02x\n", path, mode,
+                          (unsigned char)path[0], (unsigned char)path[1], (unsigned char)path[2], (unsigned char)path[3],
+                          (unsigned char)path[4], (unsigned char)path[5], (unsigned char)path[6], (unsigned char)path[7]);
+        else fprintf(stderr, "[totk-fs] OpenDirectory (null) mode %d\n", mode);
+    }
     if (runtime_romfs_owns(path)) return open_rom_directory(out, path, mode);
     char p[1100]; unsigned r = host_path(path, p, sizeof p); if (r) return r; if (!out || mode < 1 || mode > 3) return R_INVALID_ARGUMENT;
     DIR *d = opendir(p); if (!d) return errno_result();
@@ -317,6 +322,8 @@ static unsigned read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, 
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !count || max < 0 || (!out && max)) return R_INVALID_ARGUMENT;
     Dir *d = &dirs[h - DIR_BASE]; if (!d->dir && !d->rom) return R_INVALID_ARGUMENT;
     int64_t n = 0; struct dirent *e;
+    if (getenv("TOTK_FS_LOG") && d->rom)
+        fprintf(stderr, "[totk-fs] ReadDirectory %s pos=%lld n=%lld max=%lld\n", d->path, (long long)d->pos, (long long)d->nrom, (long long)max);
     if (d->rom) {
         for (; n < max && d->pos < d->nrom; n++, d->pos++) {
             const struct RomEntry *r = &d->rom[d->pos];
@@ -339,19 +346,32 @@ static void close_directory(uint64_t h) {
     pthread_mutex_unlock(&lock);
 }
 
-/* nn::fs::GetDirectoryEntryCount (SDK 12.3.9 imports it): what OpenDirectory would list for the same path and mode. */
-static unsigned dir_entry_count(int64_t *out, const char *path) {
-    if (!out) return R_INVALID_ARGUMENT;
-    uint64_t h = 0; unsigned r = open_directory(&h, path, 3);
-    if (r) return r;
+/* nn::fs::GetDirectoryEntryCount(s64 *out, DirectoryHandle handle): the total entry count of a directory that is
+   already open. The second argument is a handle, not a path -- treating it as a path made every count fail with a
+   garbage "path", which silently left the engine's file table empty and cost the game its sound banks. Counting never
+   moves the handle's read position: RomFS handles know their count, host handles are re-listed on the side. */
+static unsigned dir_entry_count(int64_t *out, uint64_t h) {
+    if (!out || h < DIR_BASE || h >= DIR_BASE + NDIRS) return R_INVALID_ARGUMENT;
+    Dir *d = &dirs[h - DIR_BASE];
+    if (!d->dir && !d->rom) return R_INVALID_ARGUMENT;
     int64_t total = 0;
-    for (;;) {
-        DirectoryEntry e[64]; int64_t n = 0;
-        unsigned rr = read_directory(&n, e, h, 64);
-        if (rr) { close_directory(h); return rr; }
-        total += n; if (n < 64) break;
+    if (d->rom) total = d->nrom;
+    else {
+        DIR *again = opendir(d->path);
+        if (!again) return errno_result();
+        struct dirent *e;
+        while ((e = readdir(again))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || strlen(e->d_name) > 768) continue;
+            char child[2048]; snprintf(child, sizeof child, "%s/%s", d->path, e->d_name); struct stat st; if (stat(child, &st)) continue;
+            int is_dir = S_ISDIR(st.st_mode); if (!(d->mode & (is_dir ? 1 : 2))) continue;
+            total++;
+        }
+        closedir(again);
     }
-    close_directory(h); *out = total; return 0;
+    *out = total;
+    if (getenv("TOTK_FS_LOG"))
+        fprintf(stderr, "[totk-fs] GetDirectoryEntryCount %s handle=%llu -> %lld\n", d->path, (unsigned long long)h, (long long)total);
+    return 0;
 }
 /* The fs heap allocator sizes the guest's fs buffers; host I/O never uses it. */
 static void fs_set_allocator(void *alloc, void *release) { (void)alloc; (void)release; }

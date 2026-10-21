@@ -154,6 +154,21 @@ static void aud_tree_dump(const uint8_t *b) {
     if (cslot) { aud_peek(cslot, &cn, 4); if (cn) aud_peek(cslot + 8, &cbase, 8); }
     fprintf(stderr, "[audstate] dvdC n=%u node=%#llx\n", cn, (unsigned long long)cbase);
     if (cn) aud_tree(cbase, "dvdC0", b);
+    uint64_t m = 0; memcpy(&m, b + 0x12c7888, 8);
+    if (m) {
+        uint64_t w[14] = {0}; char nm[64] = {0};
+        if (aud_peek(m, w, sizeof w)) {
+            if (w[6]) aud_peek(w[6], nm, sizeof nm - 1);
+            fprintf(stderr, "[audstate] mount words=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx path=\"%s\"\n",
+                    (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3],
+                    (unsigned long long)w[4], (unsigned long long)w[5], (unsigned long long)w[6], (unsigned long long)w[7],
+                    (unsigned long long)w[8], (unsigned long long)w[9], (unsigned long long)w[10], (unsigned long long)w[11],
+                    (unsigned long long)w[12], (unsigned long long)w[13], nm);
+        }
+    }
+    uint64_t romname = 0; char rn[64] = {0}; memcpy(&romname, b + 0x12c7880, 8);
+    if (romname) aud_peek(romname, rn, sizeof rn - 1);
+    fprintf(stderr, "[audstate] romname=%#llx \"%s\"\n", (unsigned long long)romname, rn);
     memcpy(&bp, b + 0x12c7888, 8);
     if (bp) {
         aud_peek(bp, &b_n, 4);
