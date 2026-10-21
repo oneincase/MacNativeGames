@@ -105,6 +105,63 @@ static int aud_peek(uint64_t addr, void *dst, size_t n) {
     if (!addr) return 0;
     return mach_vm_read_overwrite(mach_task_self(), addr, n, (mach_vm_address_t)dst, &got) == KERN_SUCCESS && got == n;
 }
+/* The guest resolves "sound/..." through its own Hw::DvdSystem table, not through our FS layer (the FS log never sees
+   a sound path). main+0x982330 matches a path against trees with main+0x981788, where a node is {char *name; ?;
+   child *dirs; child *files} and a child is {char *name; child *next}. The record tables hang off *(main+0x12c7890)
+   (records of 0x70, payload at +8) and *(main+0x12c7888) (count then payload at +8). Dumping the roots and their
+   first directory children answers whether "sound" is registered at all -- i.e. whether the gap is registration. */
+static void aud_tree(uint64_t node, const char *tag, const void *unused) { (void)unused;
+    uint64_t name = 0, dirs = 0, w[6] = {0}; char txt[64] = {0};
+    if (!node) { fprintf(stderr, "[audstate] %s node=0\n", tag); return; }
+    if (!aud_peek(node, w, sizeof w)) {
+        fprintf(stderr, "[audstate] %s node=%#llx unreadable\n", tag, (unsigned long long)node); return; }
+    name = w[0]; dirs = w[2];
+    if (name) aud_peek(name, txt, sizeof txt - 1);
+    fprintf(stderr, "[audstate] %s node=%#llx words=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx name=\"%s\"\n", tag,
+            (unsigned long long)node, (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2],
+            (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[5], txt);
+    /* A node also carries an entry array at word4 with a count at word5 (the "rom:/" root showed ptr,0x40): print the
+       head of that array, dereferencing the first two words of each 0x20-byte slot as candidate name strings. */
+    if (unused && w[4] && w[5] && w[5] < 512) {
+        uint64_t cnt = w[5] < 12 ? w[5] : 12;
+        for (uint64_t i = 0; i < cnt; i++) {
+            uint64_t sl[4] = {0}; char a[48] = {0}, b2[48] = {0};
+            if (!aud_peek(w[4] + i * 0x20, sl, sizeof sl)) break;
+            if (sl[0]) aud_peek(sl[0], a, sizeof a - 1);
+            if (sl[1]) aud_peek(sl[1], b2, sizeof b2 - 1);
+            fprintf(stderr, "[audstate] %s  ent[%llu] %#llx,%#llx,%#llx,%#llx  A=\"%s\" B=\"%s\"\n", tag,
+                    (unsigned long long)i, (unsigned long long)sl[0], (unsigned long long)sl[1],
+                    (unsigned long long)sl[2], (unsigned long long)sl[3], a, b2);
+        }
+    }
+    for (uint64_t c = dirs, i = 0; c && i < 40; i++) {
+        uint64_t cn = 0, nx = 0; char ct[64] = {0};
+        if (!aud_peek(c, &cn, 8) || !aud_peek(c + 8, &nx, 8)) break;
+        if (cn) aud_peek(cn, ct, sizeof ct - 1);
+        fprintf(stderr, "[audstate] %s  dir[%llu] \"%s\"\n", tag, (unsigned long long)i, ct);
+        c = nx;
+    }
+}
+static void aud_tree_dump(const uint8_t *b) {
+    uint64_t a_slot = 0, a_base = 0, a_cslot = 0, bp = 0; uint32_t a_n = 0, b_n = 0;
+    memcpy(&a_slot, b + 0x12c7890, 8); memcpy(&a_cslot, b + 0x12c7898, 8);
+    if (a_slot) aud_peek(a_slot, &a_base, 8);
+    if (a_cslot) aud_peek(a_cslot, &a_n, 4);
+    fprintf(stderr, "[audstate] dvdA base=%#llx n=%u\n", (unsigned long long)a_base, a_n);
+    if (a_n) aud_tree(a_base + 8, "dvdA0", b);
+    uint64_t cslot = 0, cbase = 0; uint32_t cn = 0;
+    memcpy(&cslot, b + 0x12c78b0, 8);
+    if (cslot) { aud_peek(cslot, &cn, 4); if (cn) aud_peek(cslot + 8, &cbase, 8); }
+    fprintf(stderr, "[audstate] dvdC n=%u node=%#llx\n", cn, (unsigned long long)cbase);
+    if (cn) aud_tree(cbase, "dvdC0", b);
+    memcpy(&bp, b + 0x12c7888, 8);
+    if (bp) {
+        aud_peek(bp, &b_n, 4);
+        fprintf(stderr, "[audstate] dvdB n=%u\n", b_n);
+        aud_tree(bp + 8, "dvdB0", b);
+    }
+}
+
 void nier_audio_state_tick(uint64_t frame) {
     static int on = -1, lines; static uint64_t last_obj, last_fp;
     if (on < 0) on = getenv("NIER_AUDIO_STATE_PROBE") != NULL;
@@ -183,6 +240,7 @@ void nier_audio_state_tick(uint64_t frame) {
             (unsigned long long)envy[0], (unsigned long long)envy[1], (unsigned long long)envy[2],
             (unsigned long long)envh[0], (unsigned long long)envh[1], (unsigned long long)envh[2],
             (unsigned long long)envobj, envst[0], envst[1], envst[2]);
+    if (frame == 60 || frame == 600) aud_tree_dump(b);
     fflush(stderr);
 }
 

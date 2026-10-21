@@ -1,3 +1,41 @@
+## 2026-10-22 音频 P0：声音资源一个都没进 `Hw::DvdSystem`（`sound/Init.bnk` + 3 个 `.wai` 全失败；表结构已 dump）
+
+**工具**：`NIER_AUDIO_STATE_PROBE=1`（只读，`runtime/game_patches.c`，`mach_vm_read_overwrite` 读宿主堆）新增两段：①`SoundSystem::Env` 状态 `[audstate] env y=… h=… obj=… st=…`；②DvdSystem 表 dump `[audstate] dvdA/dvdB/dvdC …`。`logs/c83.sh`（40 s 到标题、帧 900、0 崩）与 `logs/c89.sh`（帧 918）为实测轮。
+
+**实测（c83，F=60 与 F=600 完全一致）**
+```
+[audstate] env y=0x10a349658,0x10a349668,0x10a349678 h=0,0,0 obj=0x10a349680 st=0,0x3e3a8bf9,0x6c2a37cc
+```
+- `y` 三个对象确实在堆上分配过（0x10 步长相邻），但三者的**首字段（文件句柄）= 0**，四个 `registData` 返回槽 `st=0,0,0,0`。
+- **语义纠正（推翻上一轮 f920685 的判断）**：`main+0x983b80` 的返回值 **0 = 失败**。成功路径 `0x983c08 str x24,[x20]` + `0x9834a0` 非零；失败 `0x983c34/c68 mov w0,wzr` + `str xzr,[x20]`。上一轮把 `st=0,0,0,0` 读成"四个全成功"是错的，实际是 **`sound/Init.bnk` 与 `sound/WwiseInfo.wai`/`WwiseStreamInfo.wai`/`WwiseVoiceInfo.wai` 四个全部没装进来**。
+- `0x3e3a8bf9`/`0x6c2a37cc` 不是状态码，是 `SE_ListenerPreset`/`SE_ListenerPresetFadeTime` 的 AkUniqueID（`0x9ae220`/`0x9ad7c0` 查表结果）；`Volume_Master` 查到 0。
+
+**装载链路（静态，已核实）**：`main+0x8c9870`（唯一调用者 `0x58f814` ← `0x58f7ec` ← `0x58f75c`）先用 `0x9aca90` 把 `sound/Init.bnk` 格式化进 `*(0x12c6768)` 的 0x200 缓冲，再四次 `0x983b80(obj, 0, path, allocator, flag, 0)`；`0x983b80` 内部是 `0x982330(path)`（找不到就走 `0xf94827` 的 `[Hw::DvdSystem] %sは見つかりません`）→ `0x9974d4`（读入）→ `0x9834a0`（解析）。**卡在第一步 `0x982330` 返回 0**。
+
+**RomFS 侧无问题**：`sound/Init.bnk` 22621 B、`sound/WwiseInfo.wai` 234336 B、`sound/WwiseStreamInfo.wai` 211280 B、`sound/WwiseVoiceInfo.wai` 80064 B 都真实存在于 `runtime-index.bin`（660 条）；`runtime/fs_host.c` 的 `open_rom_directory()` 每次列举都无条件打 `[totk] RomFS directory rom:/: 34 entries`，说明 guest 确实拿到了 34 个条目（只在启动时列举一次，从不列举子目录，也从不 open `sound/` 路径）。
+
+**DvdSystem 表结构（本轮 dump 出来）**：`main+0x982330` 依次查三个来源——
+1. 记录列表：`base=*(*(0x12c7890))`、`count=*(u32*)*(0x12c7898)`，记录 0x70 步长，**flag 在记录 +0（循环用 `ldur w8,[x20,#-8]`，payload 在 +8）**，对 flag≠0 的每条调 `0x981788(rec+8, path)`；
+2. 内联列表 `*(0x12c7888)`（`{u32 count; payload @+8}`）；
+3. 哈希桶表 `*(0x12c78c8)`：`w20=0x7e0` 起每 0x20 一块向下扫 64 桶，桶非空就调 `0x982460`；桶里 `[bucket]` 的 word0 = 种类，**1 = 记录列表**（回到来源 1/2 的链表，0x70 步长）、**2 = cpk 条目**（`x0=[bucket+8]` 再调 `0xaa5780`）。
+`0x981788` 是**路径树匹配**：`strchr(path,'/')`，节点 `{char *name; …; dirs @+0x10; files @+0x18}`，子项 `{char *name; child *next}`，用 `0xd9a260`（定长比较）/`0xd9a270`（整串比较）后递归剩余路径。
+
+**实测 dump（c84–c89，F=60 与 F=600 两次都一样）**
+```
+[audstate] dvdA base=0x7544a7bb98 n=1
+[audstate] dvdA0 node=0x7544a7bba0 words=0,0,0,0,0,0 name=""
+[audstate] dvdC n=0 node=0
+[audstate] dvdB n=1
+[audstate] dvdB0 node=0x10a392cd8 words=0x7544a0e540,0,0,0,0x75449bbc20,0x40 name="rom:/"
+```
+即：`rom:/` 的根节点存在且名字正确，但 **dirs（+0x10）与 files（+0x18）都是 0**，另有一个 64 槽（word5=0x40）数组（word4）**全 0**；来源 1 的唯一记录 flag=0（被跳过）；来源 3 计数为 0。**整棵树是空的** —— 与 `sound/*` 查不到完全一致。
+
+**为什么前面看不到任何 guest 报错**：游戏自己的日志函数 `main+0x9802b4` 是**空实现**（只把 varargs `stp` 进栈就 `ret`），release 版把日志编译掉了；`0x8c9b40` 区域那三条 `[SoundSystem::Env] … 読み込みエラー` 同样不会输出。所以失败是静默的，只能靠探针读状态。
+
+**排除项**：`data200.cpk`…`data207.cpk`、`data300.cpk` 九个 cpk 在 t≈0.000 就被逐个试探（`TOTK_FS_LOG` 行 85–101），RomFS 索引里没有这些名字，格式化串 `data%03d.cpk` 在 main 里也不存在字面量 → 属"按编号范围试探、缺失可容忍"，**不是本轮病因**。
+
+**下一手**：找**谁往树里插节点**（mount 侧），判断是 guest 的 mount 逻辑因我们返回的 `DirectoryEntry` 属性（`type`/`name`/`size`，`runtime/fs_host.c:284` 的 0x310 结构、`type` 0=dir/1=file）而整段跳过，还是根本走了另一条 mount 路径；同时可 dump 来源 3 的 64 桶看有没有 live 条目。**注意**：`/Volumes/bit2t` 卷上改完 `runtime/*.c` 必须 `touch` 再 `make`，否则 make 会因为 mtime 粒度输出 `Nothing to be done for 'runtime'` 拿旧二进制跑（c82 就这么白跑一轮）。
+
 ## 2026-10-22 — 音频 P0 第 3 步：**修正上一条**——四个音库装载其实**全失败**，卡点在更上游的 guest `Hw::DvdSystem` 路径查找
 
 - 探针再扩一组（仍 `NIER_AUDIO_STATE_PROBE=1`、只读）：游戏自己的 `SoundSystem::Env` 状态。对象三层读法 —— 槽 `main+0x12c66c8/+0x12c6788/+0x12c66d0` 是**对象指针**（堆上 0x10 字节结构，首字段才是文件句柄），槽 `main+0x12c66d8` 是引擎对象，`main+0x12c66e8/+0x12c67a8/+0x12c67b0` 存 GameSync 的返回；新增输出行 `[audstate] env y=…, h=…, obj=…, st=…`（`y` = 三个对象指针，便于区分"指针在/不在"与"字段为 0"）。
