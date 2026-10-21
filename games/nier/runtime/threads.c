@@ -318,6 +318,25 @@ static void wake_sync_waiters(void) {
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }
 }
 
+/* W5 trace (docs/plan-2026-10-22.md, NIER_TRACE_SVC0=1): first occurrence of every condition key used in a 0x1C
+   wait or a 0x1D signal, with the symbolized caller (lr). A key that only ever "wait"s names the CV whose
+   producer never runs; a key waited under one address and signalled under another is the same CV through an
+   alias mapping. Linear table, 48 keys, 64 lines, default off. */
+static void cv_trace(int num, uint64_t key, uint64_t lr) {
+    static int on = -1, lines;
+    struct cvk { uint64_t key; int sig; };
+    static struct cvk seen[48]; static int n_seen;
+    if (on < 0) on = getenv("NIER_TRACE_SVC0") != NULL;
+    if (!on || lines >= 64) return;
+    int is_sig = num == 0x1D;
+    for (int i = 0; i < n_seen; i++) if (seen[i].key == key && seen[i].sig == is_sig) return;   /* already logged */
+    if (n_seen < 48) seen[n_seen++] = (struct cvk){key, is_sig};
+    const char *mn = "?"; uint64_t mo = 0; runtime_module_offset(lr, &mn, &mo);
+    fprintf(stderr, "[cvtrace] %s key=%#llx lr=%s+0x%llx\n", is_sig ? "SIGNAL" : "wait  ",
+            (unsigned long long)key, mn, (unsigned long long)mo);
+    lines++;
+}
+
 static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ll + ts.tv_nsec; }
 void dm_guest_clock_advanced(void) {
     if (!dm_detclock_enabled()) return;
@@ -431,9 +450,9 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
-    case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
+    case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;    case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
+        cv_trace(num, key, regs[30]);
         pthread_mutex_lock(&G);
         // 顺序要紧：先置条件键 = 1，再放互斥锁。SDK 的 InternalConditionVariable::Signal 在用户态先读条件键、为 0 就不发 svc 0x1D；
         // 用户态抢互斥锁也不经过 G。原先先 lock_handoff 后置键：放锁后、置键前，别的线程可在用户态抢到锁、改完条件、读到键 0 就不唤醒，
@@ -463,6 +482,7 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
+        cv_trace(num, key, regs[30]);
         pthread_mutex_lock(&G);
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
