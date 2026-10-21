@@ -1,3 +1,22 @@
+## 2026-10-22 — 音频 P0：设备对象**建好了、ready=1**，卡在「open 输出」这一步没人调用（探针 + 修正上一条结论）
+
+- 新增诊断（默认关）`NIER_AUDIO_STATE_PROBE=1`：`runtime/game_patches.c` 的 `nier_audio_state_tick()` 由 `runtime/gfx_bridge.c` 的 `runtime_watch_tick()` 每帧驱动，每 60 帧读一次 guest 静态内存并打一行 `[audstate]`（值变化时打、每 600 帧再打一次证明活着，总行数封顶 64）；对象指针/门控字都顺着 `*(base+got)` 的 `R_AARCH64_RELATIVE` 重定位值取，不写 guest、不改文本。
+- **两个实现要点（都吃过亏）**：
+  - 设备对象不在镜像里：guest `operator new` 由宿主堆兑现，槽 `main+0x12cc9d8` 里是**宿主指针**（c74 实测 `0x7d453e0080`），所以按镜像偏移取字段会全读成 0 —— 改用 `mach_vm_read_overwrite` 拷 0x110 字节，读不到就报 `ok=0`，不会把探针自己搞崩。
+  - 上一版 c74 用 `vo` 边界检查把宿主指针判成无效，`ch/ready` 被打成占位 0 —— **那两行数字不可用**，以 c75 为准。
+- **c75 实测（同一脚本，帧 60 起就稳定，直到帧 600）**：
+  - `[audstate] F=60 obj=0x71c53e0080 ok=1 vt=0x10e81c458 ch=2 ready=1 a7=0x1 at2c=0 acq=1 flag=0`
+  - `vt = main+0x12b4458`（对象真带上了设备类 vtable）、`ch = 2`（obj+0x108）、`ready = 1`（obj+0x10c）；
+  - `F=600` 同一行 —— 状态从头到尾没变过（不是"来不及"，是**稳态停在这里**）；
+  - 0x110 字节 dump 显示 obj+8 起是设备名 `"AudioTvOutput"`（`cmd 10` 的产物），其余字段全 0，obj+0x110 之后是堆邻居 —— 对象就 0x110 字节、没有别的状态。
+- **修正上一条（`7542f44`）的表述**：`main+0xd8c548` 不是构造函数，它是**设备类的 vtable+0xc8 = `OpenDefaultAudioOut` 包装**（同一 vtable 从 `0x12b4458` 起共有 27 个方法槽，`+0x00` 析构 `0xd8aec0`、`+0x18` 轮询用 `0xd8add4`、`+0xc8` 就是 `0xd8c548`）；真正的构造函数是 `main+0xd8ab8c`，它**跑了**（c72 的两次 `cmd 5` 就是它造成的），对象建出来并置了 `ready=1`。
+- **修正"cmd 10/12 从不出现"这条证据**：`runtime/audio_mixer.c:749/759` 的 cmd 10/12 trace 只在 `NIER_TRACE_AUDIO` 下才打（`:755` 的 cmd 5 才是无条件打印），c72 没开这个开关 —— 所以"缺席"不成立；`acq=1`（`main+0x2bc8858`）说明 `AcquireAudioDeviceNotificationForOutput`（cmd 12）**曾经成功过**，设备事件早就在手。
+- **因此本轮结的论**：guest 声音引擎的**设备层已经走完**（构造 → vtable → 设备名 → 通道数 2 → 拿事件 → ready=1），稳态轮询 `main+0xd8ad0c` 每帧由引擎 tick `main+0xcdc7e8` 调用；真正没走的是**下一步：对 vtable+0xc8 的派发**（即 `OpenDefaultAudioOut` 包装 `main+0xd8c548`，c73 动态 0 次）。这也解释了为什么在 `audout:u`/HLE 侧怎么改都不会出声。
+- **补充事实（下一手要用）**：`nn::os::TryWaitSystemEvent` 在本工程里**不是宿主 HLE 符号**（`runtime/` 里 `grep TryWaitSystemEvent` 为空，`threads.c:597` 的 SystemEvent 支持是走 `guest_sym()` 找 guest 内的 sdk 实现），所以"轮询有没有在跑"不能靠 import observer，只能靠改入口或读状态。设备槽 `0x12cc9d8` 的静态读取点只有 4 处：`0xcd687c`（引擎侧 getter）、`0xd8ac24`（构造尾部写）、`0xd8acd0`（销毁：`[vt](obj)` + `operator delete` + 清槽）、`0xd8ad18`（轮询）。
+- **顺带发现一个真阻塞**：c73/c74 都在**帧 ≈2770（约 104 s）**崩在同一处 `main+0x996d84`（`str x8,[x9,#0x20]!`，x9=0，guest 链表摘除；`fault=0x77`、`region=main` `prot=0x505`），崩前正在翻新着色器 + `CreateThread`；而同样输入脚本的 c68/c71/c72 分别跑到 4800/7200/7200 帧无崩。下一轮用**同一二进制、只差探针开关**做 A/B，先判是不是探针引入。另：c75 只跑到帧 600 是因为上一轮残留的 `logs/c74.sh` 末尾 `pkill -f build/nier-native` 把新实例杀了（环境坑复现），不是崩溃。
+- 回归：`stability.sh 3 13` = `STABLE`（探针默认关）。
+- **下一手**：给 vtable+0xc8 的**派发点**定位 —— 沿 `0xcd687c`（getter）与设备类的 `+0x78/+0x90…+0x110` 方法找"该调 open"的引擎路径；同时开 `NIER_TRACE_AUDIO=1` 跑一轮拿完整音频命令序列（cmd 4/5/10/12 的时间线），把"引擎走到哪一步就不再有音频服务调用"钉死。
+
 ## 2026-10-22 — 音频 P0 收口：**动态**证明设备构造函数从未被调用（槽指向确认 + 零调用）
 
 - 新增诊断（默认关）`NIER_AUDIO_SINK_PROBE=1`：`runtime/game_patches.c` 在重定位之后、`main` 封页之前，把设备管理器 vtable 槽 `main+0x12b4428+0xf8 = main+0x12b4520` 改写成宿主桩 `nier_audio_sink_stub`，桩打 `[audiosink] main+0x12b4520 called this=… a1=… a2=… a3=…` 再转发给原函数。

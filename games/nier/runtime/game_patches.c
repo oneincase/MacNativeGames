@@ -1,5 +1,7 @@
 #include "game_patches.h"
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +76,70 @@ void runtime_game_patches(Module *main_module) {
         for (const char *c = s; *c; c++) if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-')) runtime_fail("BY3_PATCHES: bad patch name");
         apply_file(main_module, s);
     }
+}
+
+/* NIER audio-engine state probe (NIER_AUDIO_STATE_PROBE=1): read-only snapshot of the guest engine's audio-device
+   object, once a second from the present thread.
+   Beyond the sink slot the engine has its own device object (0x110 bytes, built by main+0xd8ab8c). The steady-state
+   poll main+0xd8ad0c has exactly one static caller, main+0xcdc7e8 (the engine tick), and returns at once unless
+   obj+0x10c is set; main+0xd8ab8c writes that byte only when two guest gates allow it (the byte at main+0x2bc78d0+0xa7
+   and the word at main+0x2bc74f8+0x2c) and AcquireAudioDeviceNotificationForOutput returns 0. Reading those statics
+   answers, without hooking guest code and without touching state: is the object built, did the engine ever reach
+   "ready", and which gate says no. The slots are followed through their relocated values (R_AARCH64_RELATIVE), so
+   they work in the loaded module whichever base it got. */
+static uint64_t aud_r64(const uint8_t *b, uint64_t o) { uint64_t v; memcpy(&v, b + o, 8); return v; }
+static uint32_t aud_r32(const uint8_t *b, uint64_t o) { uint32_t v; memcpy(&v, b + o, 4); return v; }
+/* Follow the relocated pointer stored at main+got, add field, and check [off, off+size) stays inside main. */
+static int aud_at(const uint8_t *b, uint64_t got, uint64_t field, uint64_t size, uint64_t *off) {
+    uint64_t base = (uintptr_t)b, a; memcpy(&a, b + got, 8);
+    if (a < base) return 0;
+    a -= base;
+    if (a >= 0x2d00000ull || field > 0x2d00000ull - a || size > 0x2d00000ull - a - field) return 0;
+    *off = a + field; return 1;
+}
+/* The device object is not in the image: the engine allocates it through the guest allocator, which this host serves
+   from the process heap, so the slot holds a plain host pointer. Copy through the kernel interface instead of
+   dereferencing it: an unmapped or freed object then reports unreadable rather than faulting the probe. */
+static int aud_peek(uint64_t addr, void *dst, size_t n) {
+    mach_vm_size_t got = 0;
+    if (!addr) return 0;
+    return mach_vm_read_overwrite(mach_task_self(), addr, n, (mach_vm_address_t)dst, &got) == KERN_SUCCESS && got == n;
+}
+void nier_audio_state_tick(uint64_t frame) {
+    static int on = -1, lines; static uint64_t last_obj, last_fp;
+    if (on < 0) on = getenv("NIER_AUDIO_STATE_PROBE") != NULL;
+    if (!on || frame % 60 || lines >= 64) return;
+    const uint8_t *b = runtime_module_base("main"); if (!b) return;
+    uint64_t off, obj = 0;
+    if (aud_at(b, 0x12cc9d8, 0, 8, &off)) obj = aud_r64(b, off);
+    uint8_t ob[0x110]; int vo = aud_peek(obj, ob, sizeof ob);
+    uint32_t ch = vo ? aud_r32(ob, 0x108) : 0; unsigned ready = vo ? ob[0x10c] : 0;
+    uint64_t vt = vo ? aud_r64(ob, 0) : 0;
+    unsigned a7 = 0, acq = 0, flag = 0; uint32_t at2c = 0; uint64_t ev[4] = {0, 0, 0, 0};
+    if (aud_at(b, 0x12ca938, 0xa7, 1, &off)) a7 = b[off];
+    if (aud_at(b, 0x12cc7c8, 0x2c, 4, &off)) at2c = aud_r32(b, off);
+    if (aud_at(b, 0x12cd3e8, 0, 1, &off)) acq = b[off];
+    if (aud_at(b, 0x12cc948, 0, 1, &off)) flag = b[off];
+    if (aud_at(b, 0x12cd3f0, 0, 32, &off)) for (int i = 0; i < 4; i++) ev[i] = aud_r64(b, off + 8 * i);
+    uint64_t fp = ((uint64_t)ch << 32) ^ ready ^ ((uint64_t)a7 << 8) ^ ((uint64_t)at2c << 12) ^ ((uint64_t)acq << 20)
+                ^ ((uint64_t)flag << 24) ^ ev[0] ^ ev[1] ^ ev[2] ^ ev[3] ^ obj ^ ((uint64_t)vo << 48);
+    if (frame % 600 && fp == last_fp) return;      /* print on change, and once every 10 s to show liveness */
+    last_fp = fp; lines++;
+    fprintf(stderr, "[audstate] F=%llu obj=%#llx ok=%d vt=%#llx ch=%u ready=%u a7=%#x at2c=%#x acq=%u flag=%u "
+            "ev=%#llx,%#llx,%#llx,%#llx\n",
+            (unsigned long long)frame, (unsigned long long)obj, vo, (unsigned long long)vt, ch, ready, a7, at2c, acq,
+            flag, (unsigned long long)ev[0], (unsigned long long)ev[1], (unsigned long long)ev[2],
+            (unsigned long long)ev[3]);
+    if (vo && obj != last_obj) {                   /* first sight of an object (or a new one): full 0x110 bytes */
+        last_obj = obj;
+        for (int row = 0; row < 0x110; row += 0x20) {
+            char line[256]; size_t o = 0;
+            o += snprintf(line + o, sizeof line - o, "[audstate] obj+%#04x:", row);
+            for (int i = 0; i < 0x20; i += 4) o += snprintf(line + o, sizeof line - o, " %08x", aud_r32(ob, row + i));
+            fprintf(stderr, "%s\n", line);
+        }
+    }
+    fflush(stderr);
 }
 
 /* The TotK host hooks the shared graphics layer and the input keys call keep their names and answer "off". */
