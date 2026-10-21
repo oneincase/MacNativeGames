@@ -6339,22 +6339,29 @@ void gs_compact_flush(void) {
     static id<MTL4ArgumentTable> at; static MTL4ArgumentTableDescriptor *ad; static id<MTLBuffer> repb;
     if (!at) { ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 5; at = [g_dev newArgumentTableWithDescriptor:ad error:nil]; if (!at) return; }
     if (!repb) { repb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (!repb) return; res_add(repb); }
+    /* The per-compaction 16 B argument buffer used to be a fresh `newBufferWithLength:` every flush, registered in the
+       residency set and only unref'd later. Measured in the flight scene that turned into 4558 live registrations and a
+       ~1.2 MB/frame device-memory slope (2194 -> 3673 MB between frames 300 and 1800, then the 5 GB budget guard aborted).
+       One persistent ring instead: the contents are rewritten on the CPU right before each dispatch, and the GPU reads a
+       slot only until the frame that encoded it completes, so a 4096-slot ring (64 KB) leaves far more headroom than the
+       2-3 frames in flight. */
+    static id<MTLBuffer> g_parb; static unsigned g_parb_i;
+    if (!g_parb) { g_parb = [g_dev newBufferWithLength:16 * 4096 options:MTLResourceStorageModeShared]; if (!g_parb) return; res_add(g_parb); }
     for (int i = 0; i < n; i++) {
         gs_cpt *q = &g_gs_pend[i];
-        id<MTLBuffer> parb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];   /* constant uint2 q = {ntri, cap_base} */
-        if (!parb) continue;
-        uint32_t *pp = (uint32_t *)parb.contents; pp[0] = q->ntri; pp[1] = q->cap_base;   /* constant uint2 q */
-        res_add(parb);
+        id<MTLBuffer> parb = g_parb;
+        unsigned slot = g_parb_i++ & 4095;
+        NSUInteger poff = (NSUInteger)slot * 16;
+        uint32_t *pp = (uint32_t *)(void *)((uint8_t *)parb.contents + poff); pp[0] = q->ntri; pp[1] = q->cap_base;   /* constant uint2 q */
         rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         rs_sync();
         { uint32_t *rp = (uint32_t *)repb.contents; rp[0] = 0; rp[1] = 0; }
-        [at setAddress:q->gpu_cap atIndex:0]; [at setAddress:q->gpu_cnt atIndex:1]; [at setAddress:q->gpu_lst atIndex:2]; [at setAddress:parb.gpuAddress atIndex:3];
+        [at setAddress:q->gpu_cap atIndex:0]; [at setAddress:q->gpu_cnt atIndex:1]; [at setAddress:q->gpu_lst atIndex:2]; [at setAddress:parb.gpuAddress + poff atIndex:3];
         [at setAddress:repb.gpuAddress atIndex:4];
         id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
         [ce setArgumentTable:at]; enc_c_pso(ce, ps);
         enc_c_dispatch(ce, MTLSizeMake((q->ntri + 63) / 64, 1, 1), MTLSizeMake(64, 1, 1));
         enc_c_end(ce);
-        defer_obj_unref(parb);
         static int once; if (!once++) MLOG("[gs] 压缩内核就绪：%u 三角形 → 计数 %#llx 列表 %#llx", q->ntri, (unsigned long long)q->gpu_cnt, (unsigned long long)q->gpu_lst);
         g_gs_prev_cnt = q->cnt_p;
         static int rep = -1; if (rep < 0) rep = getenv("NIER_GS_REPORT") != NULL;   // P2 measurement: what the kernel actually wrote, read after the submission completes
