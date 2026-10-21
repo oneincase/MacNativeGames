@@ -119,6 +119,22 @@
 
 ---
 
+## P7 长会话 abort：CubeArray 深度超过 Metal 上限（341 立方体）· 完成（2026-10-21）
+
+**现象**：`nier.log` 帧 13257（飞行场景之后的战斗段）被 Metal 断言杀进程：`MTLTextureDescriptor arrayLength (768) … max allowed size (341)`，栈 `pkg_upload ← tex_mtl ← prepare_draw_textures ← draw_inner`。
+
+**根因**：`tex_desc()` 把 NVN `CUBEMAP_ARRAY` 的 `depth` 直接当立方体数写进 `arrayLength`；游戏声明 `16x16x768 级 5 格式 0x29`（4608 面 / 18 MB）。Metal 的 slice 预算是 2048，cube array 的上限是 `2048/6=341`（实测 342 也 abort；`MTLDevice` 没有可读的 `maxTextureArrayLayers`）。
+
+**改法**
+1. `tex_desc_fixup()`：宽高 1..16384、3D 深度 1..2048、级数 ≤15 且按尺寸、`arrayLength` ≤2048、cube array ≤341、MSAA 样本数规范化；超限打 `[tex]` 一行（前 6 次 + 每 500 次）。
+2. `mt_slices()` + `pkg_upload_`/`wb_write_list`：逐 slice 拷贝与写回截到已建纹理的实际 slice 数；guest 内布局（`nvn_tex_layout`）不动。
+
+**验收**：`[tex]` 修正行 + `[tex] 拷贝按 Metal 上限截断 … 2046 层` + `TOTK_TEX_UP_PROBE=1` 的 `[tex-probe]` 行；进程不再 abort。
+
+**风险**：Metal 放不下的 341..767 立方体永远缺失（若游戏真用到那一段，画面会少反射/探针）；`mtl_read_texels()` 的 GPU 内容回读路径未截断（该贴图目前不回读）。
+
+---
+
 ## 里程碑
 
 | 里程碑 | 内容 | 判定 |
@@ -128,3 +144,4 @@
 | M3 | P3+P4 | 无接缝、无白块 |
 | M4 | P5 | 有声 |
 | M5 | 打包验收 | `make app` + 30 分钟连续游玩无 abort/panic |
+| M6 | P7 | **已达成 2026-10-21（描述符 + 截断验证）**：CubeArray 768 层按 341 建、拷贝 2046 层、不再 abort；场景内绑定画面未验证 |

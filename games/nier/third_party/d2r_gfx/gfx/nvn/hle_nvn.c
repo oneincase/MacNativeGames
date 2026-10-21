@@ -412,6 +412,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     }
     o->serial = nvn_new_serial();
     live_put(o);
+    totk_tex_diag_probe(o);   // TOTK: diagnostic hook, off unless TOTK_TEX_UP_PROBE is set
     if (totk_life_match(o)) totk_life_log("init tex=%p ser=%llu mem=%p", (void *)t, (unsigned long long)o->serial, (void *)o->mem);
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);

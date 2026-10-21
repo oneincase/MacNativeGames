@@ -1,3 +1,13 @@
+## 2026-10-21 — 长会话 abort：CubeArray 768 立方体超过 Metal 上限（341）
+
+- **现象**：`NIER_build/logs/nier.log`（14:03，帧 13257，进度在飞行场景之后的战斗段）进程被 Metal 断言杀掉：`MTLTextureDescriptor arrayLength (768) is set to zero or greater than the max allowed size (341)`；栈 `pkg_upload ← tex_mtl ← tex_by_id ← prepare_draw_textures ← draw_inner`，即"游戏第一次把某张贴图绑到绘制上"时建纹理失败，不是 guest fault。
+- **实测限制**：新增 `scripts/diag/metal_tex_limits_probe.m`（个案 fork 子进程，避免断言吞输出；`MTLDevice` 没有 `maxTextureArrayLayers` 属性可读）在 M5 上量到：1D/2D/2DMS 阵列最多 2048 slice；**CubeArray 的 `arrayLength` 按立方体数计、共用 2048 slice 预算 → 最多 341 立方体（2046 面），342 与 768 都被断言杀掉**。三个参考工程（nier / nxnative / d2r-mobile）都没有这条上限保护，nxnative 只有 `depth>2048` 的静默丢纹理。
+- **根因**：`tex_desc()` 把 NVN `CUBEMAP_ARRAY` 的 `depth` 直接当立方体数写进 `arrayLength`。游戏声明 `16x16x768 级 5 格式 0x29`（= 4608 面 / 18 MB），Metal 一张纹理放不下。
+- **改法**：新增 `tex_desc_fixup()`（宽高 1..16384、3D 深度 1..2048、级数按尺寸上限且 ≤15、`arrayLength` ≤2048、**cube array ≤2048/6=341**、MSAA 样本数规范化，超限打一行 `[tex]` 日志，前 6 次 + 每 500 次）；新增 `mt_slices()`，`pkg_upload_` 的逐 slice 拷贝与 GPU 写回都按已建纹理的实际 slice 数截断（4608→2046）。guest 内存里的布局（`nvn_tex_layout`）不变，只是拷贝/写回不越界。
+- **为什么不猜语义**：NVN 的 cube-array `depth` 到底是立方体数还是面数没有文档可证；但无论哪种解释，截断到 2046 面后"index < 2046 的 slice 内容"都与游戏着色器的索引一致（face 顺序本来就是 cube-major），丢掉的只是 Metal 无论如何都放不下的层，因此不需要先证明语义。
+- **验收**：`[tex] 按 Metal 上限修正 ser=1619 声明 16x16x768 级 5 阵列 768 → 实用 16x16x1 级 5 阵列 341`、`[tex] 拷贝按 Metal 上限截断 ser=1619 声明 4608 层 实用 2046 层`、`[tex-probe] … Metal 建成 16x16x1 类型 6 / slice 2046`，进程不再 abort（`TOTK_TEX_UP_PROBE=1` 在创建时就验证描述符，不必推进到那个场景）。
+- **未验证**：该场景真正绑定时（及 341 层之后若被读写时的 Metal clamp 行为）的画面；另外 `mtl_read_texels()` 的 GPU 内容回读路径未加同样的截断（那张贴图目前不回读）。
+
 ## 2026-10-21 — P2 收尾：几何阶段压缩走 GPU 间接绘制
 
 - **捕获改直写缓冲**：`gs_capture_pso()` 早前把 locn2/3/4 写进 varying（`[[user(locn32..35)]]`），而捕获管线 `rasterizationEnabled=NO`，顶点输出整体丢弃 → 捕获缓冲恒为 0 → 内核全丢、计数恒 0。改成 `vertex void main0(device float4 *totk_cap [[buffer(29)]], …)` 直接写缓冲：槽 29 避开程序自用（实测最大 0）、顶点流 16+n、零缓冲 30；Metal 每级缓冲槽上限 0..30，31 会报 `'buffer' attribute parameter is out of bounds`。

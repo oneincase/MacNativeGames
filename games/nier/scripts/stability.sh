@@ -3,6 +3,7 @@
 # usage: scripts/stability.sh [runs] [seconds] [extra env...]
 set -u
 WORK=${WORK:-/Volumes/bit2t/switch/totk/NIER_build}
+cd "$WORK" || { echo "no work folder $WORK"; exit 2; }   # the runtime boots relative to the work folder (2026-10-21: three runs found no patched module because this script ran from cwd=games/nier)
 RUNS=${1:-3}; SECS=${2:-13}; shift 2 2>/dev/null || true
 fail=0
 i=1

@@ -2443,6 +2443,7 @@ static void wb_note(const tex_t *t) {
     nvn_hm_put(&g_wb, &k, e);
     pthread_mutex_unlock(&g_smu);
 }
+static NSUInteger mt_slices(id<MTLTexture> mt);   // TOTK: defined next to tex_desc (a cube counts six faces)
 static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u);
@@ -2533,6 +2534,7 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
         void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
         if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
         unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1;
+        { NSUInteger cap = mt_slices(mt); if (cap && layers > cap) layers = (unsigned)cap; }   // TOTK: the texture may hold fewer slices than the layout describes (tex_desc_fixup)
         for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) ok = wb_level_back(t, mt, l, y);
         nvn_dirty_gpu_write_end(tok);
         if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
@@ -2609,6 +2611,47 @@ static int tex_swizzle_sel(const tex_t *t, const uint8_t *view_sel, int format, 
 }
 static int tex_swizzle(const tex_t *t, int format, MTLTextureSwizzleChannels *out) { return tex_swizzle_sel(t, NULL, format, out); }
 static int swizzle_eq(MTLTextureSwizzleChannels a, MTLTextureSwizzleChannels b) { return a.red == b.red && a.green == b.green && a.blue == b.blue && a.alpha == b.alpha; }
+// TOTK: Metal aborts the process on a descriptor outside its limits (it does not return nil), and for cube arrays its limit is
+// lower than the slice count NVN wording implies. Measured with scripts/diag/metal_tex_limits_probe.m on this GPU: 1D / 2D /
+// 2DMS arrays hold at most 2048 slices, and a cube array's arrayLength counts cubes but shares that same 2048-slice budget, so
+// it holds at most 2048/6 = 341 cubes (342 aborts). NieR's first combat scene samples a 768-deep cube array (the light-probe
+// atlas) and killed the process here. The layout in guest memory is not touched (nvn_tex_layout still describes every declared
+// slice); the copy out of it stops at the slices that fit, see pkg_upload_ and wb_write_list.
+#define TEX_MAX_DIM 16384
+#define TEX_MAX_SLICES 2048
+static unsigned long long g_tex_caps;
+static void tex_desc_fixup(const tex_t *t, MTLTextureDescriptor *d) {
+    NSUInteger p_w = d.width, p_h = d.height, p_dp = d.depth, p_arr = d.arrayLength, p_lv = d.mipmapLevelCount, p_sc = d.sampleCount;
+    NSUInteger arr_max = d.textureType == MTLTextureTypeCube || d.textureType == MTLTextureTypeCubeArray ? TEX_MAX_SLICES / 6 : TEX_MAX_SLICES;
+    if (d.arrayLength < 1) d.arrayLength = 1; else if (d.arrayLength > arr_max) d.arrayLength = arr_max;
+    if (d.width < 1) d.width = 1; else if (d.width > TEX_MAX_DIM) d.width = TEX_MAX_DIM;
+    if (d.height < 1) d.height = 1; else if (d.height > TEX_MAX_DIM) d.height = TEX_MAX_DIM;
+    if (d.textureType == MTLTextureType3D) { if (d.depth < 1) d.depth = 1; else if (d.depth > TEX_MAX_SLICES) d.depth = TEX_MAX_SLICES; }
+    uint32_t lvmax = 1;   // levels this size can have (16384 → 15)
+    for (uint32_t m = (uint32_t)MAX(d.width, d.height); m > 1; m >>= 1) lvmax++;
+    if (lvmax > 15) lvmax = 15;
+    if (d.mipmapLevelCount < 1) d.mipmapLevelCount = 1; else if (d.mipmapLevelCount > lvmax) d.mipmapLevelCount = lvmax;
+    if (d.textureType == MTLTextureType2DMultisample || d.textureType == MTLTextureType2DMultisampleArray) {
+        if (d.sampleCount != 2 && d.sampleCount != 4 && d.sampleCount != 8) d.sampleCount = 1;
+        d.mipmapLevelCount = 1;   // Metal: a multisample texture has one level
+    } else d.sampleCount = 1;
+    if (p_w == d.width && p_h == d.height && p_dp == d.depth && p_arr == d.arrayLength && p_lv == d.mipmapLevelCount && p_sc == d.sampleCount) return;
+    unsigned long long n = ++g_tex_caps;
+    if (n <= 6 || n % 500 == 0)
+        MLOG("[tex] 按 Metal 上限修正 ser=%llu 声明 %ux%ux%u 级 %u 阵列 %lu 样本 %lu 目标 %d 格式 %#x → 实用 %lux%lux%lu 级 %lu 阵列 %lu 样本 %lu（累计 %llu 张）",
+             (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.levels, (unsigned long)p_arr, (unsigned long)p_sc, t->d.target, t->d.format,
+             (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.depth, (unsigned long)d.mipmapLevelCount, (unsigned long)d.arrayLength, (unsigned long)d.sampleCount, n);
+}
+// TOTK: slices a built texture really has (a cube counts six faces), so copies and write-backs stay inside it
+static NSUInteger mt_slices(id<MTLTexture> mt) {
+    if (!mt) return 0;
+    switch (mt.textureType) {
+        case MTLTextureTypeCube: return 6;
+        case MTLTextureTypeCubeArray: return 6 * mt.arrayLength;
+        case MTLTextureType3D: return 1;
+        default: return mt.arrayLength;
+    }
+}
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "贴图格式 %#x Metal 无对应（首例）", t->d.format); return nil; }
@@ -2638,6 +2681,7 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     // decoded by the bcd kernel on GPUs without BC support); those get the swizzle on their sampling view (tex_by_id).
     MTLTextureSwizzleChannels sw;
     if (tex_swizzle(t, t->d.format, &sw) && !(d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) d.swizzle = sw;
+    tex_desc_fixup(t, d);   // TOTK: keep Metal from aborting on a descriptor it will not build
     return d;
 }
 // 就地升级：原贴图没开 PixelFormatView（缺省不开，保住苹果显卡无损压缩）却要建换格式视图时，按原规格 + PixelFormatView 新建、逐 slice × level 拷过去并替换登记。
@@ -3306,6 +3350,18 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
     if (t->d.target == 9) layers *= 6;
+    // TOTK: Metal holds fewer slices than the guest declared for a big cube array (tex_desc_fixup): copy the slices that fit,
+    // in the guest's own slice order. Under either reading of NVN's cube-array depth (cubes or faces) every slice below the cap
+    // keeps the content the guest's shader indexes, so this loses only the layers Metal could never hold.
+    if (t->d.target != 2) {
+        NSUInteger cap = mt_slices(mt);
+        if (cap && layers > cap) {
+            static unsigned long long n;
+            if (++n <= 6 || n % 500 == 0)
+                MLOG("[tex] 拷贝按 Metal 上限截断 ser=%llu 声明 %u 层 实用 %lu 层（累计 %llu 张，目标 %d）", (unsigned long long)t->serial, layers, (unsigned long)cap, n, t->d.target);
+            layers = (unsigned)cap;
+        }
+    }
     int tca = tex_astc(t);   // TOTK: BC1 -> ASTC 4x4 (see tex_astc)
     int tck = !tca && tc_pf(t->d.format) != MTLPixelFormatInvalid && d.pixelFormat == tc_pf(t->d.format);   // TOTK: BC2/3/4/5/7 transcoded (tex_tc decided in tex_desc)
     int tco = t->d.format == 0x49 ? 8 : 16;   // output bytes per block
@@ -3468,9 +3524,23 @@ static int tex_mirrored(const tex_t *t) {
     return 1;
 }
 static int tex_check_once(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_CHECK_ONCE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_TEX_CHECK_ONCE=0：CPU 池贴图每次取用都查是否被改写（旧行为）"); } return v; }
+// TOTK (diagnostic, TOTK_TEX_UP_PROBE=1): build the Metal texture of a resource the guest declares larger than Metal's limits
+// right at creation, and log what came out. The copy out of guest memory still happens at the first bind (on the submit
+// thread, see up_owner_check); this only proves the descriptor is one Metal accepts, which is what aborted the process before
+// tex_desc_fixup existed. Off by default.
+void totk_tex_diag_probe(const tex_t *t) {
+    static int on = -1; if (on < 0) on = getenv("TOTK_TEX_UP_PROBE") != NULL;
+    if (!on || !t || !(t->d.target == 4 || t->d.target == 6 || t->d.target == 9) || t->d.depth <= 341) return;
+    MTLTextureDescriptor *d = tex_desc(t, tex_mirrored(t));
+    if (!d) { MLOG("[tex-probe] ser=%llu 目标 %d 声明 %ux%ux%u 级 %u：没有描述符", (unsigned long long)t->serial, t->d.target, t->d.width, t->d.height, t->d.depth, t->d.levels); return; }
+    id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
+    if (!mt) { MLOG("[tex-probe] ser=%llu 目标 %d 声明 %ux%ux%u 级 %u：Metal 拒绝了这个描述符", (unsigned long long)t->serial, t->d.target, t->d.width, t->d.height, t->d.depth, t->d.levels); return; }
+    MLOG("[tex-probe] ser=%llu 目标 %d 声明 %ux%ux%u 级 %u 阵列 %u：Metal 建成 %lux%lux%lu 类型 %lu / slice %lu", (unsigned long long)t->serial, t->d.target,
+         t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.depth, (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long)mt.depth,
+         (unsigned long)mt.textureType, (unsigned long)mt_slices(mt));
+}
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
-    tex_t *t = (tex_t *)ct; BOTW_TEX_FOLLOW(t)
-    if (!t || !t->serial) return nil;
+    tex_t *t = (tex_t *)ct; BOTW_TEX_FOLLOW(t)    if (!t || !t->serial) return nil;
     int packaged = tex_mirrored(t);
     __unsafe_unretained id have = (__bridge id)serial_ptr(t->serial);
     if (packaged) {
