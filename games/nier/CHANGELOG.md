@@ -1,3 +1,13 @@
+## 2026-10-22 — 音频 P0：设备通道数变化**不能**让 guest 请求输出（`COUNT_FIRST` 假设被证伪）
+
+- 前置证据（现成日志，三次运行 c66/c68/c70 一致）：`audout=0` 行、`[audio]=0` 行、`audren=5` 行、`audiodev=2` 行 —— guest 从未打开 `audout:u`，我们的 `nier_audio_open_default` 从未进入（与 `docs/audio-root-cause.md` 的根因一致）。
+- **c72（唯一改动 = `NIER_AUDIO_DEVICE_COUNT_FIRST=6`，其余同 c68；跑到帧 5700、0 故障）**：
+  - 全日志只有 **两次** `[audiodev] cmd 5 GetActiveChannelCount -> 6` / `-> 2`（第 90、148 行），
+  - `audout=0`、`[audio]=0` —— **仍然没有任何输出请求**；
+  - 且 **`cmd 10`（GetActiveAudioDeviceName）与 `cmd 12`（AcquireAudioDeviceNotificationForOutput）一次都没出现**。
+- **结论**：`docs/audio-root-cause.md` 里"第 3 条还有戏"这条**被证伪** —— 设备通道数不一致不会让游戏创建音频输出。而 cmd 10/12 缺席说明设备构造函数（`main+0xd8c548`）确实**从未执行**（那两次 cmd 5 来自 manager proxy 路径），与"零 BL 调用者"的静态结论互相印证。
+- **下一手（已想定，未做）**：`runtime_observer` 只能挂 guest 的**导入符号**，挂不了内部地址 —— 改为在加载期把 vtable 槽（`main+0x12b4428 + 0xf8` = `main+0x12b4520`）**改写成一个会记日志再跳到原函数的宿主桩**。槽被调到时立刻留下调用者（LR/FP）与参数，一次启动即可判定"这条 vtable 到底有没有被走过、是谁该走它"。
+
 ## 2026-10-22 — 品红块排查（两条假设已排除）
 
 - **`passdump 2` 可用且有用**：c70（帧 7200、0 故障）拿到 14686 行 `[pass] F<n> P/D/R/X/Q/Y`（序列号 / 格式 / 是否 clear / clear 色）。对 F4447、F4448 两帧统计 clear 色只有 `clear=0,0,0,0`（78 次）与 `clear=0,0,0,1`（2 次），**没有 `clear=1,0,1`** → 品红块**不是**任何被记录的清屏色。
