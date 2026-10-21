@@ -164,7 +164,20 @@ uint64_t nier_audio_append(void *out_raw, void *buf_raw) {
     if (offset + bytes > b->capacity) { trace("AudioOut buffer out of range (offset %llu size %llu capacity %llu)", (unsigned long long)offset, (unsigned long long)bytes, (unsigned long long)b->capacity); return 0x8a5; }
     AudioQueueBufferRef qb;
     if (AudioQueueAllocateBuffer(h->aq, (UInt32)(frames ? frames * 4 : 4), &qb)) return 0x8a5;
+    if (getenv("NIER_AUDIO_MIXPROBE") && frames) {   /* who writes the guest's buffer: nobody, or a silent mixer? */
+        static unsigned k; int16_t *g = (int16_t *)(uintptr_t)(b->sample_buffer + offset); size_t n = (size_t)frames * channels;
+        unsigned poison = 0, zero = 0, other = 0;
+        for (size_t i = 0; i < n; i++) { if (g[i] == 0x1234) poison++; else if (g[i] == 0) zero++; else other++; }
+        if (k < 6) fprintf(stderr, "[audio] mixprobe %u: n=%zu poison=%u zero=%u other=%u first=%d\n", ++k, n, poison, zero, other, (int)g[0]);
+        for (size_t i = 0; i < n; i++) g[i] = 0x1234;
+    }
     to_stereo((const int16_t *)(uintptr_t)(b->sample_buffer + offset), qb->mAudioData, frames, channels);
+    if (getenv("NIER_TRACE_AUDIO")) {   /* loudness: peak of this buffer and the running maximum */
+        static int gmax; static unsigned nb; const int16_t *d = qb->mAudioData; int peak = 0;
+        for (uint32_t i = 0; i < frames * 2; i++) { int v = d[i]; if (v < 0) v = -v; if (v > peak) peak = v; }
+        if (peak > gmax) gmax = peak; nb++;
+        if (nb <= 2 || nb % 2000 == 0) fprintf(stderr, "[audio] mix peak %d max %d (buffer %u, frames %llu)\n", peak, gmax, nb, (unsigned long long)frames);
+    }
     qb->mAudioDataByteSize = (UInt32)(frames * 4);
     if (!frames) { memset(qb->mAudioData, 0, 4); qb->mAudioDataByteSize = 4; }
     OSStatus eq = AudioQueueEnqueueBuffer(h->aq, qb, 0, NULL);

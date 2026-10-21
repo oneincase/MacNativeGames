@@ -251,7 +251,8 @@ static void h_ctor(void *obj, int type, int format, int mode, int priority) {
     if (g_movies[i]) { LOG("【红】decoder object %p reused without destruction", obj); release_codec(g_movies[i]); free(g_movies[i]); }
     g_movies[i] = m; pthread_mutex_unlock(&g_lock);
     ((void **)obj)[0] = G.vptr; ((void **)obj)[1] = m;
-    LOG("VP9 decoder %p on the host (libvpx %s), output format %d", obj, vpx_codec_version_str(), format);
+    static unsigned made; made++;
+    LOG("VP9 decoder %p on the host (libvpx %s), output format %d (decoder #%u created)", obj, vpx_codec_version_str(), format, made);
 }
 static void destroy(void *obj) {
     pthread_mutex_lock(&g_lock); Movie *m = NULL;
@@ -348,7 +349,7 @@ static int h_acquire_input(void *obj, int *index, int *remaining) {
     if (!index || !remaining) return ST_NULL;
     pthread_mutex_lock(&m->mu);
     *index = -1; *remaining = 0; int st = ST_NO_INPUT;
-    if (m->started && m->nin_free > 0) {
+    if (m->started && !m->eos_in && m->nin_free > 0) {   /* after end of stream MediaCodec hands out no more input buffers */
         *index = m->in_free[0]; memmove(m->in_free, m->in_free + 1, (size_t)--m->nin_free * sizeof m->in_free[0]);
         *remaining = m->nin_free; st = ST_OK;
     }
@@ -369,6 +370,9 @@ static int h_send_input(void *obj, int index, int offset, int size, int64_t time
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     if (!m->started) { pthread_mutex_unlock(&m->mu); return ST_ERROR; }
+    { static unsigned n; static int on = -1; n++; if (on < 0) on = getenv("NIER_MOVIE_LOG") != NULL;
+      if (on && (n <= 5 || n % 2000 == 0))
+          LOG("[movie] send #%u obj=%p idx=%d off=%d size=%d t=%lld flags=%u started=%d eos=%d pending=%d", n, obj, index, offset, size, (long long)time, flags, m->started, m->eos_in, m->npending); }
     Pending p = {index, offset, size, time, flags};
     if (m->eos_in) { m->in_free[m->nin_free++] = index; note(m, &s, EV_INPUT); }   /* after end of stream: hand the buffer back */
     else if (m->npending || !decode_one(m, &s, &p)) m->pending[m->npending++] = p;
@@ -381,6 +385,10 @@ static int h_acquire_output(void *obj, int *index, int64_t *time, unsigned *flag
     if (!index || !time || !flags || !remaining) return ST_NULL;
     pthread_mutex_lock(&m->mu);   /* paced frames become ready only at presents (movie_host_tick): one per game frame */
     *index = -1; *time = 0; *flags = 0; *remaining = 0; int st = ST_NO_OUTPUT;
+    static unsigned na, nok, neo, nnone; static int on = -1; if (on < 0) on = getenv("NIER_MOVIE_LOG") != NULL;
+    na++; if (m->nready > 0) { nok++; if (m->ready[0].flags & FLAG_EOS) neo++; } else nnone++;
+    if (on && (na <= 5 || na % 2000 == 0))
+        LOG("[movie] acquire #%u ok=%u eos=%u none=%u nready=%d started=%d", na, nok, neo, nnone, m->nready, m->started);
     if (m->nready > 0) {
         Ready r = m->ready[0]; memmove(m->ready, m->ready + 1, (size_t)--m->nready * sizeof m->ready[0]);
         *index = r.index; *time = r.time; *flags = r.flags; *remaining = m->nready; st = ST_OK;

@@ -1,3 +1,19 @@
+## 2026-10-22 白屏排查（1/2）：movie 解码器 EOS 之后仍在发放输入缓冲 —— 游戏线程每秒空转 3500 次；修掉后**白屏不变**，但空转消失
+
+**背景**：修好 `GetDirectoryEntryCount`（上一提交）后，游戏开始真正枚举并装载全部资源，随后的序章阶段表现为**长时间整屏纯白**（用户报告"一直白屏"）。本轮先判断"是卡住还是画错"。
+
+**证据一（不是挂起）**：`logs/c110.log` 的 `threads` dump —— guest 主线程在 `mtl_link_wait_tick <- h_nvnWindowAcquireTexture <- main+0x9bbae8`（正常的等上屏），其余线程 `nanosleep`/`svc_thread`；`[负载] … GPU 94% (1%)` 里**游戏自己的 GPU 工作只有 1%**；帧号仍在推进（帧 300→3600，约 55 fps），同一时刻两张 `wshot` 的 md5 完全相同（`c110_a.png` = `c110_b.png`）→ 游戏在做同一件事、画同一个白画面，不是卡死。
+
+**证据二（`hletrace 2` 8 s 窗口）**：`movie::Decoder::AcquireInputBufferIndex` **28045 次**、`SendInputBufferForDecode` **28044 次**、`GetInputBuffer` **28044 次** —— 每秒约 3500 次，全在影片解码的**输入侧**。
+
+**根治点**：`runtime/movie_host.c` 的 `h_acquire_input()` 在 `m->eos_in` 置位后**仍然继续发放输入缓冲**（`send` 的 EOS 分支只是把 buffer 塞回空闲表）。真实 MediaCodec 在 EOS 之后不再交出输入缓冲，于是游戏（`size=0, flags=4`）反复"拿到缓冲→提交 EOS"，永不终止。修法是 `if (m->started && !m->eos_in && m->nin_free > 0)`。
+
+**结果**：`logs/c113.log` 里 `[movie] send #` 的滚动计数停在第 5 次之后再没有 2000 次行，空转消失；但 **`c113_a.png` 仍是 99% 纯白** → 该死循环**不是**白屏的原因（它是一个独立缺陷，每秒 3500 次空转白烧 CPU）。
+
+**白屏留下的线索**：同一轮 `[tex-new]` 一路涨到 **3400 次 / 5733 MB**（每帧新建一张 1728 KB 纹理、几乎没有回收），GPU 94% 而游戏 GPU 工作 1%。下一轮从"为什么每帧新建一张 1728 KB 纹理、谁该回收"入手。
+
+新增诊断（默认关，`NIER_MOVIE_LOG=1` 打开，只打前 5 次与每 2000 次）：`[movie] send #n idx/off/size/t/flags/…`、`[movie] acquire #n ok/eos/none/…`、解码器创建计数 `decoder #n created`。回归 `sh scripts/stability.sh 3 13` = `run 1/2/3: faults=0` → `STABLE`。
+
 ## 2026-10-22 音频 P0：`GetReleasedAudioOutBuffer` 返还的 tag 用了 `buffer->next`（恒为 0）—— 引擎以为"没有空闲缓冲"，每秒把输出拆掉重建，改返缓冲区对象本身后输出变成一条持续流
 
 **一句话**：`runtime/audio_public.c` 的 `nier_audio_append()` 把 `(Queued){b->next, bytes}` 存进队列，播完再把这个 `tag` 交给 guest 的 `GetReleasedAudioOutBuffer`。但 guest 的 `AudioOutBuffer::next` 是 SDK 自己的链指针、游戏填 0，于是**每次"释放"都报告 tag=0**。引擎据此认定没有缓冲区播完 → 立刻 stop/close 再重开，形成每秒一次的重试循环，声音永远只播几毫秒就被掐断。
