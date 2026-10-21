@@ -749,6 +749,7 @@ static void dump_threads(unsigned secs) {
     thr_t *run[64]; int nrun = 0;
     for (thr_t *t = g_all; t; t = t->all) {
         uint32_t word = 0; if (t->wkind == 1 && t->waddr) memcpy(&word, (const void *)(uintptr_t)t->waddr, 4);
+        else if (t->wkind == 2 && t->wkey) memcpy(&word, (const void *)(uintptr_t)t->wkey, 4);   /* the condition key: 1 while linked = someone cleared/signalled without waking us (the lost-wakeup shape of the 0x1C order bug); 0 = genuinely waiting for a producer */
         uint64_t htid = 0; if (t->pt) pthread_threadid_np(t->pt, &htid);
         fprintf(stderr, "[totk-dump] tid=%llu ", (unsigned long long)htid);
         fprintf(stderr, "core=%d mask=%#llx ", t->cur_core, (unsigned long long)t->mask);

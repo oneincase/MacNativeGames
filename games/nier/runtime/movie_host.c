@@ -127,7 +127,14 @@ static Movie *find(const void *guest) {
 /* Events are signalled after the decoder's lock is released: the woken game thread calls straight back in. */
 typedef struct { void *ev[8]; int n; } Signals;
 static void note(Movie *m, Signals *s, int which) { if (m->events && m->events[which] && s->n < 8) s->ev[s->n++] = m->events[which]; }
-static void fire(const Signals *s) { for (int i = 0; i < s->n; i++) G.signal_event(s->ev[i]); }
+static void fire(const Signals *s) {
+    { static int on = -1; static unsigned n;   /* W0 (docs/plan-2026-10-22.md): did the host decoder signal a client
+           event at all? The movie worker h=0x1026 froze at nsvc=2 on a condition variable (c143); if these signals
+           never happen, the player waits on something the host never raises. Default off, capped. */
+      if (on < 0) on = getenv("NIER_MOVIE_LOG") != NULL;
+      if (on && s->n && ++n <= 12) fprintf(stderr, "[movie] fire #%u n=%d ev0=%p\n", n, s->n, s->ev[0]); }
+    for (int i = 0; i < s->n; i++) G.signal_event(s->ev[i]);
+}
 
 static int frame_bytes(const Movie *m) { return m->w * m->h + (m->w / 2) * (m->h / 2) * 2; }
 
@@ -404,6 +411,12 @@ static int h_acquire_output(void *obj, int *index, int64_t *time, unsigned *flag
     na++; if (m->nready > 0) { nok++; if (m->ready[0].flags & FLAG_EOS) neo++; } else nnone++;
     if (on && (na <= 5 || na % 2000 == 0))
         LOG("[movie] acquire #%u ok=%u eos=%u none=%u nready=%d started=%d", na, nok, neo, nnone, m->nready, m->started);
+    /* W2 evidence (c137): after end of stream the game stopped calling into the decoder entirely (the log holds
+       only the first five acquire lines). Count post-EOS entries to tell "the player polls acquire/release" from
+       "the player never comes back" — the second means the state machine waits on something other than the decoder. */
+    static unsigned post_eos;
+    if (on && m->eos_in && (++post_eos <= 4 || post_eos % 500 == 0))
+        LOG("[movie] post-EOS acquire total=%u (this #%u) nready=%d started=%d", na, post_eos, m->nready, m->started);
     if (m->nready > 0) {
         Ready r = m->ready[0]; memmove(m->ready, m->ready + 1, (size_t)--m->nready * sizeof m->ready[0]);
         *index = r.index; *time = r.time; *flags = r.flags; *remaining = m->nready; st = ST_OK;

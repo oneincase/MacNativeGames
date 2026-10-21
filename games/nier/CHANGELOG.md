@@ -1,3 +1,12 @@
+## 2026-10-22 W1 后续取证（c143/c144）：宿主事件流正常，白屏收窄到 subsdk0 movie worker 卡条件变量
+
+- 探针两处（默认关）：`threads.c` 的 `threads` 转储对 kind-2 等待者补打**条件键字**（`word=`，此前只读 kind-1 的锁字，条件变量等待者的关键判据一直是瞎的）；`movie_host.c` 的 `fire()` 加宿主→客户事件 signal 计数（`NIER_MOVIE_LOG`，前 12 条）。
+- **c143（双次 dump，间隔 4 s）**：全部 kind-2 等待者 `word=0x1` —— 这是 0x1C 的设计（先置键再挂链），不是丢唤醒形态；装载泵 `h=0x1027` 的 nsvc 1248→1510 在推进。**唯独 movie worker `h=0x1026`（entry 在 subsdk0，卡 `main+0xb2fb5c` 的 WaitConditionVariable，key=`…38efa4`）nsvc=2 两次都不动** —— 线程创建后只做过 2 次 svc，第二次就是这次永睡。
+- **c144（fire 计数）**：宿主 decoder 的事件在**持续发出**（`fire #1..#12`，ev0 主要是 EV_INPUT=`…0eb8`），播放器线程 `h=0x1025` 轮询消费正常（nsvc 13780 在涨）。post-EOS acquire total=42/43：播放器拿到 EOS 后只再调 2 次就停手 —— 与"播放器进入影片结束路径"一致。
+- **排除与结论**：W1c 之后，VP9 视频路径（宿主 decoder + 事件 + 播放器轮询）已闭环；卡死点移到 **subsdk0 movie 库自己的 worker 线程**：它等的条件变量没人 signal。它是 `DecoderImpl`/NvMM 时代的异步工作线程（`movie_host.c` 头注释：该库 = Android MediaCodec over NvMM，经 nvdrv 等 NvHostSync fence）——宿主只 override 了 `movie::Decoder` 的 17 个 vtable 方法，**没有接管这个 worker 的唤醒源**。下一手（W5）：定位该条件变量的 signal 方（subsdk0 里 `SignalConditionVariable` 的调用点归因），判断它等的是 fence 还是队列；若属 NvHostSync 等待，需给该 worker 的等待点做宿主语义（这是"未知服务保留明确失败"与"实现有语义的降级"的边界，先取证再动）。
+- 本轮不动行为；`stability.sh 3 13` 由 W3/W4 提交时已验，探针默认关不影响。
+
+
 ## 2026-10-22 W4：uplog 升级为字节统计，裁决"池里是 0xFF"——**错**，池里就是解码数据
 
 - 改动：`nvn_mtl.m` 的 `DM_NVN_UPLOG` 块单遍统计 `wff`（全 FF 字）、`ff/n`（FF 字节占比）、`min/max/mean`、前 16 字节 hex。默认关不变。
