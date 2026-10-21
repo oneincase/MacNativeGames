@@ -15,6 +15,8 @@
 - **实测（c142，`DM_NVN_UPLOG=1600x904`，30 s）**：`ser=1502 … wff=0 ff=0/1446400 mean=16.0 min=16 max=16 head=10101010…`（= Y 平面 0x10 填充 = 解码 frame 0 的 mean 16.0，逐帧吻合）；随后 `mean=184.2 head=baba…`、`mean=226.7 head=e5e5…` 是淡入曲线的第 2、3 帧。**影片平面池子里就是解码结果，不是 0xFF**。c118 的"nz8 全非零 → 池被填白"正式作废（nz8 区分不了 0x10 重复与 0xFF——W4 就是为了堵这个）。
 - 因此白屏的剩余成因收窄为：(a) 画面静止 = 播放器停在 EOS 后的最后一帧（淡入到亮场的 logo 结尾），(b) 真正没推进的是**任务完成方**：`h=0x1026`（movie 库 worker，entry 在 subsdk0）卡在条件变量 `key=…38efa4`，`nsvc=2` 后再没醒过（c139/c140 一致）——装载泵 `h=0x1027` 等的 `task+0x38` 信号量正该由它 release。下一轮假设：查谁该 signal 这个条件变量（`svc 0x1D` 丢唤醒的又一形态，或 worker 在等宿主 IO 完成回调）。
 
+- **再延伸（同一份 c142 日志）**：`ser=1502` 的 mean 时间序列 16.0 → 184.2 → 226.7 → **228.1 并定格到 frame 697+**。Y=228 在 YUV 里就是白场——**「白屏」的白就是影片（`movie_logo/logo_01.usm`）最后一帧的真实内容**（淡入到白场后播放器定格），不是任何填充/渲染错误。「白屏」一词从此的准确含义 = **「影片停在末帧 + 装载泵永等 worker」**，画面侧无缺陷。
+
 
 ## 2026-10-22 W3：REUP_MAX_BYTES 1 MB→4 MB，影片平面不再每帧新建纹理
 
@@ -572,4 +574,5 @@ keys and saves are never committed. Status lives in [docs/status-1.0.3.md](docs/
 - 门条件不变：仅 HDR 源→LDR 目标、整级 level-0、无偏移、非 3D、非压缩；块压缩目标直接回退（BLOCKRT 关闭下不会出现）。
 - 验证：`NIER_T2T_CONVERT=1` + `TOTK_GPU_ALLOW_SUBMIT=1` stability.sh 13 秒 ×3 与 100 秒实跑全干净（0 fault）；整窗截图 YoRHa 启动序列完整、序章云海/字幕正常（绿色调与场景缺口为 P2/P3 已知残留，与本改动无关）；不带转换的默认路径 13 秒 ×2 干净。
 - launcher 默认 `NIER_T2T_CONVERT=1`（`make app` 重打包生效）；`docs/screens/07-composite-boot.png` 为合成路径下的启动画面。
+
 
