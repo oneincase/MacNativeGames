@@ -89,16 +89,15 @@
 
 ---
 
-## P5 无声音
+## P5 无声音 —— **已解决（2026-10-22，两个独立 bug 串起来）**
 
-**现状**：guest 只开 `audren:u` ×3，查设备（cmd 5 通道数 / 10 名字 / 12 事件）后不再前进；从不打开 `audout:u`、从不调 `nn::audio::OpenDefaultAudioOut`；`audio_public.c` 的覆盖从未被调用；线程无阻塞。
+**结论**：不是 `audren`/`audout` 服务、不是 HLE 回复形状、不是 guest 状态机。是**两个宿主侧 bug**：
+1. `29a4983`：`runtime/fs_host.c` 的 `dir_entry_count(int64_t*, const char *path)` 把 `nn::fs::GetDirectoryEntryCount(s64*, DirectoryHandle)` 的第二个参数**当路径**用。句柄 `0x300000000` 被当字符串读成垃圾（`raw=75a5f5121e0f0000`）→ 返回错误 → 引擎挂 `rom:/` 时"列举到 0 条"→ 整棵 `Hw::DvdSystem` 树空 → `sound/Init.bnk` 与三个 `.wai` 全部"見つかりません" → Wwise 无音库 → 音频输出从不初始化。改成按句柄计数后，`rom:/sound/ -> 9`、`rom:/sound/English(US)/ -> 19`，音库在 0.08–0.10 s 逐个打开（`BGM.bnk`/`WwiseVoiceInfo.wai`/`WwiseStreamInfo.wai`/`WwiseInfo.wai`/`Init.bnk`/`vo_core.bnk`），`[audstate] env h=` 从 `0,0,0` 变成三个非 0 句柄。
+2. `0bfbd51`：`runtime/audio_public.c` 的 `nier_audio_append()` 把 `buffer->next`（游戏填 0）当释放 tag 存队列，播完交回 guest 的 `GetReleasedAudioOutBuffer` 永远是 0 → 引擎认为"没有缓冲播完"，**每秒把输出拆掉重建**（`hletrace` 8 s 窗口：`GetReleasedAudioOutBuffer` 1530 次、`open/start/stop/close` 各 8 次）。改存 guest 的 `AudioOutBuffer*` 本身后：250 s 全导航里 `AudioOut open` **只有 1 次**、`released: asks 54000 hits 11140 queue 4`、`AudioOut appended` ≥11000 次，0 崩。
 
-**改法（逐条试，每条单独验）**
-1. 给 `smGetService` 失败与 `audren` 三条设备命令的**回复形状**（`ncopy/nmove/nxout`）加日志，对照 SDK 12.3.9 的 `IAudioDevice` 期望；重点查 cmd 12 返回的事件是否要求 `nn::os::SystemEvent` 而非普通 event。
-2. `AcquireAudioDeviceNotificationForOutput` 的返回值/事件类型按 SDK 反汇编核对（`sdk.patched.bin` 里该符号已定位）。
-3. 若仍是"查完就停"，在 `nn::audio::Initialize`/`OpenDefaultAudioOut` 入口下断点式日志，确认 guest 是否在等某个 HID/Audio 设备的初始化完成事件（与 `hid` 的初始化顺序耦合）。
+**验收（已达标）**：`[audio] AudioOut open 48000 Hz x2 PCM16 -> Core Audio (stereo)` 出现一次并保持打开整场，Core Audio 回调持续（`played callback`/`guest took tag` 正常）；回归 `stability.sh 3 13` = 3/3 `faults=0`。**听感验收待人工确认**（宿主侧已证 PCM 缓冲在 48 kHz 双声道持续入队并被播放线程按时归还）。
 
-**验收**：`[audio] AudioOut open 48000 Hz x2 PCM16` 出现，且能听到序章音效/音乐。
+**曾经排除的假设**（不要重走）：`audren` 三条命令回复形状、`NIER_AUDIO_DEVICE_COUNT_FIRST` 伪造通道数、vtable 槽 `+0xf8` 派发（`main+0xd8c548` 静态确认、动态 0 次）、"设备构造函数没跑"（`main+0xd8ab8c` 跑了，`ready=1`）、`cmd 10/12` 缺席（它们受 `NIER_TRACE_AUDIO` 门控，"没出现"从来不是证据）。
 
 ---
 
@@ -160,6 +159,10 @@
 - `d2c442d`：内核按列表所在池的剩余条目限写、索引缓冲长度不足就跳过；撤销"host 写回 guest 计数记录"（c35 因此崩 `main+0x9bbebc`）。
 - **仍未解**：压缩内核真跑时，帧 ~1936 / fence 1937-1939 的页故障**间歇**出现（c21/c26/c30/c31 各 8 次；c24/c25/c27/c29 各 0 次）；"野计数 → `lst[4*i]` 越界"假设**已证伪**（加界后 c30/c31 仍 8 次）。下一步：在捕获绘制与内核之间按 fence 二分（同一帧只编码捕获不编码内核 vs 反之），并把 `NIER_ALLOC_TRACE` 的 `[alloc]` 行与故障 fence 对齐；画面验证改用 `wshot`（`shot` 在帧 ~2200 后不再执行）。
 
+**进展（2026-10-22，收尾核对）**
+- 页故障：按映射池截断（`7569097`）之后实测 **9 轮 0 次**（c57/c59/c60/c62/c65/c66/c68/c76/c77），其中 c76/c77/c95/c96/c102 都是**跑满 7200 帧**的长跑、`fault=`/`signal=` 全 0；此前同脚本 6 轮里 4 轮各 8 次。**该项可判为已修**。
+- 视觉：`logs/c68b.png`/`c68c.png` 与 `logs/c76c.png`（飞行场景）里世界几何/直升机敌人/弹幕/HUD 都在；`logs/L7.png` 的"纯绿底 + IFF 铭牌"不再复现。抓帧建议 `wshot`（`shot` 在帧 ~2200 后不再执行）。
+
 ---
 
 ## P9 音频：先证明 guest 会不会请求输出（P5 已按反汇编重写方向）
@@ -186,6 +189,6 @@
 | M1 | P0+P1 | **已达成 2026-10-21**：转换默认开（launcher 设 `NIER_T2T_CONVERT=1`）、`stability.sh 10 13` 全 0 fault、标题/序章/菜单画面恢复（截图 `docs/screens/07-composite-boot.png`、`/tmp/nier-shots/noforce1200.png`） |
 | M2 | P2 | **机制已达成 2026-10-21**（捕获→内核→GPU 间接绘制全链路跑通、0 fault）：`[gs-rep] 保留顶点=72 有坐标三角形=760`、`[gs] 间接绘制：计数由 GPU 读`。**全场景 `count=0`<1% 与飞行场景验收未量**（进 gameplay 的 `TOTK_INPUT_SCRIPT` 盲按键仍不稳定） |
 | M3 | P3+P4 | 无接缝、无白块 |
-| M4 | P5 | 有声 |
+| M4 | P5 | **已达成 2026-10-22**（发声链路：音库装载 + `AudioOut` 持续打开 + 缓冲闭环；`29a4983`、`0bfbd51`）；听感待人工确认 |
 | M5 | 打包验收 | `make app` + 30 分钟连续游玩无 abort/panic |
 | M6 | P7 | **已达成 2026-10-21（描述符 + 截断验证）**：CubeArray 768 层按 341 建、拷贝 2046 层、不再 abort；场景内绑定画面未验证 |
