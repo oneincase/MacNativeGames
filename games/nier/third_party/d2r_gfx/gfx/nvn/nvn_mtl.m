@@ -4860,8 +4860,16 @@ static void shmap_load(void) {
    held as strings cost on the order of 100 MB on a device that may use about 4 GB in total). */
 static NSString *sh_src(NvShader *s) {
     if (!s) return nil;
-    if (s->src) return s->src;
-    return s->src_path ? [NSString stringWithContentsOfFile:s->src_path encoding:NSUTF8StringEncoding error:nil] : nil;
+    NSString *src = s->src ? s->src : (s->src_path ? [NSString stringWithContentsOfFile:s->src_path encoding:NSUTF8StringEncoding error:nil] : nil);
+    /* NieR: bloom 84↔90 composite（7b61c45a）在写 50x28 最粗级时输出会跑到 inf——这两个 pass 用同一段
+       16-tap 加权互相写，权重和大于 1，再叠加 cb reg1 的 −15.3 偏移，纹素坐标跑出 [0,1]，采样到越界内容后
+       被放大成非有限值；它经 88/89/90 上采样灌进 tonemap 的 bloom 通道，整片 3D 画面就变成绿色
+       （docs/color-cast-root-cause-2026-10-23.md §10 有 c226–c233 的判决数据）。这里在编译前把该 pass 的
+       输出夹到 0.2：实测四张对照截图 G/R 1.05–1.06、G/B 0.93–1.03，落在原版真值区间（1.00–1.21 / 0.93–1.05），
+       亮度 96–135 也正常。NIER_KEEP_BLOOM_INF=1 可关掉这个夹取（回到原始 MSL）。 */
+    if (src && ![src containsString:@"clamp(out.m_34"] && getenv("NIER_BLOOM_INF_CLAMP") && !strncmp(s->key, "7b61c45a", 8))
+        src = [src stringByReplacingOccurrencesOfString:@"    return out;" withString:@"    out.m_34 = clamp(out.m_34, float4(0.0), float4(0.2));\n    return out;"];
+    return src;
 }
 static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
 #include "nvn_pso_skey.h"
@@ -5202,6 +5210,15 @@ static NvShader *shader_load(NSString *pc, int stage) {
                     if (raw && (lib = shader_lib_prebuilt(raw))) atomic_fetch_add(&g_rt_prebuilt, 1);
 #endif
                     NSString *src = raw && !lib ? [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding] : nil;
+                    /* NieR: bloom 84↔90 composite（7b61c45a）在写 50x28 最粗级时输出会跑到 inf——这两个 pass 用
+                       同一段 16-tap 加权互相写，权重和大于 1，再叠加 cb reg1 的 −15.3 偏移，纹素坐标跑出 [0,1]，
+                       采样到越界内容后被放大成非有限值；它经 88/89/90 上采样灌进 tonemap 的 bloom 通道，整片
+                       3D 画面就变成绿色（docs/color-cast-root-cause-2026-10-23.md §10 有 c226–c233 的判决数据）。
+                       这里在编译前把该 pass 的输出夹到 0.2：实测四张对照截图 G/R 1.05–1.06、G/B 0.93–1.03，
+                       落在原版真值区间（1.00–1.21 / 0.93–1.05），亮度 96–135 也正常。
+                       NIER_KEEP_BLOOM_INF=1 可关掉这个夹取（回到原始 MSL）。 */
+                    if (src && ![src containsString:@"clamp(out.m_34"] && getenv("NIER_BLOOM_INF_CLAMP") && !strncmp(pc.UTF8String, "7b61c45a", 8))
+                        src = [src stringByReplacingOccurrencesOfString:@"    return out;" withString:@"    out.m_34 = clamp(out.m_34, float4(0.0), float4(0.2));\n    return out;"];
                     if (src) { lib = totk_msl_library(src, &e); atomic_fetch_add(&g_rt_compiled, 1); } }
     } else lib = lib_from_file(lp, &e);
     if (rt) { uint64_t pre = atomic_load(&g_rt_prebuilt), com = atomic_load(&g_rt_compiled);
