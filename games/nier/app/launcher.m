@@ -59,13 +59,14 @@ static NSString *work_folder(void) {
     /* GS 压缩：序章飞行场景的几何只在压缩路径上出画（stage-2 程序没有翻译链），默认开。
        捕获缓冲扩容时旧缓冲延迟退役（commit 6762950 修掉的页故障）。 */
     setenv("NIER_GS_COMPACT", "1", 1);
-    /* 偏色临时修复（2026-10-23，docs/color-cast-root-cause-2026-10-23.md §10）：
+    /* 偏色修复（2026-10-23，docs/color-cast-root-cause-2026-10-23.md §10）：
        bloom 最粗级（ser=84, 50x28）被 84↔90 composite（shader 7b61c45a）写成非有限值，
        再经 88/89/90 上采样灌进 tonemap 的 bloom 通道，整片画面变成绿色（G/R 2.6）。
-       跳过这一路 composite 后四张对照截图 G/R 1.00/1.00/0.99/1.01、G/B 1.01/1.01/1.01/1.00，
-       回到原版中性范围（1.00–1.21 / 0.93–1.05）。代价是 bloom 少一级（画面略欠辉光），
-       正式修法（查清 composite 为什么写 inf）完成后删掉这一行。 */
-    setenv("TOTK_EXP_SKIP_FS", "7b61c45a", 1);
+       修法 = nvn_mtl.m 的 shader_load 在编译 7b61c45a 前把输出夹到 0.2（默认开，
+       NIER_KEEP_BLOOM_INF=1 可关）；c238 实测 G/R 1.00、G/B 1.00、亮度 88.6 正常。
+       早先的临时办法 TOTK_EXP_SKIP_FS=7b61c45a（整条 composite 跳过）已被它取代：
+       跳过会让 bloom 少一级（c236 的飞行帧 G/R 1.26 略绿），不再使用。 */
+    unsetenv("TOTK_EXP_SKIP_FS");
     setenv("DM_PRESENT_LINK_FALLBACK", "1", 1);
     setenv("TOTK_SLOT_OWNER", "user", 1);
     setenv("TOTK_SLOT_PURPOSE", "player", 1);

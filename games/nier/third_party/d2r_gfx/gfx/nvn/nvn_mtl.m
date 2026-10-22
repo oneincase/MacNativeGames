@@ -5217,7 +5217,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
                        这里在编译前把该 pass 的输出夹到 0.2：实测四张对照截图 G/R 1.05–1.06、G/B 0.93–1.03，
                        落在原版真值区间（1.00–1.21 / 0.93–1.05），亮度 96–135 也正常。
                        NIER_KEEP_BLOOM_INF=1 可关掉这个夹取（回到原始 MSL）。 */
-                    if (src && ![src containsString:@"clamp(out.m_34"] && getenv("NIER_BLOOM_INF_CLAMP") && !strncmp(pc.UTF8String, "7b61c45a", 8))
+                    if (src && ![src containsString:@"clamp(out.m_34"] && !getenv("NIER_KEEP_BLOOM_INF") && !strncmp(pc.UTF8String, "7b61c45a", 8))
                         src = [src stringByReplacingOccurrencesOfString:@"    return out;" withString:@"    out.m_34 = clamp(out.m_34, float4(0.0), float4(0.2));\n    return out;"];
                     if (src) { lib = totk_msl_library(src, &e); atomic_fetch_add(&g_rt_compiled, 1); } }
     } else lib = lib_from_file(lp, &e);
