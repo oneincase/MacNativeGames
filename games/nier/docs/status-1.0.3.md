@@ -33,9 +33,9 @@ Status as of 2026-10-20/21 on macOS 27.0.1 (26A434), MacBook Pro M5 (16 GB), bui
    this engine's overlay/logo shaders rely on the geometry stage). The geometry *amplification* itself is therefore
    still absent: GS-generated copies (grass, particles, some silhouettes, HUD quads) are missing. Proper fix: emulate GS (vertex amplification
    / compute expansion) or translate the specific NVN GS programs this engine uses.
-2. **Driver constant `c2+0x160` is read as 0.** One fragment program reads a driver-constant word the replay layer does
-   not fill (the translator reports `drv_unfillable`). The port now logs it and draws anyway (the in-process scan path
-   already reads 0 for such words); the visual/gameplay effect of that word is unknown.
+2. ~~**Driver constant `c2+0x160` is read as 0.**~~ **已澄清（2026-10-23）**：这是误报。该片元程序实际只读 `c2+0x168`
+   （`.z`），那里已经填了句柄；`c2+0x160` 不是它读的字（`docs/color-cast-diagnosis.md:42`、`docs/port-plan-2026-10-23.md`
+   的偏色章节）。可以整条删掉，留在这里只是标记它曾被记录。
 3. **Mid-pass / partial-mask / scissored colour clears** run through the isolated `TOTK_GPU_MIDCLEAR=1` path (now
    defaulted for this game in `runtime/loader.c`); that path has not been compared against the console's clears.
 4. **`nvnCommandBufferReportValue`** was implemented as a 4-byte uniform write (`OP_UPDATE_UB`); the game's use of it

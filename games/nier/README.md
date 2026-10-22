@@ -55,9 +55,10 @@ make runtime WORK=$WORK
 cd $WORK && TOTK_GPU_ALLOW_SUBMIT=1 ./build/nier-native rewritten/v103 boot
 ```
 
-`TOTK_GPU_MIDCLEAR=1` is defaulted for this game inside the runtime; `TOTK_GPU_ALLOW_SUBMIT=1` (and usually
-`TOTK_GPU_WIDEN=1 TOTK_GPU_BLOCKRT=1`) is what the launcher sets, because the shared replay layer keeps GPU submission
-off for a game by default.
+`TOTK_GPU_MIDCLEAR=1` is defaulted for this game inside the runtime; the launcher sets
+`TOTK_GPU_ALLOW_SUBMIT=1 TOTK_GPU_MIDCLEAR=1 NIER_T2T_CONVERT=1`, a memory-sized `TOTK_GPU_BUDGET_MB`
+(55% of physical RAM, floor 6144 MB), `NIER_GS_COMPACT=1` and `TOTK_GPU_KEEPALIVE=0` — the shared replay
+layer keeps GPU submission off for a game by default.
 
 ## Diagnostics
 
