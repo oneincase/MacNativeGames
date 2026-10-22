@@ -2632,6 +2632,9 @@ static int tex_swizzle_sel(const tex_t *t, const uint8_t *view_sel, int format, 
     uint32_t pf = 0; uint8_t swz[4] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
     if (!nvn_fmt_to_mtl(format, &pf, swz)) return 0;
     unsigned sel[4] = {t->d.swizzle_r, t->d.swizzle_g, t->d.swizzle_b, t->d.swizzle_a};
+    { static int forced = -1; static unsigned long long only = 0;
+      if (forced < 0) { const char *e = getenv("NIER_SWZ_RGBA"); forced = e != NULL && *e; only = e && *e ? strtoull(e, NULL, 0) : 0; }
+      if (forced && (!only || only == t->serial)) { sel[0] = 2; sel[1] = 3; sel[2] = 4; sel[3] = 5; } }   /* NIER 判决：强制 RGBA（NIER_SWZ_RGBA=<ser> 只对一张） */
     if (view_sel) for (unsigned i = 0; i < 4; i++) sel[i] = view_sel[i];
     MTLTextureSwizzle c[4];
     for (unsigned i = 0; i < 4; i++) c[i] = (MTLTextureSwizzle)(sel[i] < 2 ? sel[i] : swz[sel[i] - 2]);
@@ -3531,6 +3534,14 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
                 for (size_t r = 0; r < rows; r++) memcpy((uint8_t *)stg.contents + off + r * pitch, t->mem + r * stride, pitch);
             } else
             if (nvn_deswizzle(&t->d, l, y, t->mem, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "解排布失败 格式 %#x 目标 %d", t->d.format, t->d.target); break; }
+            /* NIER: 偏色判决——把色域 3D LUT（256x16 RGBA8：16 行 = G 层，16 个 16 列块 = B，块内 16 列 = R）换成恒等表 */
+            { static int lutid_on = -1;
+              if (lutid_on < 0) lutid_on = getenv("NIER_LUT_IDENTITY") != NULL;
+              if (lutid_on && t->d.width == 256 && t->d.height == 16 && t->L.size >= 16384 && !unp && !tca && !tck) {
+                  for (size_t r = 0; r < rows; r++) { uint8_t *dst = (uint8_t *)stg.contents + off + r * pitch;
+                      for (unsigned c = 0; c < w; c++) { unsigned b = c / 16, rr = c % 16;
+                          dst[c * 4 + 0] = (uint8_t)(rr * 17); dst[c * 4 + 1] = (uint8_t)(r * 17); dst[c * 4 + 2] = (uint8_t)(b * 17); dst[c * 4 + 3] = 255; } }
+                  static int once; if (!once) { once = 1; MLOG("[lut] 恒等表已替换 %ux%u 格式 %#x size %llu", t->d.width, t->d.height, t->d.format, (unsigned long long)t->L.size); } } }
             up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l - drop);
             off += pitch * rows * z;
         }
@@ -4373,12 +4384,26 @@ static void rp_end(void) { if (g_enc) {
           m4_end(be);
           uint64_t fr = atomic_load(&g_cur_frame), pass = g_stat_pass;
           [g_commit_blocks addObject:^{ const uint32_t *v = (const uint32_t *)((const uint8_t *)rb.contents + ro);
-              double sum[3] = {0}; unsigned mn[3] = {2047, 2047, 1023}, mx[3] = {0, 0, 0};
-              for (uint32_t q = 0; q < W * H; q++) { uint32_t z = v[q], c[3] = {z & 0x7ff, (z >> 11) & 0x7ff, (z >> 22) & 0x3ff};
-                  for (int j = 0; j < 3; j++) { sum[j] += c[j]; if (c[j] < mn[j]) mn[j] = c[j]; if (c[j] > mx[j]) mx[j] = c[j]; } }
-              fprintf(pf, "F%llu p%llu ser=%ld %ux%u mean=%.1f,%.1f,%.1f min=%u,%u,%u max=%u,%u,%u\n",
+              double sum[3] = {0}; unsigned nfin[3] = {0}, cnt[3] = {0};
+              float mn[3] = {INFINITY, INFINITY, INFINITY}, mx[3] = {-INFINITY, -INFINITY, -INFINITY};
+              for (uint32_t q = 0; q < W * H; q++) {
+                  uint32_t z = v[q];
+                  for (int j = 0; j < 3; j++) {
+                      int mb = (j == 2) ? 5 : 6;                 /* B 10 位 = 5 指数 + 5 尾数 */
+                      uint32_t raw = (j == 0) ? (z & 0x7ffu) : (j == 1) ? ((z >> 11) & 0x7ffu) : ((z >> 22) & 0x3ffu);
+                      uint32_t ex = (raw >> mb) & 0x1fu, ma = raw & ((1u << mb) - 1u);
+                      float mf = (float)ma / (float)(1u << mb), f;
+                      if (ex == 0x1fu) f = (ma ? NAN : INFINITY);
+                      else if (ex == 0u) f = mf * 0x1p-14f;
+                      else f = (1.0f + mf) * exp2f((float)ex - 15.0f);
+                      if (!isfinite(f)) { nfin[j]++; continue; }
+                      sum[j] += f; cnt[j]++; if (f < mn[j]) mn[j] = f; if (f > mx[j]) mx[j] = f; } }
+              fprintf(pf, "F%llu p%llu ser=%ld %ux%u mean=%.4f,%.4f,%.4f min=%.4f,%.4f,%.4f max=%.4f,%.4f,%.4f nonfinite=%u,%u,%u\n",
                   (unsigned long long)fr, (unsigned long long)pass, psr, W, H,
-                  sum[0] / (W * H), sum[1] / (W * H), sum[2] / (W * H), mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
+                  cnt[0] ? sum[0] / cnt[0] : 0.0, cnt[1] ? sum[1] / cnt[1] : 0.0, cnt[2] ? sum[2] / cnt[2] : 0.0,
+                  cnt[0] ? mn[0] : 0.f, cnt[1] ? mn[1] : 0.f, cnt[2] ? mn[2] : 0.f,
+                  cnt[0] ? mx[0] : 0.f, cnt[1] ? mx[1] : 0.f, cnt[2] ? mx[2] : 0.f,
+                  nfin[0], nfin[1], nfin[2]);
               fflush(pf); }];
       } }
     nt_watch_after_pass();
