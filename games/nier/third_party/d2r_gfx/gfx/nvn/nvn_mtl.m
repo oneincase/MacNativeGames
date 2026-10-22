@@ -6464,9 +6464,15 @@ static void gs_capture_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) 
     NSString *bk = @(pr->sh[0]->key);
     id<MTLBuffer> capb = bufs[bk];
     if (!capb || capb.length < capn * 64) {
-        capb = [g_dev newBufferWithLength:capn * 64 options:MTLResourceStorageModeShared];
-        if (!capb) return;
-        res_add(capb); bufs[bk] = capb;
+        id<MTLBuffer> nb = [g_dev newBufferWithLength:capn * 64 options:MTLResourceStorageModeShared];
+        if (!nb) return;
+        res_add(nb);
+        /* 旧捕获缓冲可能还在前面几个提交里被捕获 pass 写、被内核读。原先直接让 bufs[bk] 换掉它，
+           最后一个强引用一去就 dealloc，GPU 随后按裸地址写那块已释放的内存 —— 这正是进标题画面
+           扩容 3072→3584→3840 KB 三连之后立刻出现的 kIOGPUCommandBufferCallbackErrorPageFault。
+           与上传路径的 g_up_pblock（见 :3219）一样，延到用过它的提交完成之后再退役。 */
+        if (capb) defer_obj_release(capb);
+        bufs[bk] = nb; capb = nb;
         MLOG("[gs] 捕获缓冲 vs=%.16s %lu 顶点（%lu KB）", pr->sh[0]->key, (unsigned long)capn, (unsigned long)(capn * 64 >> 10));
     }
     if (capn * 64 > capb.length) return;   // never encode a capture that would write past the buffer
