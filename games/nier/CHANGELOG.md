@@ -1,3 +1,12 @@
+## 2026-10-22 白屏解除：影片节拍在"全部 t=0"的 .usm 上误丢帧并释放游戏没见过的槽 —— 播放器扣满 8 槽饿死在 53/74 帧
+
+- **判决实验（c150，`TOTK_MOVIE_PACE=0`）**：影片链**首次接力**——decoder #1 消费全部 74 帧 + EOS → destroyed → **decoder #2 创建 → 81 帧 → destroyed**；c151（PACE=0 + 截图）里**标题画面完整上屏**（NieR:Automata logo/副标题/Press Any Button/版权行，见 `logs/c151_2.png`）——"停在 53/74 帧"不是游戏状态机玄学，是**我方节拍逻辑**。
+- **根因（`movie_host.c:release_due`）**：NieR 的 `.usm` 播放器每次 `SendInputBufferForDecode` 都送 `time=0`（c122 send #1..#5 全部 `t=0`）→ 所有帧的 `due_at` 相等 → 丢帧分支 `now - due <= (next-due)*3/2` 在 `next==due` 时恒真 → 每个 present 把 `decoded` 队列裁到 1 帧，并且**把游戏从未 acquire 过的槽 `out_held=0`**——这些槽随即被解码器复用写新帧，而游戏那边还按"我拿了 53 帧、还欠 53 次 release"记账。游戏对 EOS 前最后几帧的 release 落到已被复用的槽上 → `h_release_output` 的 `queued` 判定失败返回 ST_ERROR → 8 个输出槽全部被游戏扣住 → `AcquireOutputBufferIndex` 永 `ST_NO_OUTPUT`（c149：acquire 停在 total=53、EOS 从未取走、release 计数还在流动）。
+- **修复**：`release_due` 的丢帧条件加 `next == due` 守卫——**时间戳无信息时永不丢帧**（每 present 至多交 1 帧，游戏本来就是一帧一画）；带真实递增 pts 的流（TOTK `.webm`）行为逐字节不变。
+- **实测（c152，默认节拍 + 修复）**：decoder #1 74 帧 → destroyed → #2 81 帧 → destroyed → **#3 创建**（logo_00/01/02 三部连播）；90 s 内三张 `wshot` 互不相同（黑场→标题 8428 色→暗场过渡）——**白屏解除**。回归 `stability.sh 3 13` = STABLE。
+- 本轮同时验证了上一轮的三处判读：c149"停在 53 帧 = 槽饿死"方向对、归因错（不是游戏状态机等外部条件，是我方节拍）；h=0x1026/装载泵两个卡点随影片链恢复自然解除（c152 未再出现 nsvc 定格）；"白 = 影片末帧真实内容"成立（修复后第一张图就是黑场淡入，不再是静止白）。
+
+
 ## 2026-10-22 W2 判定（c149）：播放器停在影片第 53/74 帧——排除槽耗尽，是游戏状态机等一个不来的条件
 
 - 仪器：`h_release_output` 加 release 计数（`NIER_MOVIE_LOG`，前 3 条 + 每 20 条）。

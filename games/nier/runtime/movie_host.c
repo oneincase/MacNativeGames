@@ -164,11 +164,18 @@ static uint64_t due_at(Movie *m, const Ready *d) {
     return m->t0 + (uint64_t)ahead * 1000;
 }
 /* One game frame (a present): drop leading frames that are more than 1.5 frame periods late while the next one is due
-   too, then hand over at most one due frame (end of stream right after the last frame). */
+   too, then hand over at most one due frame (end of stream right after the last frame).
+   NieR (c150/c151): the .usm player sends every input with time=0, so all deadlines collapse to one instant
+   (next == due). Dropping on equal deadlines clears out_held for slots the game never saw, the game's next
+   ReleaseOutputBufferIndex then returns ST_ERROR (c149: the player stopped acquiring at frame 53/74 with the EOS
+   still queued), and the movie chain dies there. With PACE=0 the chain completed: decoder #1 74 frames -> destroyed
+   -> decoder #2 81 frames -> the title screen reached the window. So: with no timestamp information never drop,
+   just hand over at most one frame per present (the game shows one per game frame anyway); games that do carry
+   timestamps (TOTK's .webm) keep the catch-up drop. */
 static void release_due(Movie *m, Signals *s, uint64_t now) {
     while (m->ndecoded > 1 && !(m->decoded[0].flags & FLAG_EOS) && !(m->decoded[1].flags & FLAG_EOS) && m->t0) {
         uint64_t due = due_at(m, &m->decoded[0]), next = due_at(m, &m->decoded[1]);
-        if (now < next || now - due <= (next - due) * 3 / 2) break;
+        if (now < next || next == due || now - due <= (next - due) * 3 / 2) break;
         m->out_held[m->decoded[0].index] = 0; m->dropped++;
         memmove(m->decoded, m->decoded + 1, (size_t)--m->ndecoded * sizeof m->decoded[0]);
     }
