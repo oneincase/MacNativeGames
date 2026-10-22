@@ -74,6 +74,38 @@ binding 4→reg2（89，**应为 1616**）、binding 5→reg3（1616，对）。
 | c211 | `NIER_SWZ_RGBA=1`（全纹理强制 RGBA swizzle） | 世界全黑、HUD 正常 → swizzle 影响面很大但不是根因 |
 | c212 | `NIER_SWZ_RGBA=17`（只强制 ser=17） | 仍然绿 G/R 2.60 → 不是 17 的 swizzle |
 
+## 6. 反射表的 reg 与实际绑定相反（根因的根因）
+
+`$WORK/build/shader-cache/rt-totk-native-v4-unverified/b41adaf5…-1178a6955197_b.json`
+（`route: "B"`，`bindings` 12 条）的纹理槽号：
+
+| msl_name | handle | json `reg` | 角色 |
+|---|---|---|---|
+| `fp_t_cb196610_1057805E` | 0x1057805E | **2** | 场景色（`_66`） |
+| `fp_t_cb196610_1056805A` | 0x1056805A | **0** | bloom（`_74`） |
+| `fp_t_cb196610_1057005C` | 0x1057005C | **1** | LUT 上（`_260`） |
+| `fp_t_cb196610_10580060` | 0x10580060 | **3** | LUT 下（`_276`） |
+
+而 pass 376221 的**实际绑定**（passdump）：
+
+| NVN slot | 实际纹理 |
+|---|---|
+| reg0 | ser=17（1920x1080 场景） |
+| reg1 | ser=1616（256x16 LUT） |
+| reg2 | ser=89（200x112 bloom） |
+| reg3 | ser=1616（256x16 LUT） |
+
+**两者恰好把「场景」和「bloom」对调了**：shader 认为场景在 slot2、bloom 在 slot0；
+游戏把场景绑在 slot0、bloom 绑在 slot2。
+
+于是 `_66 = sample(slot2) = bloom(绿)`、`_74 = sample(slot0) = 场景(白)`，
+tonemap 用 bloom 当场景 → 整幅绿。
+
+`reg` 由外部翻译器（注释里提到的 `dmsh_build.py`，本仓库内没有源码）写进 `.json`，
+运行时 `nvn_refl_from_json`（`third_party/d2r_gfx/gfx/nvn/nvn_refl.m:43-44`）直接读：
+`int reg = [b[@"reg"] intValue]; r->reg = reg < 0 ? 0 : reg;`
+—— 一旦 json 的 `reg` 与实际 slot 相反，查表 `S.tex[stage][reg]` 就取错纹理。
+
 ## 下一步（修法方向）
 
 1. 查 `p_bind_buf` 的 `reg` 填充与 `S.tex[stage][reg]` 的赋值，确认「游戏给的 texture unit」是否被正确保存，
