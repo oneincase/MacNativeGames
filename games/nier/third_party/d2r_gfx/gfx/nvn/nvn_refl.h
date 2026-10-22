@@ -23,6 +23,12 @@ typedef struct {
     uint8_t dtt, dpf;        // 贴图槽未绑时的哑贴图：MTLTextureType 数值、像素类 | Dummy texture when the texture slot is unbound: MTLTextureType value, pixel class
     uint16_t reg, aid;       // D3D 寄存器号、参数缓冲内序号 | D3D register number, index within the argument buffer
     uint16_t off;            // SBUFU：uniform 块内的指针字节偏移 | SBUFU: byte offset of the pointer inside the uniform block
+    // NieR: 贴图绑定自带的 NVN 句柄（MSL 成员名尾部，如 fp_t_cb196610_1057805E → 0x1057805E）。
+    // 运行时用它纠正「槽号判反」：翻译器按 c[2] 的 word 偏移反推 unit，对少数程序会反
+    // （实测 tonemap b41adaf5：场景句柄 1057805E 被算成 unit 2，实际绑在 unit 0）。0 = 未解析，行为不变。
+    // NieR: the NVN texture handle that the binding carries (tail of the MSL member name).
+    // The runtime uses it to correct a slot that the translator inferred wrongly. 0 = not parsed, unchanged behaviour.
+    uint32_t h;
 } nvn_rbind;
 typedef struct {
     int nb, abi, nv;         // 绑定数、参数缓冲槽、顶点输入数 | Binding count, argument buffer slot, vertex input count

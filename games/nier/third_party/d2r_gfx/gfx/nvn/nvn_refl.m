@@ -42,6 +42,12 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
             id rg = b[@"reg"]; int reg = [rg isKindOfClass:[NSNumber class]] ? [rg intValue] : -1, aid = [b[@"arg_id"] intValue];
             r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg;
+            /* NieR: 贴图绑定自带 NVN 句柄，写在 MSL 成员名尾部（fp_t_cb196610_1057805E）。
+               运行时拿它纠正翻译器猜反的槽号，详见 nvn_rbind.h 字段说明与 nvn_mtl.m 的绑定循环。 */
+            if ([k isEqualToString:@"tex"]) {
+                NSString *mn = b[@"msl_name"]; NSUInteger mLen = mn.length;
+                if (mLen >= 8) { unsigned int hv = 0; if (sscanf(mn.UTF8String + mLen - 8, "%8x", &hv) == 1 && hv) r->h = (uint32_t)hv; }
+            }
             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
@@ -58,6 +64,46 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP || r->kind == NVN_RB_SBUFU) && reg < 0)
                 FAIL("B 绑定 %s 没解出槽号", [b[@"msl_name"] UTF8String]);
             o->nb++;
+        }
+        /* NieR: 已知 tonemap 程序的纹理槽位与游戏实际绑定相反——dmsh_build.py 按 c[2] word 偏移
+           反推 unit 号，把场景（1057805E）与 bloom（1056805A）判反；实测游戏绑的是
+           场景=unit0、bloom=unit2（c220 的 [tex-unit-dbg] 与 passdump 的 tid 双向印证）。
+           这里按 MSL 成员名尾部的 NVN 句柄做定点纠正，只动句柄匹配上的绑定，
+           其他程序与其他标题完全不受影响。依据：docs/color-cast-root-cause-2026-10-23.md §7–§9。 */
+        if ([j[@"key"] hasPrefix:@"b41adaf5"]) {
+            for (int i = 0; i < o->nb; i++) if (o->b[i].kind == NVN_RB_TEX) {
+                switch (o->b[i].h) {
+                case 0x1057805Eu: o->b[i].reg = 0; break;   /* 场景 1920x1080 延迟光照输出 */
+                case 0x1056805Au: o->b[i].reg = 2; break;   /* bloom 上采样 200x112 */
+                case 0x1057005Cu: o->b[i].reg = 1; break;   /* 3D LUT 256x16 */
+                case 0x10580060u: o->b[i].reg = 3; break;   /* 3D LUT 256x16 */
+                }
+            }
+        }
+        /* NieR 诊断：NIER_REG_SWAP=<key前缀>:<槽号,...> —— 按纹理绑定的出现顺序重排 NVN 槽号。
+           用于验证「翻译器把纹理槽号按 handle 升序分配、而不是按 NVN 程序里的 texture unit」这个假设：
+           若重排后画面颜色恢复正常，就证明问题在槽号分配，与 shader 本身无关。默认关，不影响其他标题。 */
+        static int reg_swap[16]; static int reg_swap_n = -1; static char reg_swap_key[64];
+        if (reg_swap_n < 0) {
+            reg_swap_n = 0;
+            const char *e = getenv("NIER_REG_SWAP");
+            if (e) {
+                const char *c = strchr(e, ':');
+                if (c) snprintf(reg_swap_key, sizeof reg_swap_key, "%.*s", (int)(c - e), e);
+                const char *p = c ? c + 1 : e;
+                while (*p && reg_swap_n < 16) {
+                    reg_swap[reg_swap_n++] = atoi(p);
+                    while (*p && *p != ',') p++;
+                    if (*p == ',') p++;
+                }
+            }
+        }
+        if (reg_swap_n && (!reg_swap_key[0] || !strncmp([j[@"key"] UTF8String], reg_swap_key, strlen(reg_swap_key)))) {
+            int ti = 0;
+            for (int i = 0; i < o->nb; i++) if (o->b[i].kind == NVN_RB_TEX) {
+                if (ti < reg_swap_n) { o->b[i].reg = (uint16_t)reg_swap[ti]; }
+                ti++;
+            }
         }
         NSDictionary *dr = j[@"drv_reads"];
         if ([dr isKindOfClass:[NSDictionary class]]) { o->drv_read[0] = dr[@"0"] != nil; o->drv_read[2] = dr[@"2"] != nil; }

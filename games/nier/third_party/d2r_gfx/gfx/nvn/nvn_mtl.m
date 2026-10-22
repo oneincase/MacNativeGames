@@ -7768,6 +7768,9 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     for (int i = 0; i < sh->rf.nb; i++) {
         const nvn_rbind *b = &sh->rf.b[i];
         int reg = b->reg, aid = b->aid;
+        /* NieR: tonemap 的槽位纠正已前移到反射层（nvn_refl.m 按 MSL 成员名尾部句柄定点改正）。
+           这里不再做运行时句柄搜索：S.tex 存的是纹理 id（bound_tex 用 h & 0xfffff），
+           与 shader 自带的 NVN 句柄不是同一命名空间，搜不到也不该搜。 */
         if (slot_mode && tex_slot_binding(b)) {
             // A preceding miss may create/replace a resource, or a guest write
             // may arrive since the initial key. Then finish this block normally.

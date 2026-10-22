@@ -106,6 +106,66 @@ tonemap 用 bloom 当场景 → 整幅绿。
 `int reg = [b[@"reg"] intValue]; r->reg = reg < 0 ? 0 : reg;`
 —— 一旦 json 的 `reg` 与实际 slot 相反，查表 `S.tex[stage][reg]` 就取错纹理。
 
+## 7. 槽号从哪来：翻译器按「句柄里的 c[2] word 偏移」反推 unit
+
+`/Volumes/bit2t/switch/totk/d2r-mobile/dm/gfx/tools/dmsh_build.py:307-320` 的 `decode_tex`：
+
+```python
+o0, o1, ty = h & 0x3fff, (h >> 14) & 0x3fff, h >> 28
+words = [o0] + ([o1] if ty else [])
+def slot(word, base, cb): return (word * 4 - base) // 8 if cb == 2 and word * 4 >= base and (word * 4 - base) % 8 == 0 else None
+t = next((slot(x, TEX_BASE, tb) for x in words if ...), None)   # TEX_BASE = 0x168
+```
+
+即：把句柄低 14 位（`o0`）当作 `c[2]` 表里的 **word 偏移**，再按
+`slot = (word*4 - 0x168) / 8` 反推纹理单元号。
+
+这个公式**假设「c[2] 表里的顺序 = 纹理单元号的顺序」**。对大多数程序成立，
+但对这个 tonemap 不成立：
+
+- 场景句柄 `1057805E` → `o0 = 94` → `(94*4 - 0x168)/8 = 2` → 判成 slot 2
+- bloom 句柄 `1056805A` → `o0 = 90` → `(90*4 - 0x168)/8 = 0` → 判成 slot 0
+
+而游戏实际绑定是 slot 0 = 场景、slot 2 = bloom。
+
+**根因：翻译器把「驱动常量表的 word 偏移」当成「纹理单元号」用了。**
+`c[2]` 里纹理句柄表的位置由 NVN 程序的 texture unit table 决定，
+word 偏移与 unit 号之间不是恒等映射；翻译器没有拿到那张表，就用线性公式猜，于是把场景和 bloom 判反。
+
+**验证实验（进行中）**：`NIER_REG_SWAP=<key前缀>:<槽号,...>`（`nvn_refl.m`，默认关）
+按纹理绑定出现顺序强制指定槽号，验证「重排后颜色恢复」。
+`c213`（`NIER_REG_SWAP=b41adaf5:0,2,1,3`）在帧 3077 出现 SIGSEGV，`c214`（同配置、去掉该开关）正在做对照，
+用于区分「是开关引入的崩溃」还是「先前就存在的偶发崩溃」。
+
+## 8. 最小验证：直接改 `_b.json` 的 slot（tex 与 samp 成对）
+
+运行时读的是 `<key>_b.json`（`nvn_mtl.m:5153-5170`，`<key>.json`），它 12 条 bindings 里
+纹理/采样器是成对的：
+
+```
+tex  reg 2  aid 4   fp_t_cb196610_1057805E     ← 场景，应 reg 0
+samp reg 2  aid 5   …1057805ESmplr
+tex  reg 0  aid 6   fp_t_cb196610_1056805A     ← bloom，应 reg 2
+samp reg 0  aid 7   …1056805ASmplr
+tex  reg 1  aid 8   fp_t_cb196610_1057005C     ← LUT，reg 1 正确
+samp reg 1  aid 9
+tex  reg 3  aid 10  fp_t_cb196610_10580060     ← LUT，reg 3 正确
+samp reg 3  aid 11
+```
+
+把两张主纹理的 `reg` 按 `2→0 / 0→2` 改写（tex 与 samp 成对改，备份为 `_b.json.bak2`），
+重启即由 `nvn_refl_from_json` 重新读入（`b->reg` 决定 `S.tex[stage][reg]`/`S.samp[stage][reg]` 的查表键）。
+c215 用于验证画面是否恢复正常色（真值 G/R 1.00–1.25）。
+
+**注意**：这是手工验证路径，不是正式修法。正式修法要让翻译器拿到 NVN 程序的
+texture unit table（或让运行时从程序里解析 unit 号），而不是靠 handle 的 word 偏移去猜。
+
+## 9. 手工改 `_b.json` 的实验记录（进行中）
+
+- `c215`（改 `_b.json` reg `2→0 / 0→2`，截图在导航后 320 s）：`c215_pass.png` 是**纯黑**——截图落在加载/转场窗口，不是"颜色恢复"。**教训：392 s 这个时刻是黑屏窗口，250 s 才是飞行场景。**
+- `c216`（同上，截图提前到 250 s）：`c216_pass.png` mean `37.4/68.7/55.3`、G/R **1.84**、G/B 1.24 → **仍然绿**。同批日志没有"加载着色器失败/反射转换失败"，说明 json 是读到了、没报错，但画面没变。
+- `c217`（把场景与 bloom 的 `reg` 改成 99，即不存在的槽，做"json 到底有没有生效"的一键判决）：若画面变黑/异常 → json 生效，说明 c216 的"仍绿"另有原因；若画面仍绿 → json 根本没被运行时采用，需查 `shader_load()` 实际读的是哪份文件。
+
 ## 下一步（修法方向）
 
 1. 查 `p_bind_buf` 的 `reg` 填充与 `S.tex[stage][reg]` 的赋值，确认「游戏给的 texture unit」是否被正确保存，
