@@ -12042,7 +12042,7 @@ static void td_dump_body(void) {
                 [g_td_list addObject:@[c2, @(ser * 100 + z), @0]]; }   // file index = (serial*100+z)*100
             continue; }
         for (int j = 0; j < g_tp_n; j++) if (g_tp_ser[j] == ser) { const tex_t *x = &g_tp_tex[j]; uint64_t nz = 0; if (x->mem) for (uint64_t k = 0; k < x->L.size; k += 8) if (*(const uint64_t *)(x->mem + k)) nz++;
-            MLOG("[texpng]   nvnfmt=%#x flags=%#x has_layout=%d mem=%p size=%llu nz8=%llu/%llu pool=%p pflags=%#x phost=%p off=%lld", x->d.format, x->d.flags, x->has_layout, (void *)x->mem, (unsigned long long)x->L.size, (unsigned long long)nz, (unsigned long long)(x->L.size / 8), (void *)x->pool, x->pool ? x->pool->flags : 0, x->pool ? (void *)x->pool->host : NULL, (long long)x->off); }
+            MLOG("[texpng]   nvnfmt=%#x flags=%#x has_layout=%d swz=%u,%u,%u,%u mem=%p size=%llu nz8=%llu/%llu pool=%p pflags=%#x phost=%p off=%lld", x->d.format, x->d.flags, x->has_layout, x->d.swizzle_r, x->d.swizzle_g, x->d.swizzle_b, x->d.swizzle_a, (void *)x->mem, (unsigned long long)x->L.size, (unsigned long long)nz, (unsigned long long)(x->L.size / 8), (void *)x->pool, x->pool ? x->pool->flags : 0, x->pool ? (void *)x->pool->host : NULL, (long long)x->off); }
         for (NSUInteger lv = 0; lv < t.mipmapLevelCount; lv++) [g_td_list addObject:@[t, @(ser), @(lv)]];
     }
     for (NSArray *e in g_td_list) {
