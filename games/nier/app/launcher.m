@@ -59,6 +59,11 @@ static NSString *work_folder(void) {
     /* GS 压缩：序章飞行场景的几何只在压缩路径上出画（stage-2 程序没有翻译链），默认开。
        捕获缓冲扩容时旧缓冲延迟退役（commit 6762950 修掉的页故障）。 */
     setenv("NIER_GS_COMPACT", "1", 1);
+    /* 性能（2026-10-23，c243 实测）：关掉 GPU 保活。保活是给"帧间 GPU 空转会被 M4 降频"
+       兜底的自旋核（nvn_mtl.m:453 注释），但本作 GPU 只到 27-30%（游戏自身 20-22%），
+       没有空转窗口，自旋核反而把 GPU 占满（93%）并拖慢出图。
+       c243（关保活）5 分钟 9600 帧 ≈ 32 fps、0 崩溃；c239（开保活）30 分钟 38400 帧 ≈ 21 fps。 */
+    setenv("TOTK_GPU_KEEPALIVE", "0", 1);
     /* 偏色修复（2026-10-23，docs/color-cast-root-cause-2026-10-23.md §10）：
        bloom 最粗级（ser=84, 50x28）被 84↔90 composite（shader 7b61c45a）写成非有限值，
        再经 88/89/90 上采样灌进 tonemap 的 bloom 通道，整片画面变成绿色（G/R 2.6）。
