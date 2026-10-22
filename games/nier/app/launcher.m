@@ -50,7 +50,15 @@ static NSString *work_folder(void) {
     setenv("TOTK_GPU_ALLOW_SUBMIT", "1", 1);
     setenv("TOTK_GPU_MIDCLEAR", "1", 1);
     setenv("NIER_T2T_CONVERT", "1", 1);
-    setenv("TOTK_GPU_BUDGET_MB", "5000", 1);
+    /* GPU 预算按机器物理内存定，不再写死一个数字：默认 55%，8 GB 机器也至少给 6 GB。
+       写死 5000 时，序章飞行的装载突发会顶到闸门（docs/port-plan-2026-10-23.md §2）。 */
+    unsigned long long physMB = NSProcessInfo.processInfo.physicalMemory >> 20;
+    unsigned long long budgetMB = (physMB * 55ull) / 100ull;
+    if (budgetMB < 6144ull) budgetMB = 6144ull;
+    setenv("TOTK_GPU_BUDGET_MB", [NSString stringWithFormat:@"%llu", budgetMB].UTF8String, 1);
+    /* GS 压缩：序章飞行场景的几何只在压缩路径上出画（stage-2 程序没有翻译链），默认开。
+       捕获缓冲扩容时旧缓冲延迟退役（commit 6762950 修掉的页故障）。 */
+    setenv("NIER_GS_COMPACT", "1", 1);
     setenv("DM_PRESENT_LINK_FALLBACK", "1", 1);
     setenv("TOTK_SLOT_OWNER", "user", 1);
     setenv("TOTK_SLOT_PURPOSE", "player", 1);

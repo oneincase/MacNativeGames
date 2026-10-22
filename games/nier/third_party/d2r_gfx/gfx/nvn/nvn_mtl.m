@@ -4350,6 +4350,37 @@ static void rp_end(void) { if (g_enc) {
                   (unsigned long long)fr, (unsigned long long)pass, i, (unsigned long long)serial,
                   sum[0]/4096.0, sum[1]/4096.0, sum[2]/4096.0, nonfinite[0], nonfinite[1], nonfinite[2]); fflush(f); pthread_mutex_unlock(&mu); }];
       } }
+    /* 诊断：指定 serial 的渲染目标在写完后立即整张读回，打印均值/极值。
+       DM_NVN_RTPROBE=<ser>、DM_NVN_RTPROBE_LOG=<path>（缺省 /tmp/rtprobe.txt）。
+       与帧末 texdump 对照，判定"写入后的内容"是否等于"帧末内容"，以及 tint 是否在写入即刻就存在。 */
+    { static long psr = -2; static FILE *pf; static long pfrom = -1, pto = -1;
+      if (psr == -2) { const char *e = getenv("DM_NVN_RTPROBE"); psr = e ? strtol(e, NULL, 0) : -1;
+          if (psr >= 0) { const char *p = getenv("DM_NVN_RTPROBE_LOG"); pf = fopen(p ? p : "/tmp/rtprobe.txt", "w");
+                          const char *a = getenv("DM_NVN_RTPROBE_FROM"), *b = getenv("DM_NVN_RTPROBE_TO");
+                          pfrom = a ? strtol(a, NULL, 0) : 0;
+                          pto = b ? strtol(b, NULL, 0) : 0x7fffffffffffffffL; } }
+      long long pfr = (long long)atomic_load(&g_cur_frame);
+      if (psr >= 0 && pf && pfr >= pfrom && pfr <= pto) for (int i = 0; i < R.rt.n && i < 8; i++) {
+          const tex_t *rt = R.rt.color[i]; if (!rt || (long)rt->serial != psr) continue;
+          id<MTLTexture> src = tex_mtl(rt);
+          if (!src || src.pixelFormat != MTLPixelFormatRG11B10Float) continue;
+          { static int cal; if (!cal++) { id oo = serial_get((uint64_t)psr); id<MTLTexture> tt = [oo isKindOfClass:[NvPkg class]] ? ((NvPkg *)oo)->tex : oo; MLOG("[rtprobe] 校准 ser=%ld attachment=%p serial_get=%p 同=%d", psr, (__bridge void *)src, (__bridge void *)tt, (int)(tt == src)); } }
+          uint32_t W = (uint32_t)src.width, H = (uint32_t)src.height;
+          id<MTLBuffer> rb; size_t ro = arena_alloc((size_t)W * H * 4, &rb);
+          blit_close(); rs_sync(); id<MTL4ComputeCommandEncoder> be = [g_cb computeCommandEncoder];
+          [be barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+          enc_b_copy_texture_buffer(be, src, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(W, H, 1), rb, ro, (size_t)W * 4, (size_t)W * H * 4);
+          m4_end(be);
+          uint64_t fr = atomic_load(&g_cur_frame), pass = g_stat_pass;
+          [g_commit_blocks addObject:^{ const uint32_t *v = (const uint32_t *)((const uint8_t *)rb.contents + ro);
+              double sum[3] = {0}; unsigned mn[3] = {2047, 2047, 1023}, mx[3] = {0, 0, 0};
+              for (uint32_t q = 0; q < W * H; q++) { uint32_t z = v[q], c[3] = {z & 0x7ff, (z >> 11) & 0x7ff, (z >> 22) & 0x3ff};
+                  for (int j = 0; j < 3; j++) { sum[j] += c[j]; if (c[j] < mn[j]) mn[j] = c[j]; if (c[j] > mx[j]) mx[j] = c[j]; } }
+              fprintf(pf, "F%llu p%llu ser=%ld %ux%u mean=%.1f,%.1f,%.1f min=%u,%u,%u max=%u,%u,%u\n",
+                  (unsigned long long)fr, (unsigned long long)pass, psr, W, H,
+                  sum[0] / (W * H), sum[1] / (W * H), sum[2] / (W * H), mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
+              fflush(pf); }];
+      } }
     nt_watch_after_pass();
     for (int i = 0; i < g_nblk_wb; i++) blk_copy(g_blk_wb[i].aux, 1, g_blk_wb[i].dst, &g_blk_wb[i]);   // TOTK: block-render results into the compressed texture
     g_nblk_wb = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); if (g_lp.count) lp_finish(); fz_end();
