@@ -35,6 +35,16 @@
 - `DM_NVN_TEXRAW` 逐张 `cb_wait` 同步读回会**阻塞提交线程 → 驻留积压**，在飞行场景装载突发窗口内 10.9/13.9 GB 两次撞预算闸（c170/c173）。RT 判决改用 `DM_NVN_TEXPNG(_FS)`（走采样 view、不逐张同步等）或 `DM_NVN_CBDUMP`（随 passdump 存 uniform，c174 成功产出 1343 块）。
 - 世界 HDR 偏色**不能**用任何单一现成开关（BLOOM_Q / T2T_CONVERT / GS_COMPACT）复现或消除——它在世界 pass 输出即存在。
 
+## 第二轮排除（c174/c176，2026-10-22 下午）
+
+- **c176（世界 pass 342819 采样的 28 张静态贴图逐张 PNG dump）**：全部不偏绿——G-(R+B)/2 最高的是暖色 LUT（3074-3084，R>G>B，+17 是"暖"不是"绿"），其余中性灰/白/法线蓝。**albedo/mask/LUT 输入侧排除**。
+- **c174（世界 pass uniform 全量 dump，1343 块）**：真实世界 VS 是 `6d95d272`（72 笔，非之前误追的 2fec68ad）；逐通道 tint 来自材质表 `vp_s0`（4000 条目×160B，tint 在 +48），实际使用的材质索引（`vp_c4`=st0 reg1 的 int[0]：1,6,23,26,30…）的 tint 全是**暖色**（如 (29.15, 9.87, 3.65)）——**材质 tint 数据正常**。FS `7c7dec85` 声明的 cbuf 槽（reg 7/10/12/13）在 dump 里全部在场——**uniform 绑定齐全**。
+- **驱动段"空洞 c2+0x160"是误报**：`drv_scan` 按 16 字节块粗粒度报告 `_m0[22]`（起始 0x160 在洞 [0x120,0x168) 内），但两个 shader 实际只读 `.z` 分量 = 字节 **0x168**，恰是已填的贴图句柄表起点。运行时读到的是真句柄，非 0。线索 A 关闭。
+- **ryujinx 对照（vendor/ryujinx）**：`SupportBuffer.cs` 布局与我们逐字段一致；`is_bgra` 交换仅 OpenGL 后端使用（Metal 原生支持 BGRA，恒 0 正确）；`TextureHandle.cs` 的 bindless 句柄打包（texId 低 20 | sampId<<20）与我们 c2 句柄表语义一致。ryujinx 无 NieR 专属色彩修正。
+- 剩余候选（收窄到 2 条）：
+  1. **pass 342815/342817 的 `57290de6`**：它 load 世界 HDR（ser=16）做全屏叠加，把句柄表字节 `c2[22].z` 当 **float** 用（`float _107 = (*fp_c2)._m0[22].z;` 无 as_type）——真机上 NVN 驱动在该位置放的是什么值未证；若我们放的句柄值（如 0x1000000n）被当 float（≈2.4e-39 或 NaN）参与混合，会污染叠加结果。**判据**：`flag skipfs_57290de6` 单开对比截图。
+  2. **blend 状态映射**：世界 pass 的 `b0=0x486021828 cmask=0xffff000f`——若 NVN→Metal blend 因子映射错，半透明叠加（天穹/雾/光晕）会系统性偏色。**判据**：对 342815 的 blend 因子逐位核对 `nvnCommandBufferBindBlendState` 的映射表。
+
 ## 需要的东西
 线索 A/B 的判决都卡在"没有真值对照"：要么有一份 Switch 真机同帧的参考（渲染目标或截帧），要么把 `c2+0x160` 与法线缓冲通道的**期望语义**从 NVN 驱动文档/真机确认。当前移植侧只能定位到"这两处之一"，无法凭空造真值（违反"不用返回成功掩盖未实现"）。
 
