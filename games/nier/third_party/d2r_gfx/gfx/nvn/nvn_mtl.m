@@ -3855,7 +3855,8 @@ static int g_enc_vis, g_enc_has_vis;   // 本编码器当前的可见性计数�
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // 回放中改了管线 / 深度模板相关状态 | Pipeline / depth-stencil related state was changed during replay
 static uint64_t g_stat_args_enc, g_stat_args_reuse;   // 参数缓冲：新编 / 复用次数 | Argument buffer: new-encode / reuse counts
 uint64_t g_draw_skip[16];   // TOTK: draws dropped in the replay, by reason (logged with the per-frame draw count)
-static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // 带宽账：附件读入 / 写出字节、全量读写通道数 | Bandwidth ledger: attachment load / store bytes, number of full load-store passes
+static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;
+static uint64_t g_pt_draw_base;   /* NIER_PASS_TRACE：本 pass 开始时的 g_stat_draw 快照 */   // 带宽账：附件读入 / 写出字节、全量读写通道数 | Bandwidth ledger: attachment load / store bytes, number of full load-store passes
 // DM_NVN_PASSDUMP：逐条记通道附件 / 采样 / 出图（贴图按序号），供离线做数据流分析；P / D / R / S 行的通道号一致（= 开通道后的 g_stat_pass）
 // DM_NVN_PASSDUMP=帧号 或 起-止（含两端）
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
@@ -4356,6 +4357,19 @@ static void rp_end(void) { if (g_enc) {
 #ifdef NVN_RT_RANGE_TEST
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
+    /* 诊断（黑场排查）：把「本次 pass 的全部颜色附件 serial」与「本 pass 的 draws 数」打在同一行，
+       绕开 passdump 的自增 pass 号归属问题（dump 里 P 行与 d 行的关联不可靠时，无法判断谁写了哪个 RT）。 */
+    if (getenv("NIER_PASS_TRACE")) {
+        static uint64_t n; static long pf0 = -1, pf1 = -1;
+        if (pf0 < 0) { const char *e0 = getenv("NIER_PT_FROM"), *e1 = getenv("NIER_PT_TO"); pf0 = e0 ? atol(e0) : 0; pf1 = e1 ? atol(e1) : 100000000; }
+        if (g_stat_pass >= (uint64_t)pf0 && g_stat_pass < (uint64_t)pf1 && n++ < 20000 && R.rt.n > 0 && R.rt.color[0]) {
+            char b[600]; size_t o = 0;
+            for (int i = 0; i < R.rt.n && i < 8 && o < sizeof b - 90; i++)
+                if (R.rt.color[i]) o += snprintf(b + o, sizeof b - o, " c%d=ser%llu", i, (unsigned long long)R.rt.color[i]->serial);
+            MLOG("[pt] F%llu p%llu draws=%d n=%lu%s", (unsigned long long)atomic_load(&g_cur_frame),
+                 (unsigned long long)g_stat_pass, (int)(g_stat_draw - g_pt_draw_base), (unsigned long)R.rt.n, b);
+        }
+    }
     sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_lay.active = 0;
     /* Diagnostic: inspect each full-size HDR render target immediately after its
        producer pass, on the same Metal 4 queue and before later passes reuse it. */
@@ -4773,6 +4787,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (!g_enc) g_rpb_why = 3;
     args_dirty_all();
     g_stat_pass++;
+    g_pt_draw_base = g_stat_draw;
     if (lay_n) { g_lay.active = 1; g_lay.base = g_lay.cur = lay_first; g_lay.count = lay_n; if (g_cg_force_layers) g_lay.cur = g_cg_cur;
         if (!g_lay.passes++) MLOG("[totk] layered pass: first one covers layers %d-%d of a %lux%lu level", lay_first, lay_first + lay_n - 1, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
         PD("L %llu 分层通道 层 %d-%d", g_stat_pass, lay_first, lay_first + lay_n - 1); }
@@ -5211,6 +5226,8 @@ static id<MTLLibrary> shader_lib_prebuilt(NSData *src) {
 #endif
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
+    /* 诊断：打印运行时实际加载的 MSL 变体名（排查黑场时改 MSL 改错变体）。 */
+    if (getenv("NIER_SHADER_TRACE")) { static uint64_t n; if (n++ < 300) MLOG("[shader-load] %s", pc.UTF8String); }
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
     NSString *rt_src = [NSString stringWithFormat:@"%@/%@.metal", totk_rt_dir(), pc];
     int rt = [NSFileManager.defaultManager fileExistsAtPath:rt_src];
@@ -5227,6 +5244,8 @@ static NvShader *shader_load(NSString *pc, int stage) {
                     if (raw && (lib = shader_lib_prebuilt(raw))) atomic_fetch_add(&g_rt_prebuilt, 1);
 #endif
                     NSString *src = raw && !lib ? [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding] : nil;
+                    /* 诊断：源码长度与「是否用了预编译库」，用来分辨「改了 MSL 却没生效」是缓存还是别的副本。 */
+                    if (getenv("NIER_SHADER_TRACE") && src) { static uint64_t sn; if (sn++ < 300) MLOG("[shader-src] %s len=%lu prebuilt=%d sha=%08x", pc.UTF8String, (unsigned long)src.length, lib != nil, (unsigned)(raw.length * 2654435761u)); }
                     /* NieR: bloom 84↔90 composite（7b61c45a）在写 50x28 最粗级时输出会跑到 inf——这两个 pass 用
                        同一段 16-tap 加权互相写，权重和大于 1，再叠加 cb reg1 的 −15.3 偏移，纹素坐标跑出 [0,1]，
                        采样到越界内容后被放大成非有限值；它经 88/89/90 上采样灌进 tonemap 的 bloom 通道，整片
@@ -11074,8 +11093,11 @@ static void dispatch(const p_dispatch *dp) {
     if (indirect) memcpy(g_dispatch_grid, (const void *)(uintptr_t)dp->caller, 12);
     else { g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z; }
     if (passdump()) {   // pass dumps: the dispatch, its grid and the storage buffers it can write
-        char b[600]; size_t o = 0;
+        char b[1200]; size_t o = 0;
         for (int i = 0; i < 16 && o < sizeof b - 64; i++) if (S.ssbo[5][i].addr) o += snprintf(b + o, sizeof b - o, " s%d=%#llx+%llu", i, (unsigned long long)S.ssbo[5][i].addr, (unsigned long long)S.ssbo[5][i].size);
+        /* 计算着色器能逐像素写 storage image（S.img），passdump 之前只记 storage buffer，
+           写纹理的那类派发在 dump 里完全不可见（第一章节黑场排查时卡在这里）。 */
+        for (int i = 0; i < 32 && o < sizeof b - 64; i++) if (S.img[5][i]) o += snprintf(b + o, sizeof b - o, " i%d=ser%llu", i, (unsigned long long)h_ser(S.img[5][i]));
         PD("C %llu cs=%.16s grid=%ux%ux%u%s tg=%ux%ux%u%s", g_stat_pass, cs->key, g_dispatch_grid[0], g_dispatch_grid[1], g_dispatch_grid[2], indirect ? " indirect" : "", tg[0], tg[1], tg[2], b);
     }
     encode_args(ce, cs, 5, 0);
