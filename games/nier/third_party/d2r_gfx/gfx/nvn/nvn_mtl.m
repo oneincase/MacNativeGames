@@ -5958,7 +5958,13 @@ static NSString *image_format(int f) {
         default: return nil;
     }
 }
-static const treg_t *bound_tex(uint64_t h) { int tid = (int)(h & 0xfffff); return tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL; }
+static const treg_t *bound_tex(uint64_t h) {
+    int tid = (int)(h & 0xfffff);
+    const treg_t *r = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL;
+    if (!r) { static int n; if (n++ < 12) MLOG("[bound-tex] 失败 h=%#llx tid=%d g_ntreg=%d", (unsigned long long)h, tid, g_ntreg); }
+    else if (tid == 426110 || tid == 491614) { static int n; if (n++ < 8) MLOG("[bound-tex] 命中 h=%#llx tid=%d ser=%llu ok=%d", (unsigned long long)h, tid, (unsigned long long)r->t.serial, r->ok); }
+    return r;
+}
 static int bound_target(const treg_t *r) { return r->has_v && r->v.set_target ? r->v.target : r->t.d.target; }
 static NSDictionary *rt_answers(int st) {
     NSMutableDictionary *tex = [NSMutableDictionary dictionary], *img = [NSMutableDictionary dictionary], *attr = [NSMutableDictionary dictionary], *fout = [NSMutableDictionary dictionary];
@@ -9984,7 +9990,7 @@ static int skv_check(const void *pr, const p_draw *dw, const p_draw_idx *di) {
       int st_ok = !S.ds.st || ((S.ds.fail_f == keep && S.ds.zfail_f == keep && S.ds.fail_b == keep && S.ds.zfail_b == keep) || (!S.st_wmask[0] && !S.st_wmask[1]));
       if (!df_ok || !st_ok) return 0;
       /* shader side effects (stores to storage buffers / images in the vertex or fragment stage) happen whether or not a
-         sample passes (no shader declares early_fragment_tests). rw comes from the MSL's stores (refl_mark_stores): the
+         sample passes (unless the fragment shader declares early_fragment_tests, NVN control +0x718 bit 0: then only the samples that pass, which hides nothing more). rw comes from the MSL's stores (refl_mark_stores): the
          translator flag said read-only for every shader, so the deferred-lighting quads (dbe0acd9 ...), which store a per-tile
          feedback word the next frame's class marker reads, were skipped as "0 samples" -- the title mural went dark except on
          retest frames (2026-10-16 night). Every material fragment shader stores too: an unconditional per-tile class-group flag

@@ -215,6 +215,13 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name, @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
     [rq addEntriesFromDictionary:answers];
     if (local) rq[@"local"] = local;
+    /* A fragment shader's early fragment tests: control byte +0x718 bit 0 of the 0x880-byte section (the game's NVN driver
+       reads it as a fragment flag; the Switch then tests depth before the shader). Without it Metal tests depth after a
+       fragment shader that stores to memory, and the G-buffer draws' EQUAL test fails against the prepass: the G-buffer
+       keeps its clear value and the first chapter renders black. Same rule as the TOTK fix (ae8f4f4). */
+    /* NieR's fragment control section puts the flag at +0x714 bit 0 (1 on every fragment shader seen here, 0 on vertex
+       shaders); +0x718 (the TOTK offset) is always 0 in this game. */
+    if (stage == 1 && (control[0x714] & 1)) rq[@"early_fragment_tests"] = @YES;
     rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;   // nvnDeviceSetDepthMode: NEAR_IS_MINUS_W needs the GL -> Metal clip-z conversion in every vertex shader
     if (no_translator()) {
     // No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.

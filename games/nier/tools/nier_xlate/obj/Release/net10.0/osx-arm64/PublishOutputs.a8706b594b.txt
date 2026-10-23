@@ -1,0 +1,1 @@
+/tmp/nier_out/nier_xlate
