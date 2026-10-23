@@ -198,9 +198,11 @@ static void map_module(Module *m,const char *dir) {
  make_hash(m);
  fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u\n",m->name,m->size,m->nsym);
 }
-/* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
-   Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
-   the patch sites; the count is printed and checked by the generator. */
+/* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) and patch area
+   [PATCH_OFF, page_up(file size)) for ios/tools/gen_embed.py (Breath of the Wild's exclusive-acquire patch also changes the
+   rewriter's patch area; Tears of the Kingdom's leave it as it is). Relocations never reach either (they start at
+   DATA_OFF, below PATCH_OFF), so the exported bytes differ from the verified image only at the patch sites; the counts
+   are printed. */
 static void export_ios_text(const char *rewritten,const char *out) {
  for(unsigned i=0;i<NM;i++){Module *m=&modules[i];char path[4096];size_t n=page_up(m->text_end);
   need(snprintf(path,sizeof path,"%s/%s.patched.bin",rewritten,m->name)<(int)sizeof path,"image path");
@@ -208,7 +210,14 @@ static void export_ios_text(const char *rewritten,const char *out) {
   unsigned diff=0;for(size_t k=0;k<n;k+=4)if(memcmp(orig+k,m->base+k,4))diff++;free(orig);
   need(snprintf(path,sizeof path,"%s/%s.x0.bin",out,m->name)<(int)sizeof path,"export path");
   f=fopen(path,"wb");need(f&&fwrite(m->base,1,n,f)==n&&fclose(f)==0,"write exported text");
-  printf("%s text_bytes=%zu patched_words=%u\n",m->name,n,diff);}
+  size_t p0=m->patch_off,p1=page_up(m->file_size);need(p0<=p1&&p1<=m->size,"patch area layout");
+  need(snprintf(path,sizeof path,"%s/%s.patched.bin",rewritten,m->name)<(int)sizeof path,"image path");
+  f=fopen(path,"rb");need(f!=NULL,"open patched module");uint8_t *img=calloc(1,p1-p0);need(img!=NULL,"patch area buffer");
+  need(fseek(f,(long)p0,SEEK_SET)==0,"seek patch area");size_t got=fread(img,1,m->file_size-p0,f);fclose(f);need(got==m->file_size-p0,"read patch area");
+  unsigned pdiff=0;for(size_t k=0;k<p1-p0;k+=4)if(memcmp(img+k,m->base+p0+k,4))pdiff++;free(img);
+  need(snprintf(path,sizeof path,"%s/%s.x1.bin",out,m->name)<(int)sizeof path,"export path");
+  f=fopen(path,"wb");need(f&&fwrite(m->base+p0,1,p1-p0,f)==p1-p0&&fclose(f)==0,"write exported patch area");
+  printf("%s text_bytes=%zu patched_words=%u patch_area_bytes=%zu patched_words=%u\n",m->name,n,diff,p1-p0,pdiff);}
 }
 #endif
 static void relocate(Module *m) {
@@ -489,7 +498,7 @@ void runtime_startup_checkpoint(uintptr_t caller) {
  for(unsigned i=0;i<NM;i++){uint32_t state;memcpy(&state,modules[i].base+modules[i].ctor_flag,4);need(state==2,"constructor checkpoint state");}
  printf("{\"status\":\"pass\",\"phase\":4,\"original_nnMain_return_pc\":\"0x%x\",\"scope\":\"all DT_INIT constructor loops completed; original nnMain prefix executed; stops at focus setup\"}\n", GAME_ADDR(0xe995c4));fflush(stdout);_exit(0);
 }
-#ifndef GAME_BOTW
+#ifndef GAME_BOTW160
 static void module_finis(void) { runtime_fail("guest exited: module finalizers not yet implemented"); }
 #endif
 static void boot(void) {
@@ -497,7 +506,7 @@ static void boot(void) {
  runtime_boot_status(TOTK_UI("启动游戏运行环境","Starting the game runtime"),TOTK_UI("连接游戏代码与 macOS 系统服务","Connecting the game code to macOS system services"));
  runtime_thread_init();uint32_t main_handle=svc_thread_main_init();
 #ifdef GAME_BOTW
- /* SDK 7.3.2 (Breath of the Wild): Start(handle, arg, rtld callback, module initializers). The order inside is the one of
+ /* SDK 7.3.2 (Breath of the Wild 1.6.0): Start(handle, arg, rtld callback, module initializers). The order inside is the one of
     TOTK's SDK 15 (libc0, nnosInitialize, callback, libc1, InitializeSdkModule, nninitStartup, libc2, callback, nnMain), but
     after nnMain it calls nninitFinalizeSdkModule and quick-exits itself instead of a third callback. */
  /* Host functions called from the main thread run on a stack of their own (8 MiB, guard page), as on every other guest
@@ -506,8 +515,13 @@ static void boot(void) {
     runs on core 0 waited for the main thread's next SVC (botw.md). */
  if(!getenv("TOTK_MAIN_PREEMPT")||strcmp(getenv("TOTK_MAIN_PREEMPT"),"0")){extern void runtime_hle_stack_set(uintptr_t top);size_t n=8u<<20;void *hs=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
   need(hs!=MAP_FAILED&&mprotect(hs,0x4000,PROT_NONE)==0,"main thread host-service stack");runtime_hle_stack_set((uintptr_t)hs+n-64);}
+#endif
+#ifdef GAME_BOTW160
  fprintf(stderr,"[totk] ENTER original nn::init::Start (SDK 7)\n");
  ((void(*)(uint64_t,uint64_t,void(*)(void),void(*)(void)))required("_ZN2nn4init5StartEmmPFvvES2_"))(main_handle,0,loader_ready,module_inits);
+#elif defined(GAME_BOTW)   /* 1.9.0 (SDK 20.5) takes the five-argument Start of TOTK's SDK */
+ fprintf(stderr,"[totk] ENTER original nn::init::Start (SDK 20.5)\n");
+ ((void(*)(uint64_t,uint64_t,void(*)(void),void(*)(void),void(*)(void)))required("_ZN2nn4init5StartEmmPFvvES2_S2_"))(main_handle,0,loader_ready,module_inits,module_finis);
 #else
  fprintf(stderr,"[totk] ENTER original nn::init::Start sdk+0xfa060\n");
  ((void(*)(uint64_t,uint64_t,void(*)(void),void(*)(void),void(*)(void)))required("_ZN2nn4init5StartEmmPFvvES2_S2_"))(main_handle,0,loader_ready,module_inits,module_finis);
@@ -540,5 +554,5 @@ int main(int argc,char **argv) {
 #endif
  verify_identity(!strcmp(argv[2],"probe-identity-negative"));
  for(unsigned i=0;i<NM;i++){seal(&modules[i]);check_permissions(&modules[i]);}
- if(!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
+ if(!strcmp(argv[2],"probe-gpu-sampler-border")||!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-texels-region")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
 }

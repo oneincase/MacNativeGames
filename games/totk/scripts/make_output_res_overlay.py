@@ -15,7 +15,17 @@ runtime/game_patches_v143.c): keep the two in step.
 
 Input: the IVFC-verified local RomFS image (extracted/v0/romfs). Output: extracted/v0/romfs-patches-out/<w>x<h>/<path>
 and manifest.tsv (path, size, SHA-256 of the overlay, SHA-256 of the original); game content stays in the ignored folder.
-usage: make_output_res_overlay.py 2560x1440
+
+--heapdef <file.zs> uses a player mod's replacement of the same file as the base, so the overlay carries the mod's own
+heap sizes with the 2K sizes added on top (build_app.py does this with --mod). The manifest still names the RomFS
+original, and the player's mod manifest must leave this file to the app, or the game stops with "two overlays replace
+the same file".
+
+overlay.json next to the manifest records what the overlay was made from (the script's own SHA-256, the output size,
+the scene size, and the SHA-256 of the heap table it was built on, or null for the RomFS original), so build_app.py can
+tell a current overlay from one a --mod build left behind - the mod's heap sizes must not stay in a later build that
+passes no --mod.
+usage: make_output_res_overlay.py 2560x1440 [--heapdef /path/to/mod/System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs]
 """
 import argparse, hashlib, json, math, struct
 from pathlib import Path
@@ -43,6 +53,8 @@ parser.add_argument('size', help='<width>x<height>, e.g. 2560x1440')
 parser.add_argument('--output-root', type=Path, default=root / 'extracted/v0/romfs-patches-out')
 parser.add_argument('--version', choices=('v0','v112','v121','v143'), default='v0')
 parser.add_argument('--scene', help='<width>x<height> scene render size (TOTK_RENDER_RES, 1.4.3) the heaps must also hold')
+parser.add_argument('--heapdef', type=Path,
+                    help='a mod\'s replacement HeapDef(.zs) to build on: its heap sizes are kept, the 2K sizes added')
 args = parser.parse_args()
 version = args.version
 if args.output_root == root / 'extracted/v0/romfs-patches-out': args.output_root = root / f'extracted/{version}/romfs-patches-out'
@@ -73,10 +85,16 @@ with (root / f'extracted/{version}/romfs/romfs.bin').open('rb') as image:
     pack = zstd.decompress(read('Pack/ZsDic.pack.zs'))
     for name, (lo, hi) in sarc_members(pack).items():
         d = zstd.ZstdDict(pack[lo:hi]); dictionaries[d.dict_id] = d
-    raw = read(HEAPDEF)
-info = zstd.get_frame_info(raw)
-dictionary = dictionaries[info.dictionary_id] if info.dictionary_id else None   # HeapDef is compressed without a dictionary
-byml = bytearray(zstd.decompress(raw, zstd_dict=dictionary)); assert len(byml) == info.decompressed_size
+    romfs_raw = read(HEAPDEF)       # the manifest's original_sha256 column always names the RomFS file
+mod_raw = args.heapdef.read_bytes() if args.heapdef else romfs_raw
+try:
+    info = zstd.get_frame_info(mod_raw)
+    dictionary = dictionaries[info.dictionary_id] if info.dictionary_id else None   # HeapDef is compressed without one
+    byml = bytearray(zstd.decompress(mod_raw, zstd_dict=dictionary))
+except Exception as error:          # a mod file that is not a HeapDef at all
+    raise SystemExit(f'{args.heapdef}: not a zstd-compressed HeapDef ({error})')
+assert len(byml) == info.decompressed_size, args.heapdef or 'the RomFS HeapDef'
+base = bytes(byml)
 
 # BYML v7, little endian ("YB"): hash nodes 0xC1 {u24 key index, u8 type, u32 value}; ints (0xD1) are stored inline.
 assert byml[:2] == b'YB' and struct.unpack_from('<H', byml, 2)[0] == 7
@@ -100,21 +118,28 @@ heaps = child(root_node, 'Heaps')
 def size_field(heap): return field(child(heaps, heap), 'Size', 0xd1)
 dta_at, graphics_at = size_field('DynamicTextureAllocatorMem'), size_field('Graphics')
 dta, graphics = (struct.unpack_from('<i', byml, a)[0] for a in (dta_at, graphics_at))
-assert (dta, graphics) == (DTA_KIB, GRAPHICS_KIB), (dta, graphics)
+if not args.heapdef:   # the shipped table is the reference; a mod's table may already have changed other heaps
+    assert (dta, graphics) == (DTA_KIB, GRAPHICS_KIB), (dta, graphics)
 extra = extra_kib(w, h, sw, sh)
 assert extra > 0, 'neither the output nor the scene is bigger than the shipped size: no overlay needed'
 struct.pack_into('<i', byml, dta_at, dta + extra)
 struct.pack_into('<i', byml, graphics_at, graphics + extra)
-original = zstd.decompress(raw, zstd_dict=dictionary)
-diff = [i for i in range(len(original)) if original[i] != byml[i]]
+diff = [i for i in range(len(base)) if base[i] != byml[i]]
 assert diff and all(dta_at <= i < dta_at + 4 or graphics_at <= i < graphics_at + 4 for i in diff), diff
 data = zstd.compress(bytes(byml), level=19, zstd_dict=dictionary)
 assert zstd.decompress(data, zstd_dict=dictionary) == bytes(byml)
-assert zstd.get_frame_info(data).dictionary_id == info.dictionary_id and zstd.get_frame_info(data).decompressed_size == len(byml)
+written = zstd.get_frame_info(data)
+assert written.dictionary_id == info.dictionary_id and written.decompressed_size == len(byml)
 out_dir = args.output_root / f'{w}x{h}{scene_dir}'
 target = out_dir / HEAPDEF; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
-line = '\t'.join([HEAPDEF, str(len(data)), hashlib.sha256(data).hexdigest(), hashlib.sha256(raw).hexdigest()])
-(out_dir / 'manifest.tsv').write_text(f'# path\tsize\tsha256\toriginal_sha256 (generated by scripts/make_output_res_overlay.py {w}x{h}{" --scene " + args.scene if args.scene else ""})\n' + line + '\n')
+line = '\t'.join([HEAPDEF, str(len(data)), hashlib.sha256(data).hexdigest(), hashlib.sha256(romfs_raw).hexdigest()])
+(out_dir / 'manifest.tsv').write_text(f'# path\tsize\tsha256\toriginal_sha256 (generated by scripts/make_output_res_overlay.py {w}x{h}{" --scene " + args.scene if args.scene else ""}{" --heapdef " + str(args.heapdef) if args.heapdef else ""})\n' + line + '\n')
+(out_dir / 'overlay.json').write_text(json.dumps(dict(
+    script='make_output_res_overlay.py', script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    version=version, size=f'{w}x{h}', scene=args.scene or None, extra_kib=extra,
+    heapdef=str(args.heapdef) if args.heapdef else None,
+    heapdef_sha256=hashlib.sha256(mod_raw).hexdigest() if args.heapdef else None), indent=2) + '\n')
 print(json.dumps(dict(status='pass', output=f'{w}x{h}', path=HEAPDEF, extra_kib=extra,
+                      base=str(args.heapdef) if args.heapdef else 'the RomFS original',
                       DynamicTextureAllocatorMem_kib=[dta, dta + extra], Graphics_kib=[graphics, graphics + extra],
                       size=len(data), changed_bytes=len(diff), dir=str(out_dir))))

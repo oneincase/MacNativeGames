@@ -78,7 +78,6 @@ void runtime_frame_step_update(uint64_t now_ns) {
     double dt = (double)(now_ns - last_present_ns) * 1e-9;
     last_present_ns = now_ns;
     if (dt > 0.25 || dt < 0.001) { frame_sample_count = frame_sample_next = 0; return; }
-    if (dt < 1.0 / 120.0) dt = 1.0 / 120.0;
     if (dt > 1.0 / 15.0) dt = 1.0 / 15.0;
     frame_samples[frame_sample_next++ % 5] = dt;
     if (frame_sample_count < 5) frame_sample_count++;
@@ -482,9 +481,13 @@ static void check_site(const Module *m, const GamePatch *p) {
 /* TOTK_PCHTXT=<file>: an emulator ExeFS patch for main in pchtxt form, as community mods ship them (for example
    TOTK-Ultrawide's aspect-ratio patch), for trying them here. Mac only: the phone's code is patched at build. Its
    @nsobid must be main's build id, read from the extracted ExeFS (extracted/<version>/exefs/main at 0x40); the lines
-   between @enabled and @stop are "<main address> <bytes>" (offset_shift 0x100 is the NSO header only the IPS form
-   counts). It is applied before this runtime's own patches, whose checks of the original words then refuse a file that
-   overlaps them. */
+   after @enabled are "<main address> <bytes>", @disabled switches the lines that follow off again (a section the author
+   keeps without applying it) and @stop ends the file. "@flag offset_shift 0x100" must come before the first patch line:
+   it says the addresses leave out the NSO header only the IPS form counts, which is how they are applied here; a file
+   without it, or with another shift, would land 0x100 bytes off and stops the start. "@flag print_values" (a display
+   option of the patching tools) is accepted, any other flag stops the start. The same reading as the build's --mod
+   (scripts/mod_exefs.py). It is applied before this runtime's own patches, whose checks of the original words then
+   refuse a file that overlaps them. */
 static void patch_pchtxt(Module *m) {
     const char *path = getenv("TOTK_PCHTXT");
     if (!path || !*path) return;
@@ -496,18 +499,28 @@ static void patch_pchtxt(Module *m) {
     if (!n || fseek(n, 0x40, SEEK_SET) || fread(id, 1, sizeof id, n) != sizeof id) runtime_fail("TOTK_PCHTXT: cannot read main's build id from extracted/<version>/exefs/main");
     fclose(n);
     for (int i = 0; i < 20; i++) snprintf(want + 2 * i, 3, "%02X", id[i]);
-    char line[1024]; int enabled = 0, matched = 0; unsigned count = 0, bytes = 0;
+    char line[1024]; int enabled = 0, matched = 0, shifted = 0; unsigned count = 0, bytes = 0;
     while (fgets(line, sizeof line, f)) {
         if (!strncmp(line, "@nsobid-", 8)) {
             if (strncasecmp(line + 8, want, 40)) runtime_fail("TOTK_PCHTXT is for another build of main");
             matched = 1; continue;
         }
         if (!strncmp(line, "@enabled", 8)) { enabled = 1; continue; }
+        if (!strncmp(line, "@disabled", 9)) { enabled = 0; continue; }
+        if (!strncmp(line, "@flag", 5)) {
+            char name[64] = "", value[64] = "";
+            sscanf(line + 5, "%63s %63s", name, value);
+            if (!strcmp(name, "print_values")) continue;
+            if (strcmp(name, "offset_shift")) runtime_fail("TOTK_PCHTXT: only @flag offset_shift 0x100 and print_values are supported");
+            if (strtoull(value, NULL, 16) != 0x100) runtime_fail("TOTK_PCHTXT: @flag offset_shift must be 0x100 (the addresses are main addresses)");
+            shifted = 1; continue;
+        }
         if (!strncmp(line, "@stop", 5)) break;
         unsigned long long at; char hex[512];
         if (!enabled || line[0] == '@' || sscanf(line, "%llx %511s", &at, hex) != 2) continue;
         size_t len = strlen(hex);
         if (!matched) runtime_fail("TOTK_PCHTXT: patches before its @nsobid line");
+        if (!shifted) runtime_fail("TOTK_PCHTXT: no @flag offset_shift 0x100 before the first patch line");
         if (len % 2 || at + len / 2 > m->file_size) runtime_fail("TOTK_PCHTXT: a patch line is malformed or outside main");
         for (size_t i = 0; i < len / 2; i++) { unsigned v; sscanf(hex + 2 * i, "%2x", &v); m->base[at + i] = (uint8_t)v; }
         count++; bytes += (unsigned)(len / 2);
@@ -581,7 +594,8 @@ void runtime_game_patches(Module *m) {
     patch_trap(m);
 #if defined(TOTK_GAME_V121)
     { static const uint64_t sites[] = {0xcb4b10, 0x12521cc, 0x19b36f0, 0x1ecdf68};   /* camera x2, viewport x2 (aspect_patch.h) */
-      aspect_install(m, "1.2.1", sites, 4, (m->text_end + 15) & ~15ULL, (m->file_size + 0x3fff) & ~0x3fffULL); }
+      aspect_install(m, "1.2.1", sites, 4, 2, (m->text_end + 15) & ~15ULL, 0,   /* no free padding for Vert+ stubs */
+                     (m->file_size + 0x3fff) & ~0x3fffULL); }
 #else
     if (aspect_requested()) runtime_fail("TOTK_ASPECT: only 1.2.1 and 1.4.3 so far");
 #endif

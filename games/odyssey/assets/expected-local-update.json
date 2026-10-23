@@ -1,0 +1,18 @@
+{
+  "title_id": "0100000000010000",
+  "main_build_id": "b424be150a8e7d78701cbe7a439d9ebf00000000000000000000000000000000",
+  "exefs_sha256": {
+    "main": "47ac74a66234bc1eb717b18e01fe7c880d2dd50cf1115fd046f5e5878be5f85f",
+    "sdk": "754cf4b581d749fbe3d457cf66497b141ef994cf592d247919d64a37dcc30d27",
+    "subsdk0": "d22d98656a19be240b554e7db8d69126d6427232521238d665aec3509087f2cf"
+  },
+  "romfs": {
+    "size": 5678168236,
+    "sha256": "6bb432a4032512f124485aaa5d08f5902b5d5da5027f43968cfc67cff5a97f1d"
+  },
+  "rewritten_sha256": {
+    "main.patched.bin": "d0c3b8a60556be2077a2e5e64041c3a73189e539c6fdb18e3e28df402afc14ea",
+    "sdk.patched.bin": "d950b6f1af7690231fe17e6db77d26dabf9dbf565b04774c11d7fbc605f117dd",
+    "subsdk0.patched.bin": "f5bc35332258bd850f2137c7953916dad47bd5f3ce67e5d208a1b31336c6c8da"
+  }
+}

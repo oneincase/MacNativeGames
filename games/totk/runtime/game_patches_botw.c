@@ -1,14 +1,46 @@
 /* Breath of the Wild game-code patches (botw.md): exclusive loads with acquire, the real-time frame step, and the
-   TOTK_JQ_CHECK diagnostics. The functions the shared runtime calls for the output size and keys 3 / 4 answer
-   "not available" until BotW's own sites are found. */
+   TOTK_JQ_CHECK diagnostics. Key 4 (ultrawide) is 1.9.0 only (end of the file); the output size answers "not available"
+   until BotW's own sites are found. */
 #include <stdatomic.h>
+#include "world_survey.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include "game_patches.h"
 #include "game_version.h"
+#include "aspect_math.h"   /* key 4: TOTK_ASPECT parsing */
+#include <TargetConditionals.h>
 uint32_t runtime_thread_current_handle(void);
+static void botw_aspect_install(Module *m);   /* key 4, end of the file */
+static int patch_output_res(Module *m);   /* native output size, after runtime_output_res */
+static void botw_output_tick(void);       /* the size static follows the canvas after the start */
+static void botw_aspect_apply(void);
+
+/* iOS cannot write code pages at run time: the iOS export (TOTK_EXPORT_IOS, runtime/loader.c export-ios) runs these
+   patches on the Mac, and the patched text and patch area are embedded in the app (ios/tools/gen_embed.py), as for
+   Tears of the Kingdom (game_patches.c). On the device the original words are not checked (they are patched already) and
+   each patched word is checked instead of written. The switches that leave a patch out (TOTK_REALTIME=0,
+   TOTK_PAD_REPEAT=0, TOTK_RENDER_RES=900, TOTK_EXCL_ACQUIRE=0), the brk diagnostics (TOTK_PAD_LOG, TOTK_JQ_CHECK) and the
+   native output size (TOTK_OUTPUT_RES) are Mac only; the export ignores them too, so the device checks what it made. */
+#if TARGET_OS_IPHONE
+#define CODE_PATCHED_AT_BUILD 1
+#else
+#define CODE_PATCHED_AT_BUILD 0
+#endif
+static int ios_code(void) { return CODE_PATCHED_AT_BUILD || getenv("TOTK_EXPORT_IOS") != NULL; }   /* the phone's code */
+static void put_words(Module *m, uint64_t off, const uint32_t *words, size_t n, const char *what) {
+    if (!CODE_PATCHED_AT_BUILD) { memcpy(m->base + off, words, 4 * n); return; }
+    for (size_t i = 0; i < n; i++) {
+        uint32_t have; memcpy(&have, m->base + off + 4 * i, 4);
+        if (have != words[i]) {
+            fprintf(stderr, "[botw] %s main+%#llx: embedded %08x, expected patched %08x\n", what, (unsigned long long)(off + 4 * i), have, words[i]);
+            runtime_fail("embedded main text was not patched at build time (ios/tools/build_ipa.py export-ios)");
+        }
+    }
+}
+static void put_word(Module *m, uint64_t off, uint32_t word, const char *what) { put_words(m, off, &word, 1, what); }
 
 /* Real-time frame step (TOTK_REALTIME=0: as shipped). ksys::VFR (singleton pointer main+0x2d1e170, built at main+0x183eb98)
    keeps one frame ratio at +0x3c: the frame's length in 30 fps frames. Every per-core step the game reads derives from it:
@@ -46,13 +78,20 @@ static uint64_t last_present_ns, report_ns, report_frames;
 static double frame_samples[5], report_seconds, report_game, report_short_ms, report_long_ms;
 static unsigned frame_sample_count, frame_sample_next, report_short, report_long;
 static _Atomic uint32_t pinned_step_us;
+#ifdef GAME_BOTW160
 enum { VFR_INSTANCE = 0x2d1e170, VFR_RATIO = 0x3c, VFR_DELTA_TIME = 0x138 };
+#else   /* 1.9.0: the singleton pointer is main+0x1e93890, the object's layout is the same */
+enum { VFR_INSTANCE = 0x1e93890, VFR_RATIO = 0x3c, VFR_DELTA_TIME = 0x138 };
+#endif
 static _Atomic uint32_t *pad_tick;   /* data page +8: 1 when the next frame's game time crosses a 1/30 s boundary */
 static double pad_phase;
 static uint64_t report_ticks;
-static uint8_t *g_pad_main; static int g_pad_log_on; static _Atomic uint64_t g_pad_dir_until;   /* TOTK_PAD_LOG */
+static int g_pad_log_on; static _Atomic uint64_t g_pad_dir_until;   /* TOTK_PAD_LOG */
+#ifdef GAME_BOTW160
+static uint8_t *g_pad_main;
+#endif
 
-static int realtime_enabled(void) { const char *e = getenv("TOTK_REALTIME"); return !(e && !strcmp(e, "0")); }
+static int realtime_enabled(void) { const char *e = getenv("TOTK_REALTIME"); return ios_code() || !(e && !strcmp(e, "0")); }
 static uint64_t frame_step_bits(float seconds) {
     float ratio = seconds * 30.0f; uint32_t lo, hi;
     memcpy(&lo, &ratio, 4); memcpy(&hi, &seconds, 4);
@@ -105,14 +144,14 @@ static void frame_step_measure(uint64_t now_ns) {
     if (atomic_load_explicit(&pinned_step_us, memory_order_relaxed)) return;
     /* The raw intervals are averaged and the average is clamped, not each interval: at about 95 fps under the 120 Hz
        clock, intervals shorter than 1/120 s alternate with longer ones, and raising each short one to 1/120 s made the
-       game run 6% fast (measured: botw.md). Averaged, the steps add up to the real time while the average stays inside
-       1/120..1/15 s; a hitch is spread over the next frames instead of being cut. */
+       game run 6% fast (measured: botw.md). Averaged, the steps add up to the real time at any frame rate (no lower bound:
+       a display above 120 Hz presents more often, and a floor of 1/120 s made the game run fast there); only an average
+       above 1/15 s is cut, and a hitch is spread over the next frames instead. */
     frame_samples[frame_sample_next++ % 5] = dt;
     if (frame_sample_count < 5) frame_sample_count++;
     double sum = 0;
     for (unsigned i = 0; i < frame_sample_count; i++) sum += frame_samples[i];
     double step = sum / frame_sample_count;
-    if (step < 1.0 / 120.0) step = 1.0 / 120.0;
     if (step > 1.0 / 15.0) step = 1.0 / 15.0;
     report_game += step;
     atomic_store_explicit(frame_step_data, frame_step_bits((float)step), memory_order_release);
@@ -133,6 +172,8 @@ static void pad_tick_advance(void) {
     }
 }
 void runtime_frame_step_update(uint64_t now_ns) {
+    botw_aspect_apply();   /* key 4 */
+    botw_output_tick();    /* key 3 */
     if (!frame_step_data || !now_ns) return;
     frame_step_measure(now_ns);
     if (pad_tick) pad_tick_advance();
@@ -143,6 +184,7 @@ static uint32_t adrp_reg(unsigned rd, uint64_t site, uint64_t target) {
     uint32_t imm = (uint32_t)pages & 0x1fffff;
     return 0x90000000u | ((imm & 3u) << 29) | ((imm >> 2) << 5) | (rd & 31u);
 }
+#ifdef GAME_BOTW160
 /* Pad repeat and hold counts by real time (TOTK_PAD_REPEAT=0: as shipped; botw.md). sead::ControllerBase::
    updateDerivativeParams_ (main+0x126e3b0) counts the frames each button has been held (+0x30 + 4 i) and raises its
    repeat bit (+0x10) when the count reaches the button's delay (+0xb0 + i) and then every pulse (+0xd0 + i) frames.
@@ -216,7 +258,7 @@ static const uint32_t menu_cd_shipped[MENU_CD_WORDS] = { 0x8b0a136au, 0x5289400b
 static const uint32_t menu_cd_ticked[MENU_CD_WORDS] = { 0x8b0a136au, 0x9141914bu, 0, 0xb94009adu, 0x34000aedu, 0xb94a016cu, 0x5100058du, 0xb90a016du, 0x35000a6cu };
 static void pad_log_arm(Module *m) {
     const char *l = getenv("TOTK_PAD_LOG");
-    if (!l || !*l || !strcmp(l, "0")) return;
+    if (!l || !*l || !strcmp(l, "0") || ios_code()) return;
     /* diagnostics: a brk on the loop's first instruction (ldr w8, [x19, #0x100], the same shipped and patched), see botw_pad_hook */
     uint32_t b = 0xd4200000u | (0x7c0u << 5); memcpy(m->base + PAD_LOOP, &b, 4);
     g_pad_main = m->base; g_pad_log_on = 1;
@@ -224,15 +266,15 @@ static void pad_log_arm(Module *m) {
 }
 static void patch_pad_repeat(Module *m, uint64_t page) {
     const char *e = getenv("TOTK_PAD_REPEAT");
-    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); pad_log_arm(m); return; }
-    for (unsigned i = 0; i < PAD_LOOP_WORDS; i++) {
+    if (!ios_code() && e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); pad_log_arm(m); return; }
+    for (unsigned i = 0; !CODE_PATCHED_AT_BUILD && i < PAD_LOOP_WORDS; i++) {
         uint32_t w; memcpy(&w, m->base + PAD_LOOP + 4 * i, 4);
         if (w != pad_loop_shipped[i]) {
             fprintf(stderr, "[botw] pad repeat main+%#x: found %08x expected %08x\n", PAD_LOOP + 4 * i, w, pad_loop_shipped[i]);
             runtime_fail("pad repeat by real time requires the 1.6.0 sead::ControllerBase loop");
         }
     }
-    for (unsigned i = 0; i < MENU_CD_WORDS; i++) {
+    for (unsigned i = 0; !CODE_PATCHED_AT_BUILD && i < MENU_CD_WORDS; i++) {
         uint32_t w; memcpy(&w, m->base + MENU_CD + 4 * i, 4);
         if (w != menu_cd_shipped[i]) {
             fprintf(stderr, "[botw] menu countdown main+%#x: found %08x expected %08x\n", MENU_CD + 4 * i, w, menu_cd_shipped[i]);
@@ -243,11 +285,11 @@ static void patch_pad_repeat(Module *m, uint64_t page) {
     atomic_store(pad_tick, 1);
     for (unsigned i = 0; i < PAD_LOOP_WORDS; i++) {
         uint32_t w = i == PAD_ADRP ? adrp_reg(16, (uintptr_t)m->base + PAD_LOOP + 4 * i, page) : pad_loop_ticked[i];
-        memcpy(m->base + PAD_LOOP + 4 * i, &w, 4);
+        put_word(m, PAD_LOOP + 4 * i, w, "pad repeat");
     }
     for (unsigned i = 0; i < MENU_CD_WORDS; i++) {
         uint32_t w = i == MENU_CD_ADRP ? adrp_reg(13, (uintptr_t)m->base + MENU_CD + 4 * i, page) : menu_cd_ticked[i];
-        memcpy(m->base + MENU_CD + 4 * i, &w, 4);
+        put_word(m, MENU_CD + 4 * i, w, "menu countdown");
     }
     fprintf(stderr, "[botw] pad repeat and hold counts by real time: held buttons count once per 1/30 s of game time, and so does "
                     "the pause menu's fast-repeat countdown (%u + %u instructions, all verified; TOTK_PAD_REPEAT=0: once per frame, as shipped)\n",
@@ -268,7 +310,7 @@ static void patch_realtime(Module *m) {
         {0x18522fcu, 0x1e2c1001u}, {0x1852300u, 0x1e210800u}, {0x1852304u, 0xbd0b22a0u},
         {0x161847cu, 0x1e290908u}, {0x1618480u, 0xbd400109u}, {0x1618484u, 0xb94c3680u},
     };
-    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] real-time frame step main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
@@ -285,7 +327,7 @@ static void patch_realtime(Module *m) {
         {0x18522f4u, nop}, {0x18522f8u, nop}, {0x1852300u, nop},
         {0x1618480u, 0x1e2e1009u},   /* fmov s9, #1.0: six physics substeps per frame at any frame rate */
     };
-    for (size_t i = 0; i < sizeof put / sizeof *put; i++) memcpy(m->base + put[i].off, &put[i].word, 4);
+    for (size_t i = 0; i < sizeof put / sizeof *put; i++) put_word(m, put[i].off, put[i].word, "real-time step");
     frame_step_main = m->base;
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
     atomic_store(frame_step_data, frame_step_bits(1.0f / 30.0f));
@@ -294,6 +336,92 @@ static void patch_realtime(Module *m) {
             sizeof put / sizeof *put, sizeof check / sizeof *check);
     patch_pad_repeat(m, page);
 }
+#else
+/* Breath of the Wild 1.9.0: the same real-time step at the 1.9.0 sites (found by disassembly; MacNativeGames
+   games/botw/scripts/verify_realtime_patch.py --version botw190 and verify_pad_repeat_patch.py --version botw190 run them
+   with Unicorn). ksys::VFR::calc (main+0x151d3d0) joins its ratio paths at the same place as 1.6.0's update:
+     main+0x151d484  fcmp s1, s0        -> adrp x9, <data page>
+     main+0x151d48c  b.eq #0x151d494    -> ldr s1, [x9]
+   so the store of s1 to +0x3c after them runs every frame (the flags are not read again, and x9 is reloaded at +0x151d4a4
+   before any read). The fade steps by max(interval, 1) (main+0x583118) x 0.5 x 0.2;
+   it now adds ratio x 0.2 (w0 from the helper is left as it is, nothing reads it after the conversion):
+     main+0x125f118  ucvtf s0, w0       -> adrp x8, <data page>
+     main+0x125f11c  fmov s1, #0.5      -> ldr s0, [x8]
+     main+0x125f128  fmul s0, s0, s1    -> nop
+   The UI's animation step is the same sum (main+0x1280ec8: max(interval, 1) x 0.5 into +0xb20 of the layout system,
+   [main+0x1e374b8]); it now takes the ratio too (s1 keeps its 0.5; x9 is not read again before the call after the store):
+     main+0x1280ecc  ucvtf s0, w0       -> adrp x9, <data page>
+     main+0x1280ee4  fmul s0, s0, s1    -> ldr s0, [x9]
+   Physics: the frame loop calls the physics step (main+0x156f8e8, from main+0x1281084) with the frame time, the frame
+   ratio (VFR getter main+0x59c788, +0x3c) and the time speed, and the step runs round(6 x ratio) solver substeps
+   (main+0x156f930): six at the shipped 30 fps, two at 120 fps. The ratio argument is now always 1.0, as in 1.6.0:
+     main+0x128106c  fmov s9, s0        -> fmov s9, #1.0
+   (s9 is read only by the fmov s1, s9 before the call); the frame time still sets the step.
+   1.9.0's sead::ControllerBase::updateDerivativeParams_ (main+0xeb0ef0) counts held frames in floats: each held button adds
+   s8, a constant 1.0 loaded once before the loop. s8 now comes from the page, the ratio, so counts, delays and pulses are
+   1/30 s of game time at any frame rate without a tick:
+     main+0xeb0f78  adrp x8, <GOT page> -> adrp x8, <data page>
+     main+0xeb0f80  ldr x8, [x8, #0x9e0] -> nop                (the next ldr s8, [x8] reads the ratio)
+   The pause menu's fast-repeat countdown (main+0xe67d00) already takes the VFR's delta frames off per frame in 1.9.0, so
+   the patched ratio makes it real-time too. */
+static void patch_pad_repeat(Module *m, uint64_t page) {
+    const char *e = getenv("TOTK_PAD_REPEAT");
+    if (!ios_code() && e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); return; }
+    static const struct { uint32_t off, original; } check[] = {
+        {0xeb0f78u, 0xd00075e8u}, {0xeb0f7cu, 0xaa1f03f5u}, {0xeb0f80u, 0xf944f108u}, {0xeb0f84u, 0x52800036u}, {0xeb0f88u, 0xbd400108u},
+    };
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].original) {
+            fprintf(stderr, "[botw] pad repeat main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
+            runtime_fail("pad repeat by real time requires the 1.9.0 sead::ControllerBase loop");
+        }
+    }
+    const struct { uint32_t off, word; } put[] = {
+        {0xeb0f78u, adrp_reg(8, (uintptr_t)m->base + 0xeb0f78, page)}, {0xeb0f80u, 0xd503201fu},
+    };
+    for (size_t i = 0; i < sizeof put / sizeof *put; i++) put_word(m, put[i].off, put[i].word, "real-time step");
+    fprintf(stderr, "[botw] pad repeat and hold counts by real time: held buttons count the VFR ratio per frame (%zu instructions, "
+                    "%zu verified; TOTK_PAD_REPEAT=0: one per frame, as shipped)\n", sizeof put / sizeof *put, sizeof check / sizeof *check);
+}
+static void patch_realtime(Module *m) {
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
+    if (data_off + 0x4000 != m->size || data_off & 0xfff) runtime_fail("real-time frame-step page layout");
+    static const struct { uint32_t off, original; } check[] = {
+        {0x151d484u, 0x1e202020u}, {0x151d488u, 0x3900a268u}, {0x151d48cu, 0x54000040u}, {0x151d490u, 0xbd003e61u},
+        {0x125f114u, 0x97cc9001u}, {0x125f118u, 0x1e230000u}, {0x125f11cu, 0x1e2c1001u}, {0x125f120u, 0xd0002208u},
+        {0x125f124u, 0xbd42d662u}, {0x125f128u, 0x1e210800u}, {0x125f12cu, 0xbd417101u}, {0x125f130u, 0x1e210801u},
+        {0x1280ec8u, 0x97cc0894u}, {0x1280eccu, 0x1e230000u}, {0x1280ed0u, 0xf0005db3u}, {0x1280ed4u, 0x9112e273u},
+        {0x1280ed8u, 0x1e2c1001u}, {0x1280edcu, 0x2a1f03e0u}, {0x1280ee0u, 0xf9400268u}, {0x1280ee4u, 0x1e210800u},
+        {0x1280ee8u, 0xbd0b2100u},
+        {0x1281064u, 0x97cc6dc9u}, {0x1281068u, 0xf94002a0u}, {0x128106cu, 0x1e204009u}, {0x1281070u, 0x97ccd7ceu},
+        {0x1281080u, 0x1e204121u}, {0x1281084u, 0x940bba19u},
+    };
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].original) {
+            fprintf(stderr, "[botw] real-time frame step main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
+            runtime_fail("real-time frame step requires the 1.9.0 VFR::calc instructions");
+        }
+    }
+    const uint64_t page = (uintptr_t)m->base + data_off;
+    const struct { uint32_t off, word; } put[] = {
+        {0x151d484u, adrp_reg(9, (uintptr_t)m->base + 0x151d484, page)}, {0x151d48cu, 0xbd400121u},   /* ldr s1, [x9] */
+        {0x125f118u, adrp_reg(8, (uintptr_t)m->base + 0x125f118, page)}, {0x125f11cu, 0xbd400100u},   /* ldr s0, [x8] */
+        {0x125f128u, 0xd503201fu},
+        {0x1280eccu, adrp_reg(9, (uintptr_t)m->base + 0x1280ecc, page)}, {0x1280ee4u, 0xbd400120u},   /* ldr s0, [x9] */
+        {0x128106cu, 0x1e2e1009u},   /* fmov s9, #1.0: six physics substeps per frame at any frame rate */
+    };
+    for (size_t i = 0; i < sizeof put / sizeof *put; i++) put_word(m, put[i].off, put[i].word, "real-time step");
+    frame_step_main = m->base;
+    frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
+    atomic_store(frame_step_data, frame_step_bits(1.0f / 30.0f));
+    fprintf(stderr, "[botw] real-time frame step: the VFR ratio, one interval-stepped fade and the UI animation step follow the measured frame time, physics keeps six substeps a frame "
+                    "(%zu instructions, %zu verified); initial 33.33 ms, sampled at each present (TOTK_REALTIME=0: as shipped)\n",
+            sizeof put / sizeof *put, sizeof check / sizeof *check);
+    patch_pad_repeat(m, page);
+}
+#endif
 /* Diagnostics (TOTK_JQ_CHECK=1): random crashes look like one job run twice (two threads in the same skinning job, a list
    item consumed twice). brk instructions replace a few instructions of sead::JobQueue::run (main+0x12c0dc0) and of the
    worker manager's wake (main+0x13a0150) and sync (main+0x13a03d0); the SIGTRAP handler (loader.c crash -> botw_jq_hook)
@@ -334,12 +462,12 @@ static struct { uint32_t state, status, ring; uint64_t jq; } g_pre[64];   /* per
    bit (ldaxr / ldaxp): one bit, the same registers and size, only stronger ordering. */
 static int excl_ld(uint32_t w) { return (w & 0x3ffffc00u) == 0x085f7c00u || (w & 0xbfff8000u) == 0x887f0000u; }   /* ldxr{b,h} / ldxp */
 static int excl_st(uint32_t w) { return (w & 0x3fe07c00u) == 0x08007c00u || (w & 0xbfe00000u) == 0x88200000u; }   /* st{l}xr{b,h} / st{l}xp */
-static unsigned excl_acquire(uint8_t *code, size_t n) {
+static unsigned excl_acquire(uint8_t *code, size_t n, int write) {   /* write 0: only count what is left */
     unsigned done = 0; uint32_t *w = (uint32_t *)(void *)code; size_t words = n / 4;
     for (size_t i = 0; i < words; i++) {
         if (!excl_ld(w[i])) continue;
         uint32_t rn = (w[i] >> 5) & 31;
-        for (size_t j = i + 1; j < words && j <= i + 16; j++) if (excl_st(w[j]) && ((w[j] >> 5) & 31) == rn) { w[i] |= 0x8000u; done++; break; }
+        for (size_t j = i + 1; j < words && j <= i + 16; j++) if (excl_st(w[j]) && ((w[j] >> 5) & 31) == rn) { if (write) w[i] |= 0x8000u; done++; break; }
     }
     return done;
 }
@@ -350,35 +478,85 @@ static unsigned excl_acquire(uint8_t *code, size_t n) {
    target is made at 1920x1080 (and 960x540 for the half-size ones; pass dumps 2026-10-20) at the same frame rate on the
    Great Plateau. Above the screen size the game fails to make its heaps, and a 2560x1440 screen needs larger heaps than
    the game asks for (PlacementMgr fails after a 320 MB render budget at main+0x1804c44): not done.
-   main+0x1821674 movk x8, #0x44c8, lsl #48 (1600.0) -> movk x8, #0x44f0, lsl #48 (1920.0). */
+   main+0x1821674 movk x8, #0x44c8, lsl #48 (1600.0) -> movk x8, #0x44f0, lsl #48 (1920.0).
+   1.9.0's display-mode routine is main+0x1266074 (a jump on the mode byte +0x11be; docked and mode 2 store the same pair
+   to +0x1210 / +0x1214 and crop 1920x1080; handheld stores 1280.0 / 1280.0 and is left as shipped):
+   main+0x12660c8 movk x8, #0x44c8, lsl #48 -> movk x8, #0x44f0, lsl #48. */
+#ifdef GAME_BOTW160
+enum { RENDER_MOVK = 0x1821674 };
+#else
+enum { RENDER_MOVK = 0x12660c8 };
+#endif
 static void patch_render_1080(Module *m) {
     const char *e = getenv("TOTK_RENDER_RES");
-    if (e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
+    if (!ios_code() && e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
     static const struct { uint32_t off, original; } check[] = {
+#ifdef GAME_BOTW160
         {0x1821670u, 0xd2a89e08u}, {0x1821674u, 0xf2e89908u}, {0x1821678u, 0xf9094b88u},
+#else   /* mov x8, #0x44f00000 / mov x2, sp / mov w1, wzr / movk / str x8, [x19, #0x1210] */
+        {0x12660bcu, 0xd2a89e08u}, {0x12660c0u, 0x910003e2u}, {0x12660c4u, 0x2a1f03e1u}, {0x12660c8u, 0xf2e89908u},
+        {0x12660ccu, 0xf9090a68u},
+#endif
     };
-    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] render size main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
-            runtime_fail("1080p render size requires the 1.6.0 display-mode instructions");
+            runtime_fail("1080p render size requires the " TOTK_GAME_VERSION " display-mode instructions");
         }
     }
     const uint32_t movk = 0xf2e89e08u;   /* movk x8, #0x44f0, lsl #48 */
-    memcpy(m->base + 0x1821674u, &movk, 4);
+    put_word(m, RENDER_MOVK, movk, "docked render size");
     fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
+}
+/* The phone's render size (user 2026-10-23: "内部960×540，输出 用默认 放大机制"): the iPhone / iPad runs the handheld
+   mode, whose branch of the 1.6.0 display-mode routine (jump table at main+0x26164f8: mode 1 -> main+0x18216c8) stores
+   the screen width 1280.0 and the render width 1280.0 as one pair:
+     main+0x18216c8  mov x8, #0x44a00000              (1280.0, the screen)
+     main+0x18216cc  movk x8, #0x44a0, lsl #48        (1280.0, the render width) -> movk x8, #0x4470, lsl #48 (960.0)
+   The renderer scales its targets by render / screen width, as docked play does at 1600 / 1920, so the scene is drawn at
+   960x540 and the game's own upscale draws it into the 1280x720 canvas (MetalFX does not replace it on the phone:
+   totk_mfx_up.m mfxup_enabled).
+   1.9.0: the display-mode routine main+0x1266074 jumps by a byte table (main+0x1725916, base main+0x12660bc): mode 1 ->
+   main+0x1266114, the same pair (str x8, [x19, #0x1210]); mode 3 (VR) computes its own and is left alone:
+     main+0x1266114  mov x8, #0x44a00000
+     main+0x1266118  movk x8, #0x44a0, lsl #48        -> movk x8, #0x4470, lsl #48 (960.0)
+   (its dynamic-resolution scale, main+0x12661e8, divides the render width +0x1214 by 1280.0 in handheld: 0.75). */
+#ifdef GAME_BOTW160
+enum { PHONE_RENDER = 0x18216c8u, PHONE_RENDER_STR = 0xf9094b88u };   /* str x8, [x28, #0x1290] */
+#else
+enum { PHONE_RENDER = 0x1266114u, PHONE_RENDER_STR = 0xf9090a68u };   /* str x8, [x19, #0x1210] */
+#endif
+static void patch_phone_render(Module *m) {
+    if (!ios_code()) return;
+    const struct { uint32_t off, original; } check[] = {{PHONE_RENDER, 0xd2a89408u}, {PHONE_RENDER + 4, 0xf2e89408u}, {PHONE_RENDER + 8, PHONE_RENDER_STR}};
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].original) {
+            fprintf(stderr, "[botw] handheld render size main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
+            runtime_fail("the phone's render size requires the " TOTK_GAME_VERSION " handheld display-mode instructions");
+        }
+    }
+    put_word(m, PHONE_RENDER + 4, 0xf2e88e08u, "handheld render size");   /* movk x8, #0x4470, lsl #48: 960.0 */
+    fprintf(stderr, "[botw] handheld render size 960x540, the game's own upscale to the 1280x720 canvas (phone)\n");
 }
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
-    patch_render_1080(m);
+    runtime_survey_init(m);   /* TOTK_SURVEY=1: survey pos / move (world_survey.c) */
+    if (!patch_output_res(m)) patch_render_1080(m);
+    patch_phone_render(m);
+    botw_aspect_install(m);
     if (realtime_enabled()) patch_realtime(m);
     else fprintf(stderr, "[botw] real-time frame step off (TOTK_REALTIME=0): the game advances by its present interval\n");
     { const char *a = getenv("TOTK_EXCL_ACQUIRE");
-      if (!a || strcmp(a, "0")) {
-          unsigned t = excl_acquire(m->base, m->text_end), p = excl_acquire(m->base + m->patch_off, m->file_size - m->patch_off);
+      if (ios_code() || !a || strcmp(a, "0")) {
+          const int w = !CODE_PATCHED_AT_BUILD;   /* the device: the export set them all, in the text and the patch area */
+          unsigned t = excl_acquire(m->base, m->text_end, w), p = excl_acquire(m->base + m->patch_off, m->file_size - m->patch_off, w);
+          if (!w && (t || p)) { fprintf(stderr, "[botw] %u + %u exclusive loads without acquire in the embedded code\n", t, p); runtime_fail("embedded main text was not patched at build time (ios/tools/build_ipa.py export-ios)"); }
+          if (!w) fprintf(stderr, "[botw] exclusive loads with acquire: set at build time (iOS), none left\n"); else
           fprintf(stderr, "[botw] exclusive loads with acquire: %u in the code, %u in the rewriter's patch area (TOTK_EXCL_ACQUIRE=0: as shipped)\n", t, p);
       } else fprintf(stderr, "[botw] exclusive loads as shipped (TOTK_EXCL_ACQUIRE=0)\n"); }
-    const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0")) return;
+    const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0") || ios_code()) return;
     for (int i = 0; i < JQ_SITES; i++) { uint32_t w; memcpy(&w, m->base + g_jq_site[i].off, 4);
         if (w != g_jq_site[i].word) { fprintf(stderr, "[botw] TOTK_JQ_CHECK: main+%#x is %08x, not %08x (%s): not armed\n", g_jq_site[i].off, w, g_jq_site[i].word, g_jq_site[i].what); return; } }
     for (int i = 0; i < JQ_SITES; i++) { uint32_t b = 0xd4200000u | ((0x7a1u + (uint32_t)i) << 5); memcpy(m->base + g_jq_site[i].off, &b, 4); }
@@ -393,6 +571,7 @@ static int jq_slot(uint64_t th) {
 static double jq_ms(uint64_t since) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); return since ? (double)(mach_absolute_time() - since) * tb.numer / tb.denom / 1e6 : -1; }
 #define U32(a) (*(const uint32_t *)(uintptr_t)(a))
 #define U64(a) (*(const uint64_t *)(uintptr_t)(a))
+#ifdef GAME_BOTW160
 /* TOTK_PAD_LOG: at the controller loop's first instruction (x19 = the controller, w11 = the new hold mask): the load it
    replaced, and one line per update while a stick or d-pad direction (bits 16..23) is or was held: time, thread, the
    controller, the tick the loop will read, new and previous hold, the previous update's repeat bits, counts 16..23. */
@@ -413,8 +592,11 @@ static int botw_pad_hook(ucontext_t *u) {
     }
     u->uc_mcontext->__ss.__pc += 4; return 1;
 }
+#endif
 int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was one of ours, handled */
+#ifdef GAME_BOTW160
     if (g_pad_log_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
+#endif
     if (!g_jq_on) return 0;
     ucontext_t *u = context; uint64_t pc = u->uc_mcontext->__ss.__pc, *x = u->uc_mcontext->__ss.__x;
     int site = -1; for (int i = 0; i < JQ_SITES; i++) if (pc == (uintptr_t)g_jq_main + g_jq_site[i].off) site = i;
@@ -484,36 +666,326 @@ int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was
 }
 #undef U32
 #undef U64
-int runtime_output_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 int runtime_render_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }   /* no scene size above 1600x900 for the heaps (romfs.c) */
+#ifdef GAME_BOTW160
+/* Output size, 1.6.0: key 3 cycles off -> MetalFX 2K -> native 2K -> off, as on Tears of the Kingdom 1.4.3 (user
+   2026-10-23). The game takes its TV size from two places (both found in the code): a function-local static {1920, 1080}
+   at main+0x2cceb10 that six guarded initialisers write (the framework makes the swapchain from it once at the start; the
+   system task's TV size, the dungeon map and the noise gauge read it), and the docked branch of the display-mode function
+   (main+0x1821670..0x18216ac), which writes the screen and render widths (+0x1290: 1920.0 and the shipped 1600.0), the
+   system task's TV size (+0x4c0, which Renderer::calc pushes to the TV display every frame) and the window crop.
+   TOTK_OUTPUT_RES unset or auto (the default): the initialisers make a 2560x1440 swapchain, the docked branch takes its
+   sizes from the data page after the module (+16 {screen, render width} floats, +24 {width, height}), starting at
+   1920x1080 drawn in the swapchain's top-left (the window crop), and key 3 rewrites them and asks the display-mode
+   function to apply the current mode again (+0x123d = +0x123e of *(main+0x2cceaf0), as the game itself does at
+   main+0x1821624; it takes the request under its lock at main+0x1821644). The static follows the canvas after the start.
+   <w>x<h>: that size from the start, fixed. 0: the shipped 1920x1080 swapchain, no switching (patch_render_1080 then
+   renders the scene at 1080p). Heaps are fixed in the code (no HeapDef): render targets 115 -> 320 MiB, the graphics
+   system (the swapchain) 48 -> 64 MiB, SetMemoryHeapSize and the root block +224 MiB, the host's application pool the
+   same (runtime_output_res_extra_bytes, services.c); native 2K was played without a heap failure (user 2026-10-23). */
+enum { OUT_OFF, OUT_AUTO, OUT_FIXED };
+static int g_out_mode = -1;
+static unsigned g_out_w, g_out_h;            /* the largest canvas: the swapchain and the heaps are made for it */
+static _Atomic uint64_t g_out_cur;           /* the canvas now, w | h << 32 */
+static _Atomic uint64_t *g_out_page;         /* the data page + 16: [0] {screen, render width} floats, [1] {width, height} */
+static uint8_t *g_out_main;
+static void output_parse(void) {
+    if (g_out_mode >= 0) return;
+    if (ios_code()) { g_out_mode = OUT_OFF; return; }   /* the phone: the game's own size (handheld 720p) */
+    const char *e = getenv("TOTK_OUTPUT_RES"); unsigned a, b; char tail;
+    if (e && !strcmp(e, "0")) { g_out_mode = OUT_OFF; return; }
+    if (!e || !*e || !strcmp(e, "auto")) { g_out_mode = OUT_AUTO; g_out_w = 2560; g_out_h = 1440; return; }
+    if (sscanf(e, "%ux%u%c", &a, &b, &tail) != 2 || a < 1280 || b < 720 || a > 7680 || b > 4320)
+        runtime_fail("TOTK_OUTPUT_RES must be auto, 0 or <width>x<height> (1280x720 .. 7680x4320)");
+    g_out_mode = OUT_FIXED; g_out_w = a; g_out_h = b;
+}
+int runtime_output_res(unsigned *w, unsigned *h) {
+    output_parse();
+    if (g_out_mode == OUT_OFF) return 0;
+    if (w) *w = g_out_w;
+    if (h) *h = g_out_h;
+    return 1;
+}
+uint64_t runtime_output_size_current(void) { uint64_t c = atomic_load(&g_out_cur); return c ? c : 1920ull | (1080ull << 32); }
+#define OUTPUT_EXTRA (224ull << 20)
+uint64_t runtime_output_res_extra_bytes(void) { return runtime_output_res(NULL, NULL) ? OUTPUT_EXTRA : 0; }
+static uint32_t movz_x(unsigned rd, unsigned imm16, unsigned hw) { return 0xd2800000u | (hw << 21) | (imm16 << 5) | rd; }
+static uint32_t movk_x(unsigned rd, unsigned imm16, unsigned hw) { return 0xf2800000u | (hw << 21) | (imm16 << 5) | rd; }
+static uint64_t output_floats(unsigned screen, unsigned render) {
+    float a = (float)screen, b = (float)render; uint32_t x, y; memcpy(&x, &a, 4); memcpy(&y, &b, 4);
+    return x | ((uint64_t)y << 32);
+}
+static void output_page(unsigned w, unsigned h) {   /* what the docked branch writes from its next run on */
+    const char *e = getenv("TOTK_RENDER_RES");
+    unsigned render = w == 1920 && h == 1080 && e && !strcmp(e, "900") ? 1600 : w;   /* the shipped 1600x900 scene at 1080p only */
+    atomic_store(&g_out_page[0], output_floats(w, render));
+    atomic_store(&g_out_page[1], w | ((uint64_t)h << 32));
+    atomic_store(&g_out_cur, w | ((uint64_t)h << 32));
+}
+static void output_static(void) { uint64_t c = atomic_load(&g_out_cur); memcpy(g_out_main + 0x2cceb10, &c, 8); }
+static int output_reapply(void) {
+    uint64_t g; memcpy(&g, g_out_main + 0x2cceaf0, 8);
+    if (!g) return 0;
+    volatile uint8_t *gfx = (volatile uint8_t *)(uintptr_t)g;
+    uint8_t mode = gfx[0x123e];
+    if (mode != 0 && mode != 2) return 0;   /* docked only: handheld and VR keep their own sizes */
+    gfx[0x123d] = mode;
+    return 1;
+}
+static void output_switch(unsigned w, unsigned h) {
+    output_page(w, h); output_static();
+    int ok = output_reapply();
+    fprintf(stderr, "[botw] output %ux%u%s\n", w, h, ok ? " (the display mode applies it at the next frame)" : ": the game is not in a docked mode now; it applies when it is");
+}
+/* At each present: once the framework has made the swapchain from the static, the static follows the canvas (the dungeon
+   map and the noise gauge scale by it every call). */
+static void botw_output_tick(void) {
+    static int done;
+    if (done || g_out_mode != OUT_AUTO || !g_out_page) return;
+    done = 1; output_static();
+}
+static int patch_output_res(Module *m) {
+    unsigned w, h; if (!runtime_output_res(&w, &h)) return 0;
+    if (w > 0xffff || h > 0xffff) runtime_fail("TOTK_OUTPUT_RES too large");
+    static const uint32_t size_init[] = {0xe563dc, 0xe56410, 0x113fb48, 0x1140208, 0x1186ce0, 0x1805028};
+    static const struct { uint32_t off, original; } check[] = {
+        {0x1821670, 0xd2a89e08}, {0x1821674, 0xf2e89908}, {0x1821678, 0xf9094b88}, {0x182167c, 0xf000a508}, {0x1821680, 0xf9408108},
+        {0x1821684, 0xd280f009}, {0x1821688, 0xf2c08709}, {0x182168c, 0xf9026109}, {0x18216ac, 0xf8054109},
+        {0x1804c44, 0x52a0e608}, {0xe550a0, 0x320807e0}, {0xe536dc, 0x52b86000}, {0xe53fa0, 0x52b82015},
+    };
+    uint32_t word;
+    for (size_t i = 0; i < sizeof size_init / sizeof *size_init; i++) {
+        memcpy(&word, m->base + size_init[i], 4); uint32_t k; memcpy(&k, m->base + size_init[i] + 12, 4);
+        if (word != 0xd280f009u || k != 0xf2c08709u) { fprintf(stderr, "[botw] output size main+%#x: %08x / %08x\n", size_init[i], word, k); runtime_fail("the output size requires the 1.6.0 size initialisers"); }
+    }
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+        memcpy(&word, m->base + check[i].off, 4);
+        if (word != check[i].original) { fprintf(stderr, "[botw] output size main+%#x: found %08x expected %08x\n", check[i].off, word, check[i].original); runtime_fail("the output size requires the 1.6.0 display-mode and heap instructions"); }
+    }
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
+    if (data_off + 0x4000 != m->size) runtime_fail("the output size: no data page after the main module");
+    const uint64_t page = (uintptr_t)m->base + data_off;
+    g_out_main = m->base; g_out_page = (_Atomic uint64_t *)(void *)(page + 16);
+    output_page(g_out_mode == OUT_AUTO ? 1920 : w, g_out_mode == OUT_AUTO ? 1080 : h);
+    uint32_t mw = movz_x(9, w, 0), mh = movk_x(9, h, 2);   /* the swapchain at the largest size */
+    for (size_t i = 0; i < sizeof size_init / sizeof *size_init; i++) { memcpy(m->base + size_init[i], &mw, 4); memcpy(m->base + size_init[i] + 12, &mh, 4); }
+    const uint32_t branch[4] = {
+        adrp_reg(9, (uintptr_t)m->base + 0x1821670, page),   /* adrp x9, page */
+        0xf9400928u,                                         /* ldr x8, [x9, #16]: {screen, render width} */
+        0xf9400d29u,                                         /* ldr x9, [x9, #24]: {width, height} (at 0x1821684) */
+        0xd503201fu,                                         /* nop */
+    };
+    memcpy(m->base + 0x1821670, &branch[0], 4); memcpy(m->base + 0x1821674, &branch[1], 4);
+    memcpy(m->base + 0x1821684, &branch[2], 4); memcpy(m->base + 0x1821688, &branch[3], 4);
+    const uint32_t heap_render = 0x52a28008u;   /* mov w8, #0x14000000: 320 MiB */
+    const uint32_t heap_gfx = 0x320603e0u;      /* mov w0, #0x4000000: 64 MiB */
+    const uint32_t heap_size = 0x52ba2000u;     /* mov w0, #0xd1000000: SetMemoryHeapSize +224 MiB */
+    const uint32_t heap_root = 0x52b9e015u;     /* mov w21, #0xcf000000: the root block +224 MiB */
+    memcpy(m->base + 0x1804c44, &heap_render, 4); memcpy(m->base + 0xe550a0, &heap_gfx, 4);
+    memcpy(m->base + 0xe536dc, &heap_size, 4); memcpy(m->base + 0xe53fa0, &heap_root, 4);
+    fprintf(stderr, "[botw] output: a %ux%u swapchain, starting at %s; heaps: render 320 MiB, graphics 64 MiB, +224 MiB (23 instructions verified)%s\n",
+            w, h, g_out_mode == OUT_AUTO ? "1920x1080" : "that size", g_out_mode == OUT_AUTO ? "; key 3: off -> MetalFX 2K -> native 2K" : "");
+    return 1;
+}
+#else
+int runtime_output_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 uint64_t runtime_output_size_current(void) { return 1920ull | (1080ull << 32); }   /* the canvas this game draws (frontend.m's shortcut text); no output-size patch yet */
 uint64_t runtime_output_res_extra_bytes(void) { return 0; }
+static int patch_output_res(Module *m) { (void)m; return 0; }
+static void botw_output_tick(void) {}
+#endif
 /* Pre-rendered movies (the memories, the intro): the movie player advances one movie frame per game frame, so above
    30 fps they ran fast, out of step with their sound, and a cutscene could wait for ever (2026-10-20). main+0x2cbef40
    holds the movie object while one plays (stored at main+0x1600e74 when it is made, cleared at main+0x1a4d6f0 after it
    is freed; the community "60 FPS + FMV Cutscenes Speed Fix" for 1.6.0 keys on the same word). While it is set the
    frame pacing holds the game at exactly 30 fps (hle_nvn.c game_holds_30, the pacing of the 30+30 mode); the real-time
    step then gives the shipped ratio 1.0. runtime/movie_host.c hands it every movie frame (TOTK_MOVIE_PACE).
-   TOTK_MOVIE_30=0 turns it off. */
+   TOTK_MOVIE_30=0 turns it off.
+   1.9.0: main+0x1e565a8 is the same word, the instance pointer of the movie player (a 0x30-byte object whose +0x20 is
+   the decoder and +0x28 its heap). The movie manager's start (main+0x13fc558) makes it through main+0x13fc9cc, which
+   stores it at main+0x13fca24; its stop (main+0x13fc68c) frees it through main+0x13fca3c, which clears the word at
+   main+0x13fca74 after the delete. */
+#ifdef GAME_BOTW160
+enum { MOVIE_WORD = 0x2cbef40 };
+#else
+enum { MOVIE_WORD = 0x1e565a8 };
+#endif
 int runtime_game_fps_limit(void) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_MOVIE_30"); on = !(e && !strcmp(e, "0")); }
     if (!on || !frame_step_main) return 0;
-    uint64_t movie; memcpy(&movie, frame_step_main + 0x2cbef40, 8);
+    uint64_t movie; memcpy(&movie, frame_step_main + MOVIE_WORD, 8);
     static int was; if (!!movie != was) { was = !!movie; fprintf(stderr, "[botw] movie %s: frame pacing %s\n", was ? "starts" : "ends", was ? "held at 30 fps" : "back to normal"); }
     return movie ? 30 : 0;
 }
 int runtime_output_res_toggle(void) { return 0; }
-/* Key 3 (runtime/input.c): MetalFX 2K on / off. On: MetalFX replaces the game's own upscale of the 1600x900 picture into
-   the 1080p canvas (nvn_mtl.m mfxup_dock, BOTW_MFXUP_DOCK_KEY) and upscales the canvas into a window or full screen bigger
-   than 1080p at the present (the output stage). This game has no native-2K mode yet: its canvas size is not patched. */
+/* Key 3 (runtime/input.c). MetalFX 2K: MetalFX replaces the game's own upscale of the scene into the 1080p canvas
+   (nvn_mtl.m mfxup_dock, BOTW_MFXUP_DOCK_KEY) and upscales the canvas into a window or full screen bigger than 1080p at
+   the present (the output stage). 1.6.0 with a 2K-capable start (TOTK_OUTPUT_RES auto, the default): off -> MetalFX 2K ->
+   native 2K (the canvas and the scene at 2560x1440, output_switch) -> off; otherwise MetalFX 2K on / off. */
 int runtime_output_mode_cycle(void) {
     extern int mfxup_enabled(void);
     extern void dm_gfx_set_flag(const char *name, int value);
+#ifdef GAME_BOTW160
+    if (g_out_mode == OUT_AUTO && g_out_page) {
+        unsigned cw = (unsigned)(atomic_load(&g_out_cur) & 0xffffffffu);
+        if (cw > 1920) { output_switch(1920, 1080); fprintf(stderr, "[botw] key 3: 关闭 2K\n"); return 1; }
+        if (mfxup_enabled()) {
+            dm_gfx_set_flag("mfx_output", 0); dm_gfx_set_flag("mfx_upscale", 0);
+            output_switch(g_out_w, g_out_h); fprintf(stderr, "[botw] key 3: 原生 2K\n"); return 1;
+        }
+    }
+#endif
     int next = !mfxup_enabled();
     dm_gfx_set_flag("mfx_output", next);
     dm_gfx_set_flag("mfx_upscale", next);
     fprintf(stderr, "[botw] key 3: %s\n", next ? "MetalFX 2K" : "关闭 2K");
     return 1;
 }
-float runtime_aspect_now(void) { return 0; }
-int runtime_aspect_toggle(void) { return 0; }
+/* Key 4 (runtime/input.c): ultrawide on / off (TOTK_ASPECT, default 21:9; also 32:9, 3440x1440 or 2.39; TOTK_ASPECT set
+   also starts with it on). The game keeps drawing into its 16:9 canvas with the main camera's aspect ratio set to the wider
+   one, so the picture holds the wider view squeezed horizontally; the present stretches it over the window
+   (nvn_mtl.m present_stretch) and the UI drawn after the scene is squeezed back to the middle 16:9 (uw_ui_squeeze).
+   The main camera's projection is a sead::PerspectiveProjection (1.9.0: vtable main+0x1d05380; aspect +0xb0, dirty +8) at +0x38
+   in a singleton made at main+0x10ed664 (pointer main+0x1e39d10: two views at +0x28 and +0x118, each with its projection
+   at +0x10). The game sets that aspect once, when the singleton is made, and recomputes the matrix every frame from the
+   fields (the near plane changes per frame), so the ratio is written into the field and the projection marked dirty: at
+   the next present after the key, and at every present while it is on (a new setup would write 16:9 again). Off puts
+   16:9 back. Only a 16:9 value is replaced (the constructor's 4:3 before the setup is left alone); a main camera of
+   another class stops the game. Mac only.
+   1.6.0 (2026-10-23): the same singleton, made inline after the "Camera" heap at main+0x1838a6c..0x1838be4 (the same
+   0x208-byte object, views at +0x28 / +0x118, the projection vtable stored at +0x38 and +0x128, the 4:3 aspect at
+   +0xe8, the dirty halfword at +0x40), pointer main+0x2cc4da0, projection vtable main+0x2bb4d48. */
+#ifdef GAME_BOTW190
+#define UW_CAMERA_SINGLETON 0x1e39d10
+#define UW_PERSPECTIVE_VTABLE 0x1d05380
+#else
+#define UW_CAMERA_SINGLETON 0x2cc4da0
+#define UW_PERSPECTIVE_VTABLE 0x2bb4d48
+#endif
+static uint8_t *g_uw_main;
+static float g_uw_wide;
+static _Atomic(uint32_t) g_uw_on;
+static int g_uw_written;   /* the field holds the wide ratio this code wrote (present thread only) */
+static _Atomic int g_uw_effective;   /* the wide ratio stayed in the field from one present to the next: the picture is wide */
+static float aspect_requested(void) {   /* TOTK's parser (aspect_math.h); "display" is not taken here */
+    double a = aspect_parse(getenv("TOTK_ASPECT"));
+    if (a < 0) runtime_fail("TOTK_ASPECT must be <w>:<h>, <w>x<h> or a ratio between 0.5 and 8");
+    return (float)a;
+}
+#ifdef GAME_BOTW160
+/* 1.6.0 writes the main projection's aspect every frame (2026-10-23: a write of ours was undone 600 times in 10 s, the
+   picture flickered between wide and 16:9): the camera's update main+0x15c2030 pushes the active camera into the
+   singleton's views and stores the layer rectangle's width / height at main+0x15c214c (str s0, [x19, #0xe8]; x19 the
+   singleton, +0xe8 = projection +0x38 + aspect +0xb0). The straight run main+0x15c2118..0x15c214c (no branch lands in it)
+   is rewritten so that store takes a float from the data page after the module (+0x20) when it is not 0.0, else the
+   game's own ratio as shipped: near / far copied with one ldp / stp, the three repeated dirty-byte stores before the
+   aspect folded into one, x9 / s1..s3 / flags free there. Key 4 then only sets that word (g_uw_word). 1.9.0 has the
+   same path (main+0x10edaf8) yet kept a written ratio; not looked into. */
+static _Atomic uint32_t *g_uw_word;
+static void botw_aspect_writer(Module *m) {
+    static const uint32_t original[14] = {0x39010277, 0xb9406ec8, 0xb900d268, 0x39010277, 0xb94072c8, 0xb900d668, 0x39010277,
+                                          0x2d4806a0, 0x2d470ea2, 0x39010277, 0x1e233821, 0x1e223800, 0x1e211800, 0xbd00ea60};
+    const uint32_t at = 0x15c2118;
+    for (int i = 0; !CODE_PATCHED_AT_BUILD && i < 14; i++) {
+        uint32_t w; memcpy(&w, m->base + at + 4 * i, 4);
+        if (w != original[i]) { fprintf(stderr, "[botw] ultrawide main+%#x: found %08x expected %08x\n", at + 4 * i, w, original[i]); runtime_fail("ultrawide requires the 1.6.0 camera update"); }
+    }
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
+    if (data_off + 0x4000 != m->size) runtime_fail("ultrawide: no data page after the main module");
+    const uint64_t page = (uintptr_t)m->base + data_off;
+    const uint32_t patched[14] = {
+        0x39010277,   /* strb w23, [x19, #0x40]       dirty */
+        0x294da6c8,   /* ldp w8, w9, [x22, #0x6c]     near, far */
+        0x291a2668,   /* stp w8, w9, [x19, #0xd0] */
+        0x2d4806a0,   /* ldp s0, s1, [x21, #0x40]     the layer rectangle */
+        0x2d470ea2,   /* ldp s2, s3, [x21, #0x38] */
+        0x1e233821,   /* fsub s1, s1, s3 */
+        0x1e223800,   /* fsub s0, s0, s2 */
+        0x1e211800,   /* fdiv s0, s0, s1              the game's ratio */
+        adrp_reg(8, (uintptr_t)m->base + at + 32, page),
+        0xbd402101,   /* ldr s1, [x8, #0x20]          ours, 0.0 = none */
+        0x1e202028,   /* fcmp s1, #0.0 */
+        0x1e201c20,   /* fcsel s0, s1, s0, ne */
+        0x39010277,   /* strb w23, [x19, #0x40]       dirty */
+        0xbd00ea60,   /* str s0, [x19, #0xe8]         the aspect */
+    };
+    put_words(m, at, patched, 14, "ultrawide aspect writer");
+    g_uw_word = (_Atomic uint32_t *)(void *)(page + 0x20);
+}
+static void botw_aspect_word(int on) { float v = on ? g_uw_wide : 0.0f; uint32_t b; memcpy(&b, &v, 4); if (g_uw_word) atomic_store(g_uw_word, b); }
+#else
+static void botw_aspect_writer(Module *m) { (void)m; }
+static void botw_aspect_word(int on) { (void)on; }
+#endif
+static float g_uw_view;                  /* runtime_aspect_view, below */
+static void botw_aspect_phone(float a);
+static void botw_aspect_install(Module *m) {
+    float start = aspect_requested();
+    g_uw_wide = start ? start : (float)ASPECT_WIDE;
+    g_uw_main = m->base; atomic_store(&g_uw_on, start != 0);
+    botw_aspect_writer(m); botw_aspect_word(start != 0);
+    fprintf(stderr, "[botw] ultrawide: key 4 switches 16:9 / %.4f (TOTK_ASPECT), starts %s\n", g_uw_wide, start ? "wide" : "at 16:9");
+    if (g_uw_view > 0) botw_aspect_phone(g_uw_view);   /* the phone's screen was reported first */
+}
+static void botw_aspect_apply(void) {
+    if (!g_uw_main) return;
+    uint64_t s; memcpy(&s, g_uw_main + UW_CAMERA_SINGLETON, 8);
+    if (!s) { static int told; if (atomic_load(&g_uw_on) && !told++) fprintf(stderr, "[botw] ultrawide: the main camera is not made yet\n"); return; }   /* the camera singleton is not made yet */
+    uint8_t *proj = (uint8_t *)(uintptr_t)(s + 0x38);
+    uint64_t vt; memcpy(&vt, proj, 8);
+    if (vt != (uintptr_t)g_uw_main + UW_PERSPECTIVE_VTABLE) runtime_fail("ultrawide: the main camera is not a sead::PerspectiveProjection in this game version");
+    float now; memcpy(&now, proj + 0xb0, 4);
+    const float game = 16.0f / 9.0f;
+    if (atomic_load(&g_uw_on)) {
+        if (now == g_uw_wide) { atomic_store(&g_uw_effective, 1); return; }
+        if (fabsf(now - game) > 1e-4f) {   /* not set up yet (the constructor's 4:3) or another ratio: left as it is */
+            static float told; if (now != told) { told = now; fprintf(stderr, "[botw] ultrawide: main camera aspect %g, not 16:9: left as it is\n", now); }
+            return;
+        }
+        atomic_store(&g_uw_effective, 0);
+        memcpy(proj + 0xb0, &g_uw_wide, 4);
+        static unsigned rewrites;   /* the game set 16:9 again after a write of ours: it sets the aspect each frame here */
+        if (!g_uw_written && !rewrites) fprintf(stderr, "[botw] ultrawide: main camera %p, aspect %g -> %g\n", (void *)proj, now, g_uw_wide);
+        else if (g_uw_written && (++rewrites == 1 || rewrites % 600 == 0)) fprintf(stderr, "[botw] ultrawide: the game set 16:9 again (%u times)\n", rewrites);
+        g_uw_written = 1;
+    } else {
+        if (!g_uw_written || now != g_uw_wide) return;   /* only the ratio this code wrote is put back */
+        memcpy(proj + 0xb0, &game, 4); g_uw_written = 0; atomic_store(&g_uw_effective, 0);
+    }
+    proj[8] = 1;   /* dirty: the matrix is rebuilt from the fields */
+}
+/* The present stretches the canvas only while the camera really draws wide (g_uw_effective): a ratio the game puts back,
+   or a camera not made yet, leaves the picture 16:9 instead of stretching it (2026-10-23, 1.6.0 stretched). */
+float runtime_aspect_now(void) { return g_uw_main && atomic_load(&g_uw_on) && atomic_load(&g_uw_effective) ? g_uw_wide : 0; }
+int runtime_aspect_toggle(void) {
+    if (!g_uw_main) return 0;
+    int on = !atomic_load(&g_uw_on); atomic_store(&g_uw_on, on); botw_aspect_word(on);
+    fprintf(stderr, "[botw] key 4: aspect ratio %s\n", on ? "wide" : "16:9 (the game's own)");
+    return 1;
+}
+/* Upstream's key 4 (#120) cycles 16:9 -> fit to the window -> 21:9 for TOTK; here key 4 switches 16:9 / wide only, so
+   the panel sees step 0 or 2 and the window size is not followed. */
+int runtime_aspect_step(void) { return g_uw_main ? (atomic_load(&g_uw_on) ? 2 : 0) : -1; }
+/* iPhone (frontend_ios.m reports the drawable once the view is made): the phone fills its screen as Tears of the Kingdom
+   does there (aspect_patch.h, user 2026-10-23 "iphone 全屏"): key 4's wide ratio becomes the screen's shape (2.16 on an
+   iPhone 14) and is on from the start, so the camera draws that view into the 1280x720 canvas, the present widens it over
+   the screen and the UI is squeezed back to 16:9 (uw_ui_squeeze). No extra memory. A screen not wider than 16:9 (an iPad)
+   keeps the game's 16:9 with bars; TOTK_ASPECT=0 (or 16:9) keeps it everywhere. Mac: the window does not change key 4. */
+/* g_uw_view: the drawable's shape, which may come before the main module is patched (botw_aspect_install takes it then). */
+static void botw_aspect_phone(float a) {
+#if TARGET_OS_IPHONE
+    const char *e = getenv("TOTK_ASPECT");
+    if ((e && (!strcmp(e, "0") || !strcmp(e, "16:9"))) || !(a > 16.0f / 9.0f * 1.01f) || a > 8.0f) {
+        fprintf(stderr, "[botw] screen shape %.4f: the game's 16:9%s\n", a, e && *e ? " (TOTK_ASPECT)" : ""); return;
+    }
+    g_uw_wide = a; atomic_store(&g_uw_on, 1); botw_aspect_word(1);
+    fprintf(stderr, "[botw] full screen: the camera takes the screen's shape %.4f (TOTK_ASPECT=0: 16:9)\n", a);
+#else
+    (void)a;
+#endif
+}
+void runtime_aspect_view(double w, double h) {
+    if (!(w > 0 && h > 0)) return;
+    g_uw_view = (float)(w / h);
+    if (g_uw_main) botw_aspect_phone(g_uw_view);
+}

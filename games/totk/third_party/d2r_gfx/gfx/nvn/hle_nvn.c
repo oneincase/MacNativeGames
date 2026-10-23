@@ -150,7 +150,7 @@ NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const
 // 设备属性：Tegra X1 实测值（nnheaders nvn_DeviceConstantsNX.h，在 SMO 上逐项调 nvnDeviceGetInteger 得到）
 // Device properties: values measured on Tegra X1 (nnheaders nvn_DeviceConstantsNX.h, obtained by calling nvnDeviceGetInteger item by item on SMO)
 static const int g_devinfo[] = {
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) && !defined(GAME_BOTW190)   // 1.9.0 (SDK 20.5) takes the values below, as TOTK
     [0x00] = 53, [0x01] = 311,  // Breath of the Wild 1.6.0 main+0xe55304 requires major 53, minor >= 311 (botw.md).
 #else
     [0x00] = 55, [0x01] = 15,   // Experimental ABI target: TOTK main+e9d614 requires major 55, minor >= 15. Unsupported functions stop.
@@ -222,6 +222,7 @@ NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
 // TOTK: logging switches checked on per-call paths (command memory, recording, submits) are read once.
 static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CMD_LOG") != NULL; return on; }
+static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CHAIN_LOG") != NULL; return on; }   // once: EndRecording runs per command buffer
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
 #ifdef GAME_BOTW
 static void guest_chain(const char *what);
@@ -548,6 +549,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
+    mtl_prog_prefetch(o);
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }
@@ -1052,7 +1054,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
-    if (getenv("TOTK_CHAIN_LOG")) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
+    if (chainlog_env()) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
 #ifdef GAME_BOTW
     if (lo) return (NVNcommandHandle)lo;
     { static uint64_t n; if (n++ < 4) LOG("[cmd] recording without room in its control memory: the handle is the copy itself (kept)"); }
@@ -1699,8 +1701,10 @@ static const char *bindprog_env(void) { return getenv("TOTK_BINDPROG_LOG"); }
 static int diag_env_once_on(void) {
     int v = atomic_load_explicit(&g_diag_env_once, memory_order_relaxed);
     if (v < 0) {
+        // On by default: the range is read once (getenv on every BindProgram cost 26 ms of CPU per second in the world,
+        // 2026-10-21 Time Profiler). TOTK_DIAG_ENV_ONCE=0 or the diag_env_once flag brings back the per-call lookup.
         const char *e = getenv("TOTK_DIAG_ENV_ONCE"); int initial = -1;
-        int desired = e && !strcmp(e, "1");
+        int desired = !(e && !strcmp(e, "0"));
         atomic_compare_exchange_strong(&g_diag_env_once, &initial, desired);
         v = atomic_load_explicit(&g_diag_env_once, memory_order_relaxed);
     }
@@ -2328,7 +2332,7 @@ static void trow(uint64_t f, const char *name, double v);
 static void set_time_constraint(uint64_t period_ns);
 static void rt_comp_tick(uint64_t period_ns);
 static int g_uncapped;   // TOTK_UNCAPPED configured, see present_cfg; suspended while frame interpolation paces the game (uncapped_now)
-static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED_HZ while interpolation paces the game
+static int g_paced_hz;   // the display-following rate, used instead of the uncapped clock while interpolation paces the game
 #include "totk_mfx_mode.h"   /* totk_mfx.m: frame interpolation mode of this game frame (TOTK_MFX, key 2) */
 /* TOTK: frame interpolation at 30 fps or at half the refresh rate paces the game itself, so it suspends the uncapped mode;
    the uncapped interpolation mode keeps it. Key 2 cycles the modes at run time (2026-10-16 night). */
@@ -2336,7 +2340,19 @@ static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED
    pre-rendered movie, which advances one movie frame per game frame). The game is then paced exactly as in the 30+30
    mode, without the interpolation. Weak: Tears of the Kingdom has none. */
 __attribute__((weak)) int runtime_game_fps_limit(void) { return 0; }
-static int game_holds_30(void) { return runtime_game_fps_limit() == 30; }
+/* TOTK_PHONE_FPS=30: the phone holds 30 fps the same way, presenting every second refresh of its 60 Hz screen, frame
+   step and present interval agreeing (lowering the uncapped clock to 30 Hz instead left the game's interval in 60 Hz
+   units: it raised it to 3 and the title ran at about 10 fps). The default is the screen's rate, at most 60 on an iPhone
+   14 (user 2026-10-23: 30 for an hour, then "iphone 改成锁60"). */
+static int phone_holds_30(void) {
+#if TARGET_OS_IPHONE
+    static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PHONE_FPS"); v = e && atoi(e) == 30; }
+    return v;
+#else
+    return 0;
+#endif
+}
+static int game_holds_30(void) { return runtime_game_fps_limit() == 30 || phone_holds_30(); }
 static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_holds_30() && (m == MFX_OFF || m == MFX_MAX); }
 /* 30+30 on a display whose rate is not a multiple of 30 (the user's 100 Hz): the game is paced by our own clock at exactly
    30 fps instead of by the display link (3 refreshes would be 33 fps); the display link still shows each picture at a refresh. */
@@ -2471,10 +2487,16 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup, draws, passes, views, variants, variants_pre, variants_bg, plain_draws; double variant_ms; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[长帧] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
+extern uint64_t mtl_view_stats(void); extern void mtl_variant_stats(uint64_t *n, uint64_t *ns, uint64_t *pre, uint64_t *bg, uint64_t *plain);
+/* TOTK_LONGFRAME_DETAIL=1: a long-frame line also names the frame's draws, render passes and new texture views, to tell a
+   frame that drew far more than usual from one that met many textures for the first time, and the patched shader
+   variants compiled from source while it was replayed (2026-10-21: in-world frames of 100-310 ms with the usual work,
+   one render pass taking almost all of it, the replay thread in border_src / vs_fn_for). */
+static int lf_detail(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_LONGFRAME_DETAIL"); on = e && !strcmp(e, "1"); } return on; }
 static const char *const g_tname[6] = {"帧时间", "出帧工作", "NVN 提交+出图", "GPU", "翻译层录制期", "翻译层提交期"};
 static void tpush(int k, double v) { g_tw[k][g_tn[k]++ % TWIN] = v; }
 // 发热归因（iOS DM_HEAT）：每帧 GPU 毫秒另存一圈，取「上次取数以来」的均值 / p95（最多最近 HRN 帧），与计时汇总的 300 帧窗口互不干扰
@@ -2515,7 +2537,7 @@ static void tsummary(uint64_t frame) {
         pae = ae; par = ar; }
       { extern uint64_t g_draw_skip[16]; static uint64_t prev[16]; char b[512]; size_t o = 0; b[0] = 0;
         static const char *why[] = {"no-program", "zero-source", "defer-take", "render-disabled", "raster-discard", "cull-both", "scissor-empty", "deferred", "no-encoder", "no-pipeline", "viewport-empty", "primitive",
-                                    "clear-render-disabled", "cond-disabled", "cond-unknown", "shader-missing"};   // TOTK: 12-14 conditional rendering (see cond_eval); 15 a shader variant the iPhone does not have yet
+                                    "clear-render-disabled", "cond-disabled", "cond-unknown", "shader-missing"};   // TOTK: 12-14 conditional rendering (see cond_eval); 15 a shader variant the iPhone does not have yet, or (Mac, async shaders) a variant or pipeline still prepared in the background
         for (int i = 0; i < 16; i++) { uint64_t d = g_draw_skip[i] - prev[i]; prev[i] = g_draw_skip[i]; if (d && o < sizeof b - 48) o += snprintf(b + o, sizeof b - o, " %s=%llu", why[i], (unsigned long long)d); }
         if (o) LOG("[nvn] TOTK 回放丢弃的绘制 至帧 %llu:%s", frame, b); }
       { static uint64_t py, pk, pw; uint64_t cy = atomic_load(&g_cum_sub_cyc), ck = atomic_load(&g_cum_sub_sys_ns), cw = atomic_load(&g_cum_sub_wall_ns);
@@ -2662,16 +2684,22 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 static int g_hz = -1, g_display_mode;
 /* TOTK_UNCAPPED (Mac and iPhone, default on; =0 off): like vsync off in other games. The game no longer waits for the display: it is
    paced by our own clock at UNCAPPED_HZ, and the display link shows the newest finished frame at every refresh (older ones
-   are merged away, as when the game runs ahead). The ceiling is 120 because the real-time frame step (game_patches.c)
-   clamps a frame to at least 1/120 s: above that the game would run fast. On a display of 120 Hz or more it changes nothing. */
-#define UNCAPPED_HZ 120
-/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 30..120 (default 120), or "display" for the display's refresh rate: the
-   iPhone app's default since 2026-10-17 (user: at most 60 on the iPhone 14's 60 Hz screen, where frames above it are never
-   shown and only heat the phone). The game still does not wait for the display, so a scene slower than the ceiling is not
-   held to 60 / 30 steps. */
+   are merged away, as when the game runs ahead). The Mac's ceiling is 120 by default (user 2026-10-22: 240 back to 120);
+   TOTK_UNCAPPED_HZ goes up to 240: the real-time frame step (game_patches*.c) follows the measured frame time at any
+   rate, so the game keeps its speed above 120 fps and on displays above 120 Hz. No ceiling at all (no present period) halved Breath of the Wild 1.9.0 on the same save, 81-93 ->
+   42-47 fps, also with a time-constraint declaration from the measured frame time; the cause is not known yet. */
+#define UNCAPPED_HZ 240           /* the highest TOTK_UNCAPPED_HZ takes */
+#define UNCAPPED_DEFAULT_HZ 120   /* the Mac's ceiling without TOTK_UNCAPPED_HZ */
+/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 30..240 (default 120 on the Mac), or "display" for the display's refresh
+   rate: the iPhone / iPad default (user 2026-10-17: at most 60 on the iPhone 14's 60 Hz screen, where frames above it are
+   never shown and only heat the phone; since 2026-10-23 the phone holds 30, phone_holds_30). The game still does not wait for the display, so a scene slower than the ceiling
+   is not held to 60 / 30 steps. */
 static int uncapped_cap(int scr) {
     const char *e = getenv("TOTK_UNCAPPED_HZ");
-    int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
+#if TARGET_OS_IPHONE
+    if (!e) e = "display";   // at most the screen's rate (60 on an iPhone 14); TOTK_PHONE_FPS=30 holds 30 (phone_holds_30)
+#endif
+    int v = !e ? UNCAPPED_DEFAULT_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
@@ -2684,7 +2712,7 @@ static void present_cfg(const win_t *o) {
     int realtime = !(rt && !strcmp(rt, "0"));
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
-      g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
+      g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && !(f60 && !strcmp(f60, "0")); }
     if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] 不限帧率（TOTK_UNCAPPED，默认开；=0 关）：不等显示器刷新，自己的时钟上限 %d 帧（TOTK_UNCAPPED_HZ）；显示器 %d Hz 每次刷新显示最新一帧%s", g_hz, scr,
                                        mfx_enabled() ? "（补帧开着时暂停：每两次刷新一帧）" : "（补帧打开时暂停，2 键）"); }
     if (!g_hz) LOG("[nvn] 【警告】DM_PRESENT_HZ=0：不限帧率，帧节奏非真机，界面逻辑可能偏离（仅供性能剖析，不能用于判据 / 对拍）");
@@ -2801,12 +2829,19 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // mistakenly stall the title rather than the save-loading screen.
     // Hold that first frame behind the loading screen if cache warm-up is still
     // active. This does not claim that an undiscovered variant cannot appear.
+    // The Mac waits until the warm-up is done, however long (user 2026-10-23: play
+    // starts with every listed pipeline ready); the phone keeps the 15 s limit.
     { static int gate; static uint64_t last_draws;
       uint64_t passes, draws; mtl_stats(&passes, &draws);
       uint64_t this_draws = draws >= last_draws ? draws - last_draws : 0;
       last_draws = draws;
       if (!gate && ((g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || this_draws > 2000)) {
-          gate = 1; extern void mtl_note_world(void); mtl_note_world(); int ms = mtl_warm_wait(15000);
+#if TARGET_OS_IPHONE
+          const int warm_limit_ms = 15000;
+#else
+          const int warm_limit_ms = -1;
+#endif
+          gate = 1; extern void mtl_note_world(void); mtl_note_world(); int ms = mtl_warm_wait(warm_limit_ms);
           if (ms) LOG("[nvn] 首次进局等管线预热 %d ms（本帧绘制 %llu）", ms, (unsigned long long)this_draws);
       } }
     present_cfg(o);
@@ -2878,6 +2913,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
+            static uint64_t pviews; uint64_t views = mtl_view_stats();
+            r->draws = (unsigned)(dr - prev_draw); r->passes = (unsigned)(ps - prev_pass); r->views = (unsigned)(views - pviews); pviews = views;
+            static uint64_t pvn, pvns, pvp, pvb, pvl; uint64_t vn, vns, vp, vb, vl; mtl_variant_stats(&vn, &vns, &vp, &vb, &vl); r->variants = (unsigned)(vn - pvn); r->variant_ms = (vns - pvns) / 1e6; r->variants_pre = (unsigned)(vp - pvp); r->variants_bg = (unsigned)(vb - pvb); r->plain_draws = (unsigned)(vl - pvl); pvn = vn; pvns = vns; pvp = vp; pvb = vb; pvl = vl;
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
@@ -2892,13 +2930,14 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           // "Long" is relative to recent conditions: when running steadily at 30 fps (menus / windowless host) or under sustained overload, every frame is > 20 ms; those are not long frames and must not flood the log - a frame has to be 40% above the sliding mean of the last 16 frames to count
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
-          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
+          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[1024];
               snprintf(b, sizeof b, "帧 %llu（%.2f s）整帧 %.1f ms，提交+出图 %.1f ms，GPU %.1f ms；新建管线 %u 条 + 着色器库 %u 个共 %.1f ms；上传贴图 首传 %u 张 + 重传 %u 次 %.1f MB / %.1f ms",
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (hidden) strlcat(b, "；接读取画面，不可见", sizeof b);
+              if (lf_detail()) { char d[384]; snprintf(d, sizeof d, "；绘制 %u 次、渲染通道 %u 个、新建贴图视图 %u 个；当场编译补丁变体 %u 个共 %.1f ms，读预编的补丁变体 %u 个，后台编补丁变体 %u 个，边框补丁没好先用原管线画 %u 次", r->draws, r->passes, r->views, r->variants, r->variant_ms, r->variants_pre, r->variants_bg, r->plain_draws); strlcat(b, d, sizeof b); }
               dm_longframe_note(b); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;

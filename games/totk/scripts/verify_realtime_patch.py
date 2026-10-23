@@ -76,7 +76,7 @@ def execute(seconds, patched):
 
 
 checks = []
-for hz in (30, 50, 60, 90, 100, 120):
+for hz in (30, 50, 60, 90, 100, 120, 144, 165, 240, 360):
     seconds = 1 / hz
     ratio, dt, global_ratio = execute(seconds, True)
     assert abs(ratio - seconds * 30) < 1e-6

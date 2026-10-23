@@ -100,7 +100,13 @@ static class SwshXlate
             // The job says "depth_minus_w": true for that mode and the translator then emits z = z * 0.5 + w * 0.5 (Metal has no
             // depth clip control, see QueryHostSupportsDepthClipControl below).
             bool depthMinusW = _job["depth_minus_w"] is JsonValue dm && (dm.TryGetValue<bool>(out bool db) ? db : dm.TryGetValue<int>(out int di) && di != 0);
-            return new GpuGraphicsState(false, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            // TOTK (2026-10-22): "early_fragment_tests" is the fragment shader's NVN control byte +0x718, which the Switch driver
+            // turns into the 3D engine's early-Z-force state (Ryujinx's EarlyZForce). The translator then declares
+            // EarlyFragmentTests, and the MSL [[early_fragment_tests]]. Without it Metal tests depth after a fragment shader
+            // that stores to memory (the material shaders' per-tile flag), and that late depth differed by an ulp from the
+            // depth prepass's: the G-buffer draws' EQUAL test failed along lines (dotted Great Sky Island lattice).
+            bool earlyZ = _job["early_fragment_tests"] is JsonValue ez && (ez.TryGetValue<bool>(out bool eb) ? eb : ez.TryGetValue<int>(out int ei) && ei != 0);
+            return new GpuGraphicsState(earlyZ, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }

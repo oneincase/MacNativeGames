@@ -399,7 +399,6 @@ static void walk_skip_empty(Walk *w) {   /* the same as skip_empty in audio_rend
         const AudrenWaveBuffer *b = &w->v->buffers[w->index];
         if (b->loop && b->loop_count < 0) break;
         w->valid[w->index] = 0; w->offset = 0; w->loops = 0; w->index = (w->index + 1) & 3;
-        if (b->end_of_stream) w->ended = 1;
     }
 }
 static void walk_step(Walk *w) {   /* the same transitions as advance_voice in audio_renderer.c */
@@ -408,8 +407,7 @@ static void walk_step(Walk *w) {   /* the same transitions as advance_voice in a
     uint64_t length = (uint64_t)(b->end - b->start);
     if (++w->offset < length) return;
     if (b->loop && (b->loop_count < 0 || w->loops < b->loop_count)) { w->loops++; w->offset = b->loop_start > b->start && b->loop_start < b->end ? (uint64_t)(b->loop_start - b->start) : 0; return; }
-    w->valid[w->index] = 0; w->offset = 0; w->loops = 0; w->index = (w->index + 1) & 3;
-    if (b->end_of_stream) w->ended = 1;
+    w->valid[w->index] = 0; w->offset = 0; w->loops = 0; w->index = (w->index + 1) & 3;   /* end of stream or not: on into the next queued buffer */
     walk_skip_empty(w);
 }
 /* Decodes `frames` output samples per channel into out[c][k]; the renderer advances the voice afterwards by the same amount. */
@@ -435,13 +433,28 @@ static void accumulate(Mixer *m, int buffer, const float *src, float vol, int fr
     float *d = mixbuf(m, buffer); for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
 }
 static int mix_valid(AudioRenderer *r, int32_t id) { return id >= 0 && id <= r->param.submix_count && r->mixes[id].in_use; }
-static int mix_depth(AudioRenderer *r, int id) {
-    int d = 0;
-    for (int guard = 0; id > 0 && guard < 64; guard++, d++) {
-        if (!mix_valid(r, r->mixes[id].dest_mix_id)) return d + 1;
-        id = r->mixes[id].dest_mix_id;
+static int mix_depth(AudioRenderer *r, int id, int depth[256], uint8_t visiting[256]) {
+    if (!id) return 0;
+    if (depth[id] >= 0) return depth[id];
+    /* Valid routing graphs are acyclic; keep malformed cycles bounded too. */
+    if (visiting[id]) return 0;
+    visiting[id] = 1;
+    Mixer *m = r->mixer;
+    const AudrenMixIn *x = &r->mixes[id];
+    int d = 1;
+    if (x->dest_splitter_id != SPLITTER_UNUSED && x->dest_splitter_id < (uint32_t)m->nsplit) {
+        const SplitInfo *s = &m->split[x->dest_splitter_id];
+        for (int k = 0; k < s->ndest; k++) {
+            const SplitDest *dest = &m->dest[s->ids[k]];
+            if (!dest->used || !mix_valid(r, dest->dest)) continue;
+            int next = 1 + mix_depth(r, dest->dest, depth, visiting);
+            if (next > d) d = next;
+        }
+    } else if (mix_valid(r, x->dest_mix_id)) {
+        d = 1 + mix_depth(r, x->dest_mix_id, depth, visiting);
     }
-    return d;
+    visiting[id] = 0;
+    return depth[id] = d;
 }
 
 /* Guest custom effects exchange int32 samples in two rings. Each ring has CPU and DSP
@@ -673,10 +686,11 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             }
         }
     }
-    /* submixes: deepest first, so every mix is complete before it is folded into its destination */
-    int order[256], n = 0, depth[256];
-    for (int i = 1; i < mc && n < 256; i++) if (r->mixes[i].in_use) { depth[n] = mix_depth(r, i); order[n++] = i; }
-    for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (depth[b] > depth[a]) { int t = order[a]; order[a] = order[b]; order[b] = t; t = depth[a]; depth[a] = depth[b]; depth[b] = t; }
+    /* Include every active splitter destination: processing a receiver before its source loses that audio. */
+    int order[256], n = 0, depth[256]; uint8_t visiting[256] = {0};
+    for (int i = 0; i < 256; i++) depth[i] = -1;
+    for (int i = 1; i < mc && n < 256; i++) if (r->mixes[i].in_use) { mix_depth(r, i, depth, visiting); order[n++] = i; }
+    for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (depth[order[b]] > depth[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
     for (int a = 0; a < n; a++) {
         mix_effects(r, order[a]);
         const AudrenMixIn *x = &r->mixes[order[a]]; int src = m->offset[order[a]];

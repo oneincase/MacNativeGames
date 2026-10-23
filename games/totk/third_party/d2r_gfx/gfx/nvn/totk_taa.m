@@ -51,6 +51,9 @@ static void keep_old(id obj) {   // released (and dropped from the residency set
 }
 
 static _Atomic int g_on = -1;
+/* Frames anti-aliased so far: the panel shows key 5 as on but not in effect while none is (a game version whose compose
+   draw TAA_COMPOSE does not know, or no world frame yet). */
+int taa_effective(void) { return g.done > 0; }
 int taa_enabled(void) {
     int on = atomic_load_explicit(&g_on, memory_order_relaxed);
     if (on < 0) {

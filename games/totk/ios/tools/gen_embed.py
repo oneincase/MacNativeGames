@@ -41,6 +41,12 @@ for name in names:
         section_image = text_image if sect == f'__TOTKX,__{name}x0' else image
         if sect == f'__TOTKX,__{name}x0': chunk_source = text_data
         else: chunk_source = data
+        # The patch area as the export left it (loader.c export-ios: Breath of the Wild's exclusive-acquire patch changes it)
+        x1_export = text_dir / f'{name}.x1.bin' if text_dir else None
+        if sect == f'__TOTKX,__{name}x1' and x1_export and x1_export.is_file():
+            x1_data = x1_export.read_bytes()
+            if len(x1_data) != hi - lo: raise ValueError(f'{name}: exported x1 must be exactly {hi - lo:#x} bytes, got {len(x1_data):#x}')
+            section_image, chunk_source, lo, hi = x1_export, x1_data, 0, hi - lo
         real = max(0, min(hi, len(chunk_source))-lo)
         if real: asm += [f'    .incbin "{section_image.resolve()}", {lo:#x}, {real:#x}']
         if hi-lo > real: asm += [f'    .space {hi-lo-real:#x}']

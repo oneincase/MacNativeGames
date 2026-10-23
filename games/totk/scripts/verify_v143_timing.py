@@ -58,7 +58,7 @@ def main():
   global_ratio=struct.unpack('<f',mu.mem_read(0x3a22128,4))[0]
   return ratio,inverse,dt,fps,global_ratio
  cases=[]
- for hz in (15,20,25,30,50,60,90,100,120):
+ for hz in (15,20,25,30,50,60,90,100,120,144,165,240,360):
   for half in (False,True):
    scale=.5 if half else 1
    for call in (0x3e5720,0x3e583c):
@@ -111,7 +111,7 @@ def main():
   assert all(abs(a-b)<1e-6 for a,b in zip(normal,ordinary)),'ordinary clock was scaled twice'
   return result
  cloth_cases=[]
- for hz in (15,20,30,40,50,60,90,100,120):
+ for hz in (15,20,30,40,50,60,90,100,120,144,165,240,360):
   for factor in (0,.25,1,2):
    for site in (0x246eac,0x345904,0x24944c,0x28bc98):
     result=cloth_clock(hz,factor,site);want=(factor/hz,factor*30/hz)
@@ -141,7 +141,7 @@ def main():
   assert mu.reg_read(UC_ARM64_REG_S1)==0x42c80000,'bounce check threshold changed'
   return struct.unpack('<f',struct.pack('<I',mu.reg_read(UC_ARM64_REG_S0)&0xffffffff))[0]
  bounce_cases=[]
- for hz in (30,60,100,120):
+ for hz in (30,60,100,120,144,240,360):
   for scale in (1,.5,.25,.1):
    got=bounce_check(hz,scale);assert abs(got-30/scale)<1e-3,(hz,scale,got)
    bounce_cases.append(dict(hz=hz,scale=scale,compared=got))

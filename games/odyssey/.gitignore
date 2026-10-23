@@ -1,0 +1,8 @@
+# User-provided game material and local build results must stay out of source control.
+*.xci
+*.nsp
+*.nsz
+*.keys
+*_build/
+.venv/
+__pycache__/

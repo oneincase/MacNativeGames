@@ -30,6 +30,28 @@ class ShaderList(unittest.TestCase):
         self.assertEqual(r.returncode, 0 if good else 1, r.stderr)
         return r.stdout
 
+    def test_rename_moves_warm_rows_to_the_variants_the_seed_carries(self):
+        old, new = KEY+'-'+'1'*12, KEY+'-'+'2'*12
+        other = 'c'*64+'-'+'3'*12
+        def key(vs, fs):   # nvn_pso_skey.h: vs[80], fs[80], then the rest of the key
+            return (vs.encode().ljust(80, b'\0')+fs.encode().ljust(80, b'\0')+b'\x07'*40).hex()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/'seed.aliases.tsv').write_text(f'{old}\t{new}\n')
+            listed = root/'pso_manifest.tsv'
+            listed.write_text('# exported\n'
+                              f'S\t{old}_b\t1\n'
+                              f'S\t{new}_b\t1\n'                         # the same row once renamed: kept once
+                              f'R\t{key(other+"_b", old+"_b")}\n'
+                              f'B\t{key(old+"_b", other+"_b")}\t-\t0:0:0x1p-1,0x1p-1,0x1p-1,0x1p-1;\n'
+                              f'C\t{other}_b\n')
+            self.run_tool('rename', root/'seed.aliases.tsv', listed)
+            self.assertEqual(rows(listed), [f'S\t{new}_b\t1', f'R\t{key(other+"_b", new+"_b")}',
+                                             f'B\t{key(new+"_b", other+"_b")}\t-\t0:0:0x1p-1,0x1p-1,0x1p-1,0x1p-1;',
+                                             f'C\t{other}_b'])
+            (root/'bad.tsv').write_text('not\tan alias\n')
+            self.run_tool('rename', root/'bad.tsv', listed, good=False)
+
     def test_variants_are_the_shader_and_its_bind_state_not_a_variant_name(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); out = root/'list.tsv'
@@ -57,6 +79,20 @@ class ShaderList(unittest.TestCase):
             self.run_tool('export', out, manifest, first)
             self.assertEqual(rows(first), [f'S\t{VARIANT}\t0', f'R\t{PIPELINE}'])
             self.assertEqual(rows(manifest), [f'R\t{PIPELINE}', f'R\t{"4"*80}', f'C\t{VARIANT}'])
+
+    def test_border_recipes_travel_with_their_pipeline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root/'list.tsv'
+            fs = '3:7:0x1p-1,0x1p-1,0x1p-1,0x1p-1;'
+            vs = '8:3:0x1p-2,0x1.99999ap-2,0x1.8p-1,0x1.ccccccp-1;9:7:0x0p+0,-0x1p+0,0x1p+0,0x1p+0:f5,5,5,1,3,0x1p+0,0x0p+0,0x1.ep+3;'   # a filtering sampler
+            later = root/'pso_user.tsv'
+            later.write_text(f'R\t{PIPELINE}\nB\t{PIPELINE}\t-\t{fs}\nB\t{PIPELINE}\t{vs}\t-\n'
+                             f'B\t{PIPELINE}\t-\t-\nB\t{PIPELINE}\t-\t3:9:0x1p-1,0x1p-1,0x1p-1,0x1p-1;\nB\t{PIPELINE}\t-\t3:7:0.5,0.5,0.5,0.5;\n')
+            self.assertIn('2 B', self.run_tool('merge', out, later))
+            self.assertEqual(rows(out, 'B'), [f'B\t{PIPELINE}\t-\t{fs}\tm', f'B\t{PIPELINE}\t{vs}\t-\tm'])
+            self.run_tool('export', out, root/'one.tsv')
+            self.assertEqual(rows(root/'one.tsv', 'B'), [f'B\t{PIPELINE}\t-\t{fs}', f'B\t{PIPELINE}\t{vs}\t-'])
+            self.assertIn('2 B', self.run_tool('stats', out))
 
     def test_a_runtime_without_a_title_list_gets_every_warm_row_in_one_file(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -114,6 +150,36 @@ class ShaderList(unittest.TestCase):
 
     def test_the_repository_list_is_valid(self):
         self.assertIn('variants', self.run_tool('stats', ROOT/'games/totk/assets/shader_list.tsv'))
+
+    def load_module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('shader_list', SCRIPT)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module
+
+    def test_pipelines_that_differ_only_in_state_they_do_not_use_are_one_row(self):
+        import struct
+        def key(blend_en, chmask, blend0, blend1):   # nvn_pso_skey.h pso_skey: target 0 is RGBA8 (70), target 1 missing
+            b = bytearray(544); b[0:len(VARIANT)] = VARIANT.encode(); b[80:80+len(VARIANT)] = VARIANT.encode()
+            struct.pack_into('<8I', b, 216, 70, 0, 0, 0, 0, 0, 0, 0)
+            struct.pack_into('<II', b, 260, blend_en, chmask); struct.pack_into('<QQ', b, 272, blend0, blend1)
+            return b.hex()
+        stale, other, clean = key(0b10, 0xff, 0x1234, 0x5678), key(0, 0x0f, 0x9abc, 0), key(0, 0x0f, 0, 0)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root/'list.tsv'
+            (root/'pso_user.tsv').write_text(f'R\t{stale}\nR\t{other}\nR\t{clean}\nB\t{stale}\t-\t3:7:0x1p-1,0x1p-1,0x1p-1,0x1p-1;\n')
+            self.run_tool('merge', out, root/'pso_user.tsv')
+            self.assertEqual(rows(out, 'R'), [f'R\t{clean}\tm'])
+            self.assertEqual([r.split('\t')[1] for r in rows(out, 'B')], [clean])
+        self.assertEqual(self.load_module().pipeline_key(PIPELINE), PIPELINE)   # a key of another size stays
+
+    def test_the_repository_lists_hold_normalised_pipeline_keys(self):
+        shader_list = self.load_module()
+        for game in ('totk', 'botw'):
+            for line in rows(ROOT/f'games/{game}/assets/shader_list.tsv'):
+                f = line.split('\t')
+                if f[0] in ('R', 'B'):
+                    self.assertEqual(shader_list.pipeline_key(f[1]), f[1], game)
 
 
 if __name__ == '__main__':

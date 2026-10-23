@@ -29,17 +29,29 @@ static NSString *totk_seed_fingerprint(NSDictionary *m, NSArray<NSString *> *nam
 
 // iOS checks the app bundle's seal when it installs the app and keeps the bundle read-only, so a seed inside the bundle
 // needs no second hash on the device (76 s for 79,352 files on an iPhone 14, 2026-10-20). Packs pushed into Documents
-// (fill packs) and every seed on the Mac are still checked. Such a seed is also not copied: the bundle and Documents are
-// on different volumes, so a clone fails (EXDEV) and the copy took 175 s; the runtime reads it in place
-// (totk_shader_rt.m totk_rt_file), and the result names the files ("overlay").
+// (fill packs) are still checked. Such a seed is also not copied: the bundle and Documents are on different volumes, so
+// a clone fails (EXDEV) and the copy took 175 s; the runtime reads it in place (totk_shader_rt.m totk_rt_file), and the
+// result names the files ("overlay").
+// The Mac app does the same: build_app.py seals the bundle, seed included, and has macOS check it once while packaging;
+// hashing all 65,435 files again and copying them into the cache (on the system volume while the app sat on another one,
+// so no clone) took 63 s on the first start after each packaging (2026-10-21). A seed outside a signed .app (a
+// development tree, TOTK_SHADER_SEED_DIR) is still checked and imported; TOTK_SHADER_SEED_IN_PLACE=1 / 0 forces either.
 static BOOL totk_seed_sealed(NSString *source) {
-#if TARGET_OS_IPHONE
-    NSString *bundle = NSBundle.mainBundle.bundlePath.stringByResolvingSymlinksInPath;
     NSString *path = source.isAbsolutePath ? source : [NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:source];
+#if TARGET_OS_IPHONE
+    /* A seed install_device.py put into Documents (ios/Sources/main.m sets TOTK_SHADER_SEED_PUSHED only once its marker,
+       written after the whole folder, names it): checked by the Mac that built it, and read in place like the bundle's. */
+    const char *pushed = getenv("TOTK_SHADER_SEED_PUSHED");
+    if (pushed && *pushed && [path.stringByResolvingSymlinksInPath isEqualToString:@(pushed).stringByResolvingSymlinksInPath]) return YES;
+    NSString *bundle = NSBundle.mainBundle.bundlePath.stringByResolvingSymlinksInPath;
     return bundle.length && [path.stringByResolvingSymlinksInPath hasPrefix:[bundle stringByAppendingString:@"/"]];
 #else
-    (void)source;   // TOTK_SHADER_SEED_IN_PLACE=1: the Mac reads its seed the way iOS does (tests of the iOS path)
-    const char *e = getenv("TOTK_SHADER_SEED_IN_PLACE"); return e && !strcmp(e, "1");
+    const char *e = getenv("TOTK_SHADER_SEED_IN_PLACE");
+    if (e && *e) return !strcmp(e, "1");
+    for (NSString *dir = path.stringByResolvingSymlinksInPath; dir.length > 1; dir = dir.stringByDeletingLastPathComponent)
+        if ([dir.pathExtension isEqualToString:@"app"])
+            return [NSFileManager.defaultManager fileExistsAtPath:[dir stringByAppendingPathComponent:@"Contents/_CodeSignature/CodeResources"]];
+    return NO;
 #endif
 }
 

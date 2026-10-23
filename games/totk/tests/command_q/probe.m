@@ -11,6 +11,12 @@ _Noreturn void runtime_fail(const char *message){fprintf(stderr,"FAIL: %s\n",mes
 void runtime_input_key(unsigned code,int down){(void)code;(void)down;}
 void runtime_input_clear(void){}
 void runtime_gamepad_start(void){}
+int runtime_gamepad_type(int *detected){if(detected)*detected=-1;return 0;}
+int runtime_mouse_enabled(void){return 0;}
+void runtime_mouse_set_hook(void (*hook)(void)){(void)hook;}
+void runtime_mouse_move(double dx,double dy){(void)dx;(void)dy;}
+void runtime_mouse_button(int button,int down){(void)button;(void)down;}
+void runtime_mouse_release(void){}
 void runtime_oe_push_message(uint32_t message){(void)message;}
 void hle_bind_system_event(void *event,int autoclear){(void)event;(void)autoclear;}
 void hle_signal_system_event(void *event){(void)event;}
@@ -23,6 +29,10 @@ int dm_gfx_fps_now(int *generated){if(generated)*generated=0;return -1;}
 int mfx_enabled(void){return 0;}
 int mfxup_output_enabled(void){return 0;}
 uint64_t runtime_output_size_current(void){return 1920|(uint64_t)1080<<32;}
+void runtime_aspect_view(double w,double h){(void)w;(void)h;}
+int runtime_aspect_step(void){return -1;}
+float runtime_aspect_now(void){return 0;}
+int taa_enabled(void){return 0;}
 
 static NSEvent *key(NSEventModifierFlags flags){
  return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0

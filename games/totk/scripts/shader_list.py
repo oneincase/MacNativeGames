@@ -14,8 +14,13 @@ It holds no game data, only identifiers; the build turns them into shaders from 
                                 the key, so bytes of another game version are never used.
   S <variant>_b <stage> <flags> a shader library the warm-up loads,
   C <variant>_b <flags>         a compute pipeline, and
-  R <pipeline key> <flags>      a render pipeline it builds; flags t: the title screen's (the first frame waits for these
-                                only), m: the rest of the warm-up. Warm rows keep the order they were recorded in.
+  R <pipeline key> <flags>      a render pipeline it builds;
+  B <pipeline key> <vertex> <fragment> <flags>
+                                the same pipeline with the border colours its samplers had (nvn_mtl.m border_parse): per
+                                stage "<argument id>:<axes>:<r>,<g>,<b>,<a>;" for each sampler, colours as C %a floats,
+                                or - for none; the warm-up builds the shader variants that emulate them and that pipeline.
+                                Flags t: the title screen's (the first frame waits for these only), m: the rest of the
+                                warm-up. Warm rows keep the order they were recorded in.
 
   shader_list.py merge [--title] <list> <source>...  add a translation cache folder (its *.variants: shaders only; a cache's
                                                      pso_collected.tsv holds every pipeline ever built, tens of thousands,
@@ -24,22 +29,33 @@ It holds no game data, only identifiers; the build turns them into shaders from 
   shader_list.py export <list> <pso_manifest.tsv> <pso_title.tsv>   the two files the runtime reads (nvn_mtl.m warm_start)
   shader_list.py export <list> <pso_manifest.tsv>   one file with every warm row, title rows first, for a runtime
                                                      without a title list (the original port, native-port)
+  shader_list.py rename <seed>.aliases.tsv <file>... rename the variants exported warm rows name through the aliases the
+                                                     seed's preparation wrote (listed variants another one serves)
+  shader_list.py prune <list> <seed folder>          drop the V rows the seed's built-in variants serve (prepare_shader_seed.py
+                                                     builtin_serves): the list keeps only non-default variants
   shader_list.py stats <list>                        check the list and count it
 """
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 
 HEADER = ('# TOTK shader list v1 (games/totk/scripts/shader_list.py; docs/shader-list.md). The one list for every platform.\n'
-          '# Identifiers and pipeline descriptors only, no game data. Translation chain totk-native-v6-unverified.\n')
+          '# Identifiers and pipeline descriptors only, no game data. Translation chain totk-native-v8-unverified.\n')
 HEADERS = {'botw': ('# Breath of the Wild shader list v1 (games/totk/scripts/shader_list.py; docs/shader-list.md). The one list for every platform.\n'
-                    '# Identifiers and pipeline descriptors only, no game data. Translation chain totk-native-v6-unverified.\n')}
+                    '# Identifiers and pipeline descriptors only, no game data. Translation chain totk-native-v8-unverified.\n')}
 EXPORT = '# Generated from {} by scripts/shader_list.py; edit that list, not this file.\n'
 KEY = re.compile(r'^[0-9a-f]{64}$')
 VARIANT = re.compile(r'^[0-9a-f]{64}-[0-9a-f]{12}_b$')
 PIPELINE = re.compile(r'^(?:[0-9a-f]{2})+$')
 HEX = re.compile(r'^[0-9a-f]{1,10}$')
+_HEXFLOAT = r'-?0x[0-9a-f]+(?:\.[0-9a-f]*)?p[-+]\d+'
+# nvn_mtl.m border_key: per sampler "<argument id>:<axes>:<r>,<g>,<b>,<a>", a filtering sampler adding
+# ":f<ws>,<wt>,<wr>,<magf>,<minf>,<aniso>,<lod min>,<lod max>" before ';' (the runtime has written it so for a while: without
+# it every B row a player sent was dropped, 51 of 51 on 2026-10-22)
+_FILTER = rf':f\d+,\d+,\d+,\d+,\d+,{_HEXFLOAT},{_HEXFLOAT},(?:{_HEXFLOAT}|inf)'
+BORDER = re.compile(rf'^(?:-|(?:\d+:[0-7]:{_HEXFLOAT},{_HEXFLOAT},{_HEXFLOAT},{_HEXFLOAT}(?:{_FILTER})?;){{1,8}})$')
 SOURCE = re.compile(r'^(?:module:[a-z0-9]+|[A-Za-z0-9_.()+-]+(?:/[A-Za-z0-9_.()+-]+)*)$')
 DEPS_FIELDS = {'tex', 'img', 'attr', 'fout'}
 
@@ -65,15 +81,42 @@ def locator(fields):
     return (fields[1], fields[2], int(fields[3], 16), int(fields[4], 16), int(fields[5], 16))
 
 
+# nvn_pso_skey.h pso_skey as the runtime writes it (544 bytes): merged flag, colour formats, blend enables, write masks and
+# one 8-byte blend state per colour target
+SKEY_SIZE, SKEY_MERGED, SKEY_CFMT, SKEY_BLEND_EN, SKEY_CHMASK, SKEY_BLEND = 544, 162, 216, 260, 264, 272
+
+
+def pipeline_key(key):
+    """A render pipeline key as nvn_pso_skey.h pso_key_norm leaves it: blend factors of a target that does not blend, and
+    outside a merged pass the write mask and blend bit of a missing colour target, cleared. Rows recorded before the runtime
+    did so differ only there (9,057 render pipelines of the list were 5,611, 2026-10-22); keys of another size stay."""
+    if len(key) != 2 * SKEY_SIZE:
+        return key
+    b = bytearray.fromhex(key)
+    merged, cfmt = b[SKEY_MERGED], struct.unpack_from('<8I', b, SKEY_CFMT)
+    (blend_en,), (chmask,) = struct.unpack_from('<I', b, SKEY_BLEND_EN), struct.unpack_from('<I', b, SKEY_CHMASK)
+    for i in range(8):
+        if not merged and not cfmt[i]:
+            blend_en &= ~(1 << i); chmask &= ~(0xf << (4 * i))
+        if not blend_en >> i & 1:
+            b[SKEY_BLEND + 8 * i:SKEY_BLEND + 8 * i + 8] = bytes(8)
+    struct.pack_into('<I', b, SKEY_BLEND_EN, blend_en); struct.pack_into('<I', b, SKEY_CHMASK, chmask)
+    return b.hex()
+
+
 def warm_row(fields):
-    """A warm row without flags ('S', variant, stage) / ('C', variant) / ('R', key), or None when it is not one."""
+    """A warm row without flags ('S', variant, stage) / ('C', variant) / ('R', key) / ('B', key, vertex, fragment), or None
+    when it is not one."""
     kind = fields[0] if fields else ''
     if kind == 'S' and len(fields) >= 3 and VARIANT.match(fields[1]) and fields[2] in ('0', '1', '5'):
         return tuple(fields[:3])
     if kind == 'C' and len(fields) >= 2 and VARIANT.match(fields[1]):
         return tuple(fields[:2])
     if kind == 'R' and len(fields) >= 2 and PIPELINE.match(fields[1]):
-        return tuple(fields[:2])
+        return ('R', pipeline_key(fields[1]))
+    if (kind == 'B' and len(fields) >= 4 and PIPELINE.match(fields[1]) and BORDER.match(fields[2]) and BORDER.match(fields[3])
+            and fields[2:4] != ['-', '-']):
+        return ('B', pipeline_key(fields[1]), fields[2], fields[3])
     return None
 
 
@@ -121,7 +164,7 @@ class ShaderList:
                 raise ValueError(f'{path}:{number}: not a shader list row')
             row = warm_row(fields[:-1])
             if row and len(fields) == len(row) + 1 and fields[-1] in ('t', 'm', 'tm'):
-                lst.warm[row] = fields[-1]
+                lst.add_warm(row, fields[-1])   # rows that only differed in what pipeline_key clears become one
                 continue
             raise ValueError(f'{path}:{number}: not a shader list row')
         return lst
@@ -182,11 +225,60 @@ class ShaderList:
         return EXPORT.format(source) + ''.join('\t'.join(row) + '\n' for row in out)
 
     def counts(self):
-        kinds = {k: sum(1 for row in self.warm if row[0] == k) for k in 'SCR'}
+        kinds = {k: sum(1 for row in self.warm if row[0] == k) for k in 'SCRB'}
         title = sum(1 for flags in self.warm.values() if 't' in flags)
         return (f'{len(self.variants)} variants over {len({k for k, _ in self.variants})} shaders, '
                 f'{len(self.locators)} located; warm rows: '
-                f'{kinds["S"]} S, {kinds["C"]} C, {kinds["R"]} R ({title} for the title screen)')
+                f'{kinds["S"]} S, {kinds["C"]} C, {kinds["R"]} R, {kinds["B"]} B ({title} for the title screen)')
+
+
+NAME = 80   # nvn_pso_skey.h pso_skey: char vs[80], fs[80] lead the pipeline key, each a NUL-padded "<variant>_b"
+
+
+def load_aliases(path):
+    """<seed>.aliases.tsv (prepare_shader_seed.py write_aliases): variant -> the variant the seed carries in its place."""
+    aliases = {}
+    for line in Path(path).read_text().splitlines():
+        old, new = line.split('\t')
+        if not (VARIANT.match(old+'_b') and VARIANT.match(new+'_b')):
+            raise ValueError(f'{path}: not an alias row: {line!r}')
+        aliases[old] = new
+    return aliases
+
+
+def rename_row(line, aliases):
+    """A warm row with the variants it names renamed through aliases (S / C: the variant; R / B: the two names in the
+    pipeline key), anything else as it is."""
+    fields = line.split('\t')
+    def name(v):   # "<variant>_b"
+        return aliases.get(v[:-2], v[:-2])+'_b' if v.endswith('_b') else v
+    if fields[0] in ('S', 'C') and len(fields) >= 2:
+        fields[1] = name(fields[1])
+    elif fields[0] in ('R', 'B') and len(fields) >= 2 and PIPELINE.match(fields[1]) and len(fields[1]) >= 4*NAME:
+        key = bytearray.fromhex(fields[1])
+        for at in (0, NAME):
+            old = bytes(key[at:at+NAME]).split(b'\0')[0].decode('ascii', 'replace')
+            new = name(old)
+            if new != old:
+                if len(new) >= NAME:
+                    raise ValueError(f'variant name {new} does not fit a pipeline key')
+                key[at:at+NAME] = new.encode().ljust(NAME, b'\0')
+        fields[1] = key.hex()
+    return '\t'.join(fields)
+
+
+def rename(text, aliases):
+    """An exported warm-up list (or a seed's pso_manifest.tsv) with its variants renamed; a row renamed into one it
+    already has is dropped."""
+    out, seen = [], set()
+    for line in text.splitlines():
+        row = rename_row(line, aliases) if line and not line.startswith('#') else line
+        if row and not row.startswith('#'):
+            if row in seen:
+                continue
+            seen.add(row)
+        out.append(row)
+    return ''.join(line+'\n' for line in out)
 
 
 def main(argv):
@@ -210,6 +302,22 @@ def main(argv):
         Path(argv[3]).write_text(lst.export('t', source=list_name(argv[1])))
     elif argv[:1] == ['export'] and len(argv) == 3:
         Path(argv[2]).write_text(ShaderList.load(argv[1]).export('t', 'm', source=list_name(argv[1])))
+    elif argv[:1] == ['rename'] and len(argv) >= 3:
+        aliases = load_aliases(argv[1])
+        for path in argv[2:]:
+            text = Path(path).read_text()
+            renamed = rename(text, aliases)
+            if renamed != text:   # often a clone of the exported file: written anew, not through the shared blocks
+                Path(path).unlink()
+                Path(path).write_text(renamed)
+    elif argv[:1] == ['prune'] and len(argv) == 3:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))   # also when run with python -I
+        from prepare_shader_seed import builtin_serves   # it imports this module
+        lst = ShaderList.load(argv[1])
+        before = len(lst.variants)
+        lst.variants = {(key, deps) for key, deps in lst.variants if not builtin_serves(argv[2], key, deps)}
+        lst.save(argv[1])
+        print(f'{before - len(lst.variants)} rows the seed serves dropped; {lst.counts()}')
     elif argv[:1] == ['stats'] and len(argv) == 2:
         lst = ShaderList.load(argv[1])
         lines = [l for l in Path(argv[1]).read_text().splitlines() if l and not l.startswith('#')]

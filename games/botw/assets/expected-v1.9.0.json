@@ -1,0 +1,35 @@
+{
+  "_comment": "The Legend of Zelda: Breath of the Wild 1.9.0 (base + the 1.9.0 update NSP, version 1114112): the update's ExeFS, its three modules rewritten for Apple silicon, the base + 1.9.0 BKTR-merged RomFS, the add-on content packs (from the --dlc NSPs, the same two RomFS images as the 1.6.0 card; each optional), and the system shared fonts (from firmware 22.5.0; no NSP carries them, so they come from --firmware or --shared-fonts).",
+  "title_id": "01007EF00011E000",
+  "version": 1114112,
+  "display_version": "1.9.0",
+  "exefs_sha256": {
+    "main": "f6f0b20bb1f2b67d164c24871cd473147eef1d285f12e7bd492e3126c6022e27",
+    "main.npdm": "38a7484e19b7a51dffda5e58c5c95a54f72c4d04bdf4bb76cbae81611fa29565",
+    "rtld": "49308064fddb52dfe9140c11a32cc6333a0917546c871967d013dcb076402817",
+    "sdk": "1d187f29784cd0af46e9e123fc2a62c77b3b07c5a39c8633d90d6c80de64e4ad",
+    "subsdk0": "767c35bcd7d23e78f9063c69b638290b8b83f91e839beb10799e6576960179b1"
+  },
+  "rewritten_sha256": {
+    "main.patched.bin": "6d48bff1b7f2692bd4f2efd3316b564877c50a10c6145610cf9a779b220538c6",
+    "sdk.patched.bin": "4d625d9baaebe60d38a00de1b8023fde7fb856d460a08433809670179483ca24",
+    "subsdk0.patched.bin": "0322958960fb205a8e108476f9e6b344e90cd5526f3e2c83503b3261ff2518e2"
+  },
+  "romfs": {
+    "size": 15132662100,
+    "sha256": "826b373b80cea5c581749a09dfbd9bb21e8d7a9cd3ed161c4d5315b9ae429dad",
+    "files": 41062
+  },
+  "aoc": {
+    "1": {"title_id": "01007EF00011F001", "size": 1390370680, "sha256": "6fc0b5f075bd52ab5390e98b4c07ffccd1db5efbcfd514003ded703fcdd2d42b", "files": 7094},
+    "2": {"title_id": "01007EF00011F002", "size": 648, "sha256": "a66389137e8505994bba3c5930e709c38d95579dae4554ab5a93ee9e519ebd20", "files": 1}
+  },
+  "shared_fonts_sha256": {
+    "standard": "d8f0b7510ea03e2a7e7552562076ce374b4bd2c9c9c1c79466f342758c046413",
+    "chinese-simplified": "a04eb490283d8393b2c49c52e315132461d790ac73996cb43ac869ce72003938",
+    "chinese-simplified-extension": "d87f8c101f852340c068ceb040565784acb19926347598d219ed57cf51bff5a9",
+    "chinese-traditional": "9d59b74e59a2dc92296d6bebad7cce791ba94688bd436304aaae174a58bd7457",
+    "korean": "2c03d70de164671c1f33caca76120e6c73223bc73a41f90605e151b04e7eb68a",
+    "nintendo-extension": "f9f62e025c9bbe0e9ae25a54ba5011202b1e3a3f3c33b2d876c40aff6174af68"
+  }
+}

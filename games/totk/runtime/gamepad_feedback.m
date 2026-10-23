@@ -213,16 +213,22 @@ static void hid_subcommand(uint8_t cmd, const uint8_t *arg, int n) {   /* main q
     if (r != kIOReturnSuccess) fprintf(stderr, "[gyro] HID subcommand 0x%02x failed: 0x%x\n", cmd, r);
 }
 static void hid_calibration(const uint8_t *c, const char *which) {
+    /* Origins are rest offsets: a few dozen steps on a Nintendo controller. An 8BitDo reports -2048, -2048, 2048 (acceleration)
+       and -2048, -2048, 2047 (gyro) there, placeholders that are no rest value (at rest it reads 0, 0, 1 G): taking them
+       as origins adds about 110 deg/s of constant rotation and makes the scales 12 % off. Such an origin counts as 0. */
+    int accOrigin[3], gyroOrigin[3];
     for (int i = 0; i < 3; i++) {
-        int acc = le16(c + 6 + 2 * i) - le16(c + 2 * i), gyro = le16(c + 18 + 2 * i) - le16(c + 12 + 2 * i);
-        if (acc <= 0 || gyro <= 0) { fprintf(stderr, "[gyro] %s HID calibration unusable: nominal scales kept\n", which); return; }
+        accOrigin[i] = le16(c + 2 * i); gyroOrigin[i] = le16(c + 12 + 2 * i);
+        if (abs(accOrigin[i]) >= 1000) accOrigin[i] = 0;
+        if (abs(gyroOrigin[i]) >= 1000) gyroOrigin[i] = 0;
+        if (le16(c + 6 + 2 * i) - accOrigin[i] <= 0 || le16(c + 18 + 2 * i) - gyroOrigin[i] <= 0) { fprintf(stderr, "[gyro] %s HID calibration unusable: nominal scales kept\n", which); return; }
     }
     for (int i = 0; i < 3; i++) {
-        hidAccScale[i] = 4.0 / (le16(c + 6 + 2 * i) - le16(c + 2 * i));
-        hidGyroOrigin[i] = le16(c + 12 + 2 * i);
-        hidGyroScale[i] = 936.0 / (le16(c + 18 + 2 * i) - hidGyroOrigin[i]);
+        hidAccScale[i] = 4.0 / (le16(c + 6 + 2 * i) - accOrigin[i]);
+        hidGyroOrigin[i] = gyroOrigin[i];
+        hidGyroScale[i] = 936.0 / (le16(c + 18 + 2 * i) - gyroOrigin[i]);
     }
-    fprintf(stderr, "[gyro] %s HID calibration: acc %.6f G, gyro %.4f deg/s per step\n", which, hidAccScale[0], hidGyroScale[0]);
+    fprintf(stderr, "[gyro] %s HID calibration: acc %.6f G, gyro %.4f deg/s per step, gyro origin %d %d %d\n", which, hidAccScale[0], hidGyroScale[0], gyroOrigin[0], gyroOrigin[1], gyroOrigin[2]);
 }
 static void hid_report(void *ctx, IOReturn result, void *sender, IOHIDReportType type, uint32_t id, uint8_t *p, CFIndex len) {   /* main run loop */
     (void)ctx; (void)sender; (void)type;
@@ -234,6 +240,8 @@ static void hid_report(void *ctx, IOReturn result, void *sender, IOHIDReportType
         return;
     }
     if (id != 0x30) return;
+    runtime_gamepad_switch_left((__bridge void *)motionPad,
+        p[6] | (p[7] & 15) << 8, (p[7] >> 4) | p[8] << 4);
     uint64_t now = runtime_now_ns(), step = hidLast && now - hidLast < 50000000ull ? (now - hidLast) / 3 : 5000000ull;
     hidLast = now;
     for (int k = 0; k < 3; k++) {
@@ -272,6 +280,7 @@ static void hid_motion_start(void) {   /* main queue */
 }
 static void hid_motion_stop(void) {   /* main queue */
     if (!hidDevice) return;
+    runtime_gamepad_switch_left(NULL, -1, -1);
     IOHIDDeviceRegisterInputReportCallback(hidDevice, hidReport, sizeof hidReport, NULL, NULL);
     IOHIDDeviceUnscheduleFromRunLoop(hidDevice, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     IOHIDDeviceClose(hidDevice, kIOHIDOptionsTypeNone);

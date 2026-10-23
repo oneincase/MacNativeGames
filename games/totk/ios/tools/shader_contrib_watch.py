@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Remind iPhone / iPad players on their Mac to send the shaders the shared list does not have yet.
+"""Remind iPhone / iPad players on their Mac to send the shaders and render pipelines the shared list does not have yet.
 
-The iOS app notes those shaders in Documents/shader-list-contribution.txt but never asks during play
+The iOS app notes them in Documents/shader-list-contribution.txt but never asks during play
 (third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h). While a device with the game is connected to this Mac (cable or the
-same network), `check` copies that file to ~/Library/Application Support/MacNativeGames/TOTK/ios-contributions/ and,
-every 500 new rows per device, asks once on the Mac to send it in a GitHub issue. When the GitHub CLI (gh) is installed and
+same network), `check` copies that file into the project folder the build ran from (<clone>/shader-list-contribution/, given
+as --store by build_app.py; players find it there, and each reminder opens it in Finder) and,
+every 100 new rows (shaders and pipelines together) per device, asks once on the Mac to send it in a GitHub issue. When the GitHub CLI (gh) is installed and
 signed in, the question offers "Submit automatically" instead of "Remind me next time": that sends this file at once (a
 secret gist and an issue that links it), without the browser. `install` runs `check` every 10 minutes as a LaunchAgent
 (build_app.py --platform ios installs it); `uninstall` removes it.
 
-usage: shader_contrib_watch.py check | install | uninstall"""
+usage: shader_contrib_watch.py check [--store <folder>] | install [--store <folder>] | uninstall"""
 import json
 import os
 import plistlib
@@ -21,14 +22,16 @@ import tempfile
 import time
 from pathlib import Path
 
-STEP = 500                     # as TOTK_CONTRIB_STEP in totk_shader_contrib.h
+STEP = 100                     # as TOTK_CONTRIB_STEP in totk_shader_contrib.h
 CHECK_EVERY = 10 * 60          # the LaunchAgent's interval
 PULL_EVERY = 30 * 60           # one copy per device at most this often
 ISSUE_URL = 'https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list.yml'
 APP_NAME = 'Tears of the Kingdom'
 LABEL = 'org.macnativegames.totk.ios-shader-contrib'
 DATA = Path.home() / 'Library/Application Support/MacNativeGames/TOTK'
-STORE = DATA / 'ios-contributions'
+WORK = DATA / 'ios-contributions'   # each device's copy by UDID and its reminder state (hidden: players do not need them)
+STORE = WORK                        # main: --store, normally <clone>/shader-list-contribution, holding the one file players send
+MERGED = 'shader-list-contribution.txt'   # the Mac's and every device's rows (app/launcher.m contrib_file writes the Mac's)
 AGENT = Path.home() / f'Library/LaunchAgents/{LABEL}.plist'
 LOG = Path.home() / 'Library/Logs/MacNativeGames/ios-shader-contrib.log'
 REPO = 'ly05010419/MacNativeGames'
@@ -50,13 +53,13 @@ def reachable_devices(listing):
 def game_bundle(apps):
     """The game's bundle identifier on a device, from `device info apps --json-output`, or None."""
     for app in apps.get('result', {}).get('apps', []):
-        if app.get('name') == APP_NAME or app.get('bundleIdentifier', '').endswith('.totk'):
+        if app.get('name') in (APP_NAME, 'TOTK') or '.totk' in app.get('bundleIdentifier', ''):   # TOTK: the home screen name since 2026-10-22
             return app['bundleIdentifier']
     return None
 
 
 def contribution_rows(text):
-    return len({line for line in text.splitlines() if line.startswith('V\t')})
+    return len({line for line in text.splitlines() if line.startswith(('V\t', 'R\t', 'B\t'))})   # shaders and pipelines
 
 
 def due(rows, reminded):
@@ -75,14 +78,14 @@ def chinese():
 def message(rows, device, auto=False):
     """(title, text, the middle button, "never", "send"); with auto (gh ready) the middle button submits at once."""
     if chinese():
-        return ('期待你的贡献', f'你的 {device} 上有 {rows} 个着色器可以贡献：玩的时候遇到的、公共着色器清单里还没有的。'
-                f'它们只有着色器的标识，不含游戏内容、存档或个人信息。发到 GitHub 加进公共清单后，以后大家打包的 App 都会带上它们，'
+        return ('期待你的贡献', f'你的 {device} 上有 {rows} 条着色器和渲染管线可以贡献：玩的时候遇到的、公共着色器清单里还没有的。'
+                f'它们只有着色器和管线的标识，不含游戏内容、存档或个人信息。发到 GitHub 加进公共清单后，以后大家打包的 App 都会带上它们，'
                 f'玩到那里不再缺画面。\n\n'
                 + ('点“自动提交”会用这台 Mac 上登录的 GitHub 命令行（gh）直接提交，不用打开网页。' if auto else '')
                 + '点“发送”会打开 GitHub 的提交页面，并在访达里显示这个文件，把它拖进页面即可。',
                 '自动提交' if auto else '下次提醒', '不要提醒了', '发送')
-    return ('We would love your contribution', f'Your {device} has {rows} shaders to contribute: ones the game met that the '
-            f'shared shader list does not have yet. They are shader identifiers only: no game data, saves or personal '
+    return ('We would love your contribution', f'Your {device} has {rows} shaders and render pipelines to contribute: ones the game met that the '
+            f'shared shader list does not have yet. They are shader and pipeline identifiers only: no game data, saves or personal '
             f'information. Sent to GitHub and added to the shared list, they come with everyone\'s next build, and nothing '
             f'is missing there any more.\n\n'
             + ('"Submit automatically" sends it now with the GitHub CLI (gh) signed in on this Mac, without the browser. ' if auto else '')
@@ -144,6 +147,7 @@ def ask(rows, device, path, platform='iPhone'):
     title, text, middle, never, send = message(rows, device, auto=bool(gh))
     script = (f'display dialog {quote(text)} with title {quote(title)} buttons {{{quote(never)}, {quote(middle)}, {quote(send)}}} '
               f'default button {quote(send)} with icon note giving up after 3600')
+    subprocess.run(['open', '-R', str(path)])   # the folder in Finder with the file selected, before the question (user 2026-10-22)
     answer = subprocess.run(['osascript', '-e', script], capture_output=True, text=True).stdout
     if gh and f'button returned:{middle}' in answer:
         link = submit(gh, path, rows, platform)
@@ -156,7 +160,6 @@ def ask(rows, device, path, platform='iPhone'):
         answer = f'button returned:{send}'
     if f'button returned:{send}' in answer:
         subprocess.run(['open', ISSUE_URL])
-        subprocess.run(['open', '-R', str(path)])
         return 'send'
     return 'never' if f'button returned:{never}' in answer else 'later'
 
@@ -180,51 +183,66 @@ def devicectl(*args):
         return json.loads(out.read_text())
 
 
+def merge_rows(src, dst):
+    """The V / R / B rows of src that dst lacks, appended to dst (made with a header if missing); returns dst's row count."""
+    have = dst.read_text(errors='replace').splitlines() if dst.exists() else []
+    known = set(have)
+    new = [l for l in src.read_text(errors='replace').splitlines() if l.startswith(('V\t', 'R\t', 'B\t')) and l not in known]
+    if not dst.exists():
+        dst.write_text('# Shaders and render pipelines this Mac and its iPhones / iPads met that the shared shader list does not have yet\n'
+                       '# (docs/shader-list.md). Only shader keys, bind states and pipeline descriptors: no game data or personal information.\n'
+                       f'# Send it in a GitHub issue: {ISSUE_URL}\n')
+    if new:
+        with dst.open('a') as f: f.write(''.join(l + '\n' for l in dict.fromkeys(new)))
+    return contribution_rows(dst.read_text(errors='replace'))
+
+
 def check():
-    STORE.mkdir(parents=True, exist_ok=True)
+    WORK.mkdir(parents=True, exist_ok=True); STORE.mkdir(parents=True, exist_ok=True)
     listing = devicectl('list', 'devices')
     for ident, udid, name, platform in reachable_devices(listing or {}):
-        state = STORE / f'{udid}.txt.reminded'
+        merged = STORE / MERGED
+        state = STORE / f'.{MERGED}.reminded'   # shared with the Mac launcher (totk_shader_contrib.h totk_contrib_state)
         if reminded_at(state.read_text() if state.exists() else '') is None:
             continue   # the player chose "Don't remind me again" for this device
-        stamp = STORE / f'{udid}.checked'
+        stamp = WORK / f'{udid}.checked'
         if stamp.exists() and time.time() - stamp.stat().st_mtime < PULL_EVERY:
             continue
         stamp.touch()
         bundle = game_bundle(devicectl('device', 'info', 'apps', '--device', ident) or {})
         if not bundle:
             continue
-        path = STORE / f'{udid}.txt'
+        path = WORK / f'{udid}.txt'
         if devicectl('device', 'copy', 'from', '--device', ident, '--domain-type', 'appDataContainer', '--domain-identifier',
                      bundle, '--source', 'Documents/shader-list-contribution.txt', '--destination', str(path)) is None:
             continue
-        rows = contribution_rows(path.read_text(errors='replace'))
+        rows = merge_rows(path, merged)   # into the one file players send, with the Mac's rows
         reminded = reminded_at(state.read_text() if state.exists() else '')
         print(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {name}: {rows} rows (reminded at {reminded})', flush=True)
         if due(rows, reminded):
             state.write_text(f'{rows}\n')   # "next time": STEP rows later
-            if ask(rows, name or platform, path, platform) == 'never':
+            if ask(rows, name or platform, merged, platform) == 'never':
                 state.write_text('never\n')
 
 
-def agent_plist(python, script, developer_dir):
-    return {'Label': LABEL, 'ProgramArguments': [python, str(script), 'check'], 'StartInterval': CHECK_EVERY,
+def agent_plist(python, script, developer_dir, store=None):
+    return {'Label': LABEL, 'ProgramArguments': [python, str(script), 'check', *(['--store', str(store)] if store else [])], 'StartInterval': CHECK_EVERY,
             'RunAtLoad': False, 'ProcessType': 'Background', 'EnvironmentVariables': {'DEVELOPER_DIR': developer_dir},
             'StandardOutPath': str(LOG), 'StandardErrorPath': str(LOG)}
 
 
-def install():
+def install(store=None):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from xcode_dir import developer_dir   # devicectl comes with the Xcode that built the iOS app
     script = DATA / 'tools' / Path(__file__).name   # a copy: the agent keeps working when the repository moves
     script.parent.mkdir(parents=True, exist_ok=True); LOG.parent.mkdir(parents=True, exist_ok=True); AGENT.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(__file__, script)
     python = '/usr/bin/python3' if Path('/usr/bin/python3').exists() else sys.executable   # not a work folder's venv, which may go
-    AGENT.write_bytes(plistlib.dumps(agent_plist(python, script, developer_dir())))
+    AGENT.write_bytes(plistlib.dumps(agent_plist(python, script, developer_dir(), store)))
     domain = f'gui/{os.getuid()}'
     subprocess.run(['launchctl', 'bootout', f'{domain}/{LABEL}'], capture_output=True)
     subprocess.run(['launchctl', 'bootstrap', domain, str(AGENT)], check=True, capture_output=True)
-    print(f'installed {AGENT}: checks connected iPhones / iPads every {CHECK_EVERY // 60} minutes')
+    print(f'installed {AGENT}: checks connected iPhones / iPads every {CHECK_EVERY // 60} minutes; contributions in {store or STORE}')
 
 
 def uninstall():
@@ -235,7 +253,10 @@ def uninstall():
 
 
 if __name__ == '__main__':
-    command = sys.argv[1] if len(sys.argv) == 2 else ''
-    if command not in ('check', 'install', 'uninstall'):
+    args = sys.argv[1:]
+    command = args[0] if args else ''
+    store = Path(args[2]).expanduser().resolve() if len(args) == 3 and args[1] == '--store' else None
+    if command not in ('check', 'install', 'uninstall') or len(args) not in (1, 3) or (len(args) == 3 and not store):
         sys.exit(__doc__)
-    {'check': check, 'install': install, 'uninstall': uninstall}[command]()
+    if store: STORE = store
+    {'check': check, 'install': lambda: install(store), 'uninstall': uninstall}[command]()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Breath of the Wild: extract and verify the 1.6.0 ExeFS from the game file.
+"""Breath of the Wild: extract and verify the 1.6.0 or 1.9.0 ExeFS from the game file.
 
-The game file is a separate 1.6.0 update NSP or a combined cartridge image. Common NSP tickets are supported. The code
+The game file is a separate 1.6.0 or 1.9.0 update NSP or a combined cartridge image. Common NSP tickets are supported. The code
 comes from the update's Program NCA (the one with a BKTR section, title 01007EF00011E000): its ExeFS
 section is read in place, the FS header hash, the hash table and every data block are verified, and the files are
 written with an extraction-manifest.json in the format of games/totk/scripts/extract_exefs.py (build_app.py reads it).

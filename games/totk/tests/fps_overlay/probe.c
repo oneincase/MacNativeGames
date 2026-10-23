@@ -88,15 +88,15 @@ int main(void) {
     /* The FPS box: the system font (it has "MetalFX已开启", user 2026-10-17), one line on the dark box; the box grows with
        what is shown. */
     int base, grown;
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 0}, 2, px, &base, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 0, 0, 0}, 2, px, &base, &h);
     CHECK(base > 40 && h == 11 * 2, "\"FPS 97  2560x1440\" at scale 2: box %dx%d", base, h);
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base + 60, "MetalFX on: \"  MetalFX已开启\" after the size (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){50, 2560, 1440, 0, 50, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){50, 2560, 1440, 0, 50, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base, "frame interpolation on: \"+50\" after the fps (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 1}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 0, 0, 1, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base, "true 2K: \"  2K\" at the end (box %d, without it %d)", grown, base);
-    fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1}, FPS_OVERLAY_MAX_SCALE, px, &w, &h);   /* longest line: fits, or drops a scale */
+    fps_overlay_raster(&(fps_overlay_info){999, 99999, 99999, 1, 5000, 1, 99999, 99999}, FPS_OVERLAY_MAX_SCALE, px, &w, &h);   /* longest line: fits, or drops a scale */
     CHECK(w > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "longest FPS line %dx%d outside the texture", w, h);
 
     const int values[] = {-1, 0, 7, 30, 60, 120, 999, 5000};
@@ -105,7 +105,7 @@ int main(void) {
         for (size_t z = 0; z < sizeof sizes / sizeof sizes[0]; z++)
         for (int mfx = 0; mfx <= 1; mfx++)
         for (int s = 1; s <= FPS_OVERLAY_MAX_SCALE; s++) {
-            fps_overlay_raster(&(fps_overlay_info){values[i], sizes[z][0], sizes[z][1], mfx, 0, 0}, s, px, &w, &h);
+            fps_overlay_raster(&(fps_overlay_info){values[i], sizes[z][0], sizes[z][1], mfx, 0, 0, 0, 0}, s, px, &w, &h);
             CHECK(w > 0 && h > 0 && w <= FPS_OVERLAY_TEX_W && h <= FPS_OVERLAY_TEX_H, "value %d scale %d box %dx%d outside texture", values[i], s, w, h);
             colours(w, h, &green, &yellow);
             int dirty = outside_dirty(w, h);
@@ -124,13 +124,24 @@ int main(void) {
     CHECK(!strcmp(line, "新着色器 0 / 总计 --"), "shader box text before the cache is counted \"%s\"", line);
     shader_overlay_text(line, sizeof line, 123456, 9999999, 123456);
     CHECK(!strcmp(line, "新着色器 99999 / 总计 999999"), "shader box text clamped \"%s\"", line);
+    pso_overlay_text(line, sizeof line, 12, 3128);
+    CHECK(!strcmp(line, "新渲染管线 12 / 总计 3128"), "render pipeline line \"%s\"", line);
+    pso_overlay_text(line, sizeof line, 0, -1);
+    CHECK(!strcmp(line, "新渲染管线 0 / 总计 --"), "render pipeline line before counting \"%s\"", line);
+    { char fl[96];   /* output resolution, then the internal (scene) one in brackets (2026-10-23) */
+      fps_overlay_text(&(fps_overlay_info){60, 1920, 1080, 0, 0, 0, 1600, 900}, fl, sizeof fl);
+      CHECK(!strcmp(fl, "FPS 60  1920x1080 (1600x900)"), "fps line with the internal resolution \"%s\"", fl);
+      fps_overlay_text(&(fps_overlay_info){30, 1280, 720, 0, 0, 0, 0, 0}, fl, sizeof fl);
+      CHECK(!strcmp(fl, "FPS 30  1280x720"), "fps line before the scene is known \"%s\"", fl); }
     /* English labels (TOTK_UI_LANG=en, or a Mac whose language is not Chinese). */
     setenv("TOTK_UI_LANG", "en", 1);
     shader_overlay_text(line, sizeof line, 3, 7428, 12);
     CHECK(!strcmp(line, "New shaders 3 / total 7428"), "English shader box text \"%s\"", line);
+    pso_overlay_text(line, sizeof line, 12, 3128);
+    CHECK(!strcmp(line, "New render pipelines 12 / total 3128"), "English render pipeline line \"%s\"", line);
     CHECK(!fps_overlay_line_pixel_font(line), "English shader line \"%s\" drawn with the pixel font, which lacks its lower-case letters", line);
     CHECK(fps_overlay_line_pixel_font("FPS 60  2560x1440"), "the FPS line left the pixel font");
-    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0}, 2, px, &grown, &h);
+    fps_overlay_raster(&(fps_overlay_info){97, 2560, 1440, 1, 0, 0, 0, 0}, 2, px, &grown, &h);
     CHECK(grown > base + 40, "English MetalFX on: \"  MetalFX on\" after the size (box %d, without it %d)", grown, base);
     setenv("TOTK_UI_LANG", "zh", 1);
     shader_overlay_text(line, sizeof line, 123456, 9999999, 123456);

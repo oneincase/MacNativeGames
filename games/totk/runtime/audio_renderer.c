@@ -89,7 +89,7 @@ static void skip_empty(AudioRenderer *r, ServerVoice *v) {
         if (b->loop && b->loop_count < 0) break;   /* an endless empty loop starves the voice, as on the DSP */
         v->valid[v->index] = 0; v->consumed++; v->offset = 0; v->loops_done = 0; v->index = (v->index + 1) & 3;
         if (r) r->empty_played++;
-        if (b->end_of_stream) { v->played = 0; break; }
+        if (b->end_of_stream) v->played = 0;
     }
 }
 static int stop_release(void) {
@@ -243,8 +243,11 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) 
         v->offset += step; v->played += step; samples -= step;
         if (v->offset < length) break;
         if (b->loop && (b->loop_count < 0 || v->loops_done < b->loop_count)) { v->loops_done++; v->offset = b->loop_start > b->start && b->loop_start < b->end ? (uint64_t)(b->loop_start - b->start) : 0; continue; }
+        /* End of stream only restarts the played-sample count (Ryujinx MarkEndOfBufferWaveBufferProcessing): the voice
+           goes on into the next queued buffer in the same frame. Breath of the Wild marks every streamed music buffer
+           so; stopping there left up to a frame of silence at each join, a steady stutter in the music (2026-10-22). */
         v->valid[v->index] = 0; v->consumed++; v->offset = 0; v->loops_done = 0; v->index = (v->index + 1) & 3;
-        if (b->end_of_stream) { v->played = 0; break; }
+        if (b->end_of_stream) v->played = 0;
         skip_empty(r, v);
     }
 }
@@ -310,6 +313,12 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
     case 7: rs->copy[rs->ncopy++] = runtime_event_readable(r->event); return;
     case 8: r->time_limit = IPC_ARG(rq, uint32_t, 0); return;
     case 9: { uint32_t v = r->time_limit ? r->time_limit : 100; IPC_OUT(rs, v); return; }
+#ifdef GAME_BOTW
+    /* Set/GetVoiceDropParameter (15.0.0+, Breath of the Wild 1.9.0): the scale of the voice-drop estimate when rendering
+       runs over its time limit. This mixer never drops voices, so the value is only kept and given back (default 1). */
+    case 12: r->voice_drop = IPC_ARG(rq, float, 0); r->voice_drop_set = 1; return;
+    case 13: { float v = r->voice_drop_set ? r->voice_drop : 1.0f; IPC_OUT(rs, v); return; }
+#endif
     default: ipc_unimplemented(s, rq);
     }
 }
@@ -593,6 +602,19 @@ void runtime_audio_probe(void) {
         }
         checked += 3;
         x.flush_wave_buffer_count = 0; x.in_use = 0; update_voice(r, &x);
+        /* 8. A buffer marked end of stream with another queued behind it: the voice plays on into that one in the same
+           frame (Breath of the Wild streams its music so; a frame of silence at each join was heard as a stutter). */
+        x.in_use = 1; x.is_new = 1; x.wave_buffer_index = 0;
+        x.wave_buffers[0] = (AudrenWaveBuffer){.address = (uint64_t)(uintptr_t)a7, .size = sizeof a7, .end = 100, .end_of_stream = 1};
+        x.wave_buffers[1] = (AudrenWaveBuffer){.address = (uint64_t)(uintptr_t)b7, .size = sizeof b7, .end = 480, .end_of_stream = 1};
+        x.wave_buffers[2] = (AudrenWaveBuffer){.sent = 1}; x.wave_buffers[3] = (AudrenWaveBuffer){.sent = 1};
+        update_voice(r, &x); audio_voices_prepare(r); audio_mixer_render(r, frame); advance_voice(r, sv7, frame);
+        if (sv7->consumed != 1 || sv7->index != 1 || sv7->offset != 140 || sv7->played != 140) {
+            fprintf(stderr, "end of stream: consumed %u index %u offset %llu played %llu, want 1 1 140 140\n", sv7->consumed, sv7->index, (unsigned long long)sv7->offset, (unsigned long long)sv7->played);
+            runtime_fail("audio probe: an end-of-stream buffer held up the buffer behind it");
+        }
+        checked += 4;
+        x.in_use = 0; update_voice(r, &x);
     }
     printf("{\"status\":\"pass\",\"probe\":\"probe-audio\",\"checked\":%d,\"scope\":\"REV15 wire parsing, native float voice/splitter biquads and consecutive request state; PCM16 channel mix, pitch interpolation, DSP-ADPCM decode, splitter to submix to final mix, device sink, stereo cascaded biquads, ordered submix reverb, auxiliary ring exchange, output limiter, bypass, frame continuity and reset\"}\n", checked);
 }

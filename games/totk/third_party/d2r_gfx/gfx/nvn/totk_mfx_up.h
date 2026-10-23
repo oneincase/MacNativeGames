@@ -30,3 +30,4 @@ int mfxup_prepare(int ctx, id<MTLTexture> src, id<MTLTexture> dst, NSUInteger ou
 id<MTLTexture> mfxup_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> src, NSUInteger out_w, NSUInteger out_h);
 id<MTLResidencySet> mfxup_residency(void);   // the contexts' own output textures (nil until one exists); the queue adds it once
 void mfxup_stats(int ctx, char *out, size_t n);
+uint64_t mfxup_switches(int ctx);   // times the current scaler changed to another cached one (logged once per scaler)

@@ -257,18 +257,21 @@ void runtime_diag_xpoke(unsigned off,float value){
 #endif
 static void patch_output_res(Module *m);
 static void patch_render_res(Module *m);
+static void patch_fixed_res(Module *m);
 void runtime_game_patches(Module *m) {
     runtime_survey_init(m);
     if (strcmp(m->name, "main")) runtime_fail("1.4.3 game patches expect main");
     patch_realtime(m);
     patch_output_res(m);
     patch_render_res(m);
+    patch_fixed_res(m);
     patch_slowmo_bounce(m);
 #if !TARGET_OS_IPHONE
     diag_main=m;   /* frmwatch / xpoke */
 #endif
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
-      aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
+      aspect_install(m, "1.4.3", sites, 4, 2, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
+                     ((m->text_end + 15) & ~15ULL) + 320,   /* Vert+ stubs (2 x 304 bytes): after the bounce veneer at +256, before the rewriter's code at +1024 */
                      (m->file_size + 0x3fff) & ~0x3fffULL); }
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
@@ -358,6 +361,32 @@ uint64_t runtime_output_res_extra_bytes(void){
     if(scene)grow*=1.6;
     uint64_t kib=(uint64_t)ceil(113664.0*(1+grow)/1024.0)*1024-113664;return kib<<10;
 }
+/* Key 3's picture mode is kept between runs in the file TOTK_PICTURE_MODE names (the launcher: <data>/picture-mode.txt;
+   unset: nothing is kept, as before). It holds one word: off, metalfx, native-2k or native-4k. The next start with
+   automatic output sizes begins in that mode; a size larger than this app's swapchain falls back to the largest one it
+   has (native-4k on a 2K app starts at native 2K). An explicit TOTK_OUTPUT_RES=<w>x<h> starts as it says. */
+static void picture_mode_save(uint64_t size){
+    const char *path=getenv("TOTK_PICTURE_MODE");if(!path||!*path)return;
+    extern int mfxup_output_enabled(void);
+    const char *mode=mfxup_output_enabled()?"metalfx":size==pack_size(2560,1440)?"native-2k":
+                     size==pack_size(3840,2160)?"native-4k":"off";
+    FILE *f=fopen(path,"w");
+    if(!f||fprintf(f,"%s\n",mode)<0||fclose(f)){fprintf(stderr,"[totk] picture mode: cannot write %s\n",path);return;}
+    fprintf(stderr,"[totk] picture mode %s kept for the next start\n",mode);
+}
+static void picture_mode_restore(uint8_t *page){
+    const char *path=getenv("TOTK_PICTURE_MODE");if(!path||!*path||output_full_at_start)return;
+    char mode[32]="";FILE *f=fopen(path,"r");if(!f)return;
+    if(!fgets(mode,sizeof mode,f))mode[0]=0;
+    fclose(f);mode[strcspn(mode,"\r\n")]=0;
+    unsigned w=1920,h=1080;
+    if(!strcmp(mode,"native-4k")&&output_w>=3840&&output_h>=2160){w=3840;h=2160;}
+    else if((!strcmp(mode,"native-4k")||!strcmp(mode,"native-2k"))&&output_w>=2560&&output_h>=1440){w=2560;h=1440;}
+    else if(!strcmp(mode,"metalfx")){extern void dm_gfx_set_flag(const char *,int);dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
+    else if(strcmp(mode,"off")){fprintf(stderr,"[totk] picture mode: %s holds \"%s\", not off, metalfx, native-2k or native-4k; starting off\n",path,mode);return;}
+    atomic_store((_Atomic uint64_t *)(void *)(page+32),pack_size(w,h));
+    fprintf(stderr,"[totk] picture mode: starts in %s (kept from the last run, %s)\n",mode,path);
+}
 static void patch_output_res(Module *m){
     unsigned w,h;if(!runtime_output_res(&w,&h))return;
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->text_end+15)&~15ULL)+16;
@@ -397,8 +426,10 @@ static void patch_output_res(Module *m){
     uint8_t *page=m->base+data;output_w=w;output_h=h;
     atomic_store((_Atomic uint64_t *)(void *)(page+32),output_full_at_start?pack_size(w,h):pack_size(1920,1080));
     atomic_store((_Atomic uint64_t *)(void *)(page+40),0);
+    picture_mode_restore(page);
     atomic_store(&output_page,page);   /* Publish initialized state to the HUD on the main thread. */
-    fprintf(stderr,"[totk] 1.4.3 output: %ux%u swapchain; starts %s, key 3 cycles MetalFX / native / off; display-config veneer +%#llx\n",w,h,output_full_at_start?"at requested resolution":"at 1920x1080",(unsigned long long)stub);
+    uint64_t start=atomic_load((_Atomic uint64_t *)(void *)(page+32));
+    fprintf(stderr,"[totk] 1.4.3 output: %ux%u swapchain; starts at %ux%u, key 3 cycles MetalFX / native / off; display-config veneer +%#llx\n",w,h,(unsigned)start,(unsigned)(start>>32),(unsigned long long)stub);
 }
 /* Render resolution (TOTK_RENDER_RES=<w>x<h>, e.g. 960x540) - the 1.4.3 port of game_patches.c's patch.
    1.4.3 keeps the same graphics-parameter entry (+0x30 of the mode entry: handheld 1280x720, docked 1600x900) and the
@@ -419,16 +450,33 @@ static void patch_output_res(Module *m){
    output width over 1920, on both axes (measured: 2560x1440 asked on a 2560x1440 canvas rendered 3408x1920, 3440x1440 on
    the 3440x1440 canvas 6160x2576). The data page therefore holds the asked size divided by that factor, rewritten when
    key 3 changes the canvas, so the scene is the size asked for on every canvas. */
-static uint8_t *render_page;static unsigned render_w,render_h;
+static uint8_t *render_page;static unsigned render_w,render_h;static int render_canvas;
 static void render_res_publish(unsigned canvas_w){
     if(!render_page)return;
     float k=canvas_w>1920?canvas_w/1920.0f:1.0f,v[2]={render_w/k,render_h/k};
+    if(render_canvas){v[0]=1920;v[1]=1080;render_w=(unsigned)(1920*k);render_h=(unsigned)(1080*k);}   /* the game's scaling makes it the canvas */
     memcpy(render_page+16,v,sizeof v);
     fprintf(stderr,"[totk] 1.4.3 render resolution: %ux%u on a %u-wide canvas (game size %.0fx%.0f, scaled by %.4f)\n",render_w,render_h,canvas_w,v[0],v[1],k);
 }
+/* On by default on both (user 2026-10-23: "两边默认都打开"; before, only with TOTK_RENDER_RES, as PR #19 brought it):
+   - Mac: the scene is the canvas's size, 1920x1080 on the 1080p canvas (the docked mode's own is 1600x900) and 2560x1440
+     on the 2K one (key 3), only ever up (the Mac never lowers resolution). The heaps grow with it (romfs.c picks the
+     <canvas>-scene-<size> HeapDef overlay build_app.py makes; the application pool follows).
+   - iPhone / iPad: 960x540 under the 1280x720 canvas, the game's own upscale (FSR 1 EASU, a3a570eb / ac58fc18) drawing it
+     there (user 2026-10-23: no MetalFX on the phone, as Breath of the Wild): the phone's GPU and memory are at their
+     limit; the same size as on the old port (2026-10-16, GPU 24.3 -> 17.3 ms, measured with MetalFX upscaling).
+   TOTK_RENDER_RES=<w>x<h> sets a size, =0 the game's own (no patch on the Mac; 1280x720 on the phone). */
 static int render_res(unsigned *w,unsigned *h){
     const char *e=getenv("TOTK_RENDER_RES");
-    if(!e||!*e||!strcmp(e,"0"))return 0;
+    if(e&&!strcmp(e,"0"))return 0;
+    if(!e||!*e){
+#if TARGET_OS_IPHONE
+        *w=960;*h=540;
+#else
+        render_canvas=1;unsigned ow,oh;if(runtime_output_res(&ow,&oh)){*w=ow;*h=oh;}else{*w=1920;*h=1080;}   /* the largest scene, for the heaps */
+#endif
+        return 1;
+    }
     char rest;
     if(sscanf(e,"%ux%u%c",w,h,&rest)!=2||*w<64||*h<64||*w>4096||*h>4096)runtime_fail("TOTK_RENDER_RES must be <width>x<height>");
     return 1;
@@ -471,6 +519,29 @@ static void patch_render_res(Module *m){
     fprintf(stderr,"[totk] 1.4.3 render resolution patch: scene render size %ux%u%s (4 instructions at main+0x585e48, value on the data page)\n",
             w,h,set?"":" (the game's handheld size; TOTK_RENDER_RES not set)");
 }
+/* TOTK_FIXED_RES=1: no dynamic resolution. The game's controller (main+0x584300, called from the renderer's per-frame update at
+   main+0x58196c) keeps a window of 24 frame-time samples, predicts the next frame's cost and steps through resolution tiers
+   (the scene came out at 3024x1888, 2712x1696, 2416x1512 on a 3024x1890 canvas: 100 %, 90 %, 80 %). It returns the tier's scale
+   as a float in the low word of x0 (bit 33 set: the tier did not change); the caller stores cc4 * scale / cc0 as the renderer's
+   scale at +0xccc. Every path leaves through one epilogue, so the single instruction that moves the scale into the result
+   (main+0x5848a8, mov w9, w23) is replaced by a move of 1.0f: the controller still runs and picks tiers, but every tier is 100 %.
+   The size the render-resolution patch above chooses (TOTK_RENDER_RES) stays; this only stops the dynamic part. */
+static void patch_fixed_res(Module *m){
+    const char *e=getenv("TOTK_FIXED_RES");
+    if(!e||!*e||!strcmp(e,"0"))return;
+#if TARGET_OS_IPHONE
+    fprintf(stderr,"[totk] TOTK_FIXED_RES: not available in the embedded build\n");(void)m;
+#else
+    const uint64_t site=0x5848a8;const uint32_t original=0x2a1703e9,replacement=0x52a7f009;   /* mov w9, w23 -> mov w9, #0x3f800000 */
+    uint32_t word;memcpy(&word,m->base+site,4);
+    if(word!=original){
+        fprintf(stderr,"[totk] fixed resolution patch main+%#llx: found %08x, expected %08x\n",(unsigned long long)site,word,original);
+        runtime_fail("fixed resolution patch: main does not match 1.4.3");
+    }
+    memcpy(m->base+site,&replacement,4);
+    fprintf(stderr,"[totk] 1.4.3 fixed resolution (TOTK_FIXED_RES): the dynamic resolution controller's scale is held at 100 %% (1 instruction at main+%#llx)\n",(unsigned long long)site);
+#endif
+}
 int runtime_output_res_toggle(void){
     if(!output_page)return 0;
     _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(output_page+32);
@@ -492,5 +563,7 @@ int runtime_output_mode_cycle(void){
     else{mfx=1;name="MetalFX 2K";}
     if(full!=native)runtime_output_res_toggle();
     dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
-    fprintf(stderr,"[totk] key 3: %s\n",name);return 1;
+    fprintf(stderr,"[totk] key 3: %s\n",name);
+    picture_mode_save(atomic_load((_Atomic uint64_t *)(void *)(output_page+32)));
+    return 1;
 }

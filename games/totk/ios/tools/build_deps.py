@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Build the audio and VP9 static libraries for a physical iOS device."""
-import os, subprocess, sys
+import os, subprocess, sys, tempfile
 from pathlib import Path
 
 out = Path(sys.argv[1]).resolve(); out.mkdir(parents=True, exist_ok=True)
+# libvpx's configure splits its compiler path and flags on spaces: when the work folder has one
+# (e.g. "Tears of the Kingdom/TOTK_build"), sources and build trees go under a space-free root instead.
+root = out if ' ' not in str(out) else Path(tempfile.gettempdir()).resolve()/'macnativegames-ios-deps'
 sdk = subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'], text=True).strip()
-src = out/'src'; build = out/'build'; src.mkdir(exist_ok=True); build.mkdir(exist_ok=True)
-sdklink=out/'sdkroot/Platforms/iPhoneOS.platform/Developer/SDKs'/Path(sdk).name
+src = root/'src'; build = root/'build'; src.mkdir(parents=True, exist_ok=True); build.mkdir(exist_ok=True)
+sdklink=root/'sdkroot/Platforms/iPhoneOS.platform/Developer/SDKs'/Path(sdk).name
 if sdklink.is_symlink(): sdklink.unlink()
 sdklink.parent.mkdir(parents=True,exist_ok=True)
 if not sdklink.exists(): sdklink.symlink_to(sdk)
@@ -41,7 +44,9 @@ vpx_env=dict(os.environ,PATH=str(bindir)+os.pathsep+os.environ.get('PATH',''))
 run([str(vpx/'configure'),'--target=arm64-darwin-gcc','--disable-examples','--disable-tools',
      '--disable-docs','--disable-unit-tests','--disable-webm-io','--enable-pic','--disable-shared','--enable-static',
      f'--extra-cflags=-target arm64-apple-ios26.0 -isysroot {sdklink} -miphoneos-version-min=26.0'], cwd=vpxout, env=vpx_env)
-run(['make','-j',str(os.cpu_count() or 4),'libvpx.a'],cwd=vpxout,env=vpx_env)
+# make takes the environment as its variables, and a DEVELOPER_DIR with a space ("/Volumes/x/Tears of the Kingdom /Xcode.app")
+# ends up in a shell command unquoted (127, 2026-10-23); the tools are the links in ios-bin, so make does not need it.
+run(['make','-j',str(os.cpu_count() or 4),'libvpx.a'],cwd=vpxout,env={k:v for k,v in vpx_env.items() if k!='DEVELOPER_DIR'})
 lib=out/'lib'; include=out/'include'; lib.mkdir(exist_ok=True); include.mkdir(exist_ok=True)
 import shutil
 shutil.copy2(opus_build/'libopus.a',lib/'libopus.a')

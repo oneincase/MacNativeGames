@@ -63,6 +63,20 @@ int main(void) {
     expect(mode_of("l2 = zr aim\n", 8, &line) == -1 && line == 1, "aim without a fire button");
     expect(mode_of("l2 = zr aim l2\n", 8, &line) == -1 && line == 1, "aim fired by itself");
     expect(mode_of("l2 = zr aim r2 extra\n", 8, &line) == -1 && line == 1, "aim with an extra word");
+    /* Mouse buttons (runtime/gamepad.m, key 7 on the Mac) are physical buttons 17-21. Default: left attacks (Y), right
+       draws the bow (ZR, released by a left click: the shot), middle targets (ZL), the side buttons drive nothing. */
+    enum { ML = 17, MR = 18, MM = 19, M4 = 20, M5 = 21 };
+    expect(CONTROLLER_BUTTONS == 22 && !strcmp(controller_physical_names[ML], "mouse_left") && !strcmp(controller_physical_names[MR], "mouse_right") &&
+           !strcmp(controller_physical_names[MM], "mouse_middle") && !strcmp(controller_physical_names[M4], "mouse4") && !strcmp(controller_physical_names[M5], "mouse5"),
+           "mouse button names");
+    expect(press("", 1ULL << ML, &line) == Y && !line, "left click attacks (Y)");
+    expect(press("", 1ULL << MR, &line) == ZR && mode_of("", MR, &line) == (CONTROLLER_AIM | ML << 3), "right button draws the bow, fired by the left");
+    expect(press("", 1ULL << MM, &line) == (1 << 8), "middle button targets (ZL)");
+    expect(press("", 1ULL << M4 | 1ULL << M5, &line) == 0, "side buttons drive nothing by default");
+    expect(press("mouse_right = zl\nmouse4 = minus\n", 1ULL << MR | 1ULL << M4, &line) == ((1 << 8) | (1 << 11)) && !line, "mouse buttons remapped");
+    expect(mode_of("mouse_right = zl\n", MR, &line) == CONTROLLER_HOLD, "a mouse line without a mode holds");
+    expect(mode_of("mouse_middle = zr aim mouse5\n", MM, &line) == (CONTROLLER_AIM | M5 << 3), "a side button as a fire button");
+    expect(mode_of("mouse_left = y tap\n", ML, &line) == CONTROLLER_TAP, "modes work on mouse buttons");
     if (failures) return 1;
     printf("PASS: controller layout cases\n");
     return 0;

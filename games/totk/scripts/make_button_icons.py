@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
-"""Make a RomFS mod that draws keyboard keys or Xbox controller buttons in place of the Switch button icons.
+"""Make a RomFS mod that draws keyboard keys, Xbox or PlayStation controller buttons in place of the Switch button icons.
 
 The A/B/X/Y, L/R, ZL/ZR, +/- and d-pad icons the game shows in its prompts are glyphs of one font,
-scft/External.bfotf in Font/Font.Nin_NX_NVN.bfarc.zs (private-use code points U+E040 to U+E068). This script reads that
-archive from the player's own RomFS, redraws those glyphs, packs the archive back the way the game stores it and writes
-it into a mod folder (runtime/romfs.c serves it in place of the original), then writes the folder's manifest.tsv with
-make_mod_manifest.py. Nothing of the game ships with the project: every font comes from the player's RomFS. The archive
-is the same in 1.0.0 and 1.2.1 (same SHA-256), so one mod folder per version is enough.
+scft/External.bfotf (private-use code points U+E040 to U+E068). Every font archive has its own copy: Korean and both
+Chinese read Font/Font_KRko, Font_CNzh and Font_TWzh.Nin_NX_NVN.bfarc.zs, every other language
+Font/Font.Nin_NX_NVN.bfarc.zs (1.4.3: the four copies are byte-identical). This script reads those archives from the
+player's own RomFS, redraws those glyphs, packs each archive back the way the game stores it and writes them into a mod
+folder (runtime/romfs.c serves them in place of the originals), then writes the folder's manifest.tsv with
+make_mod_manifest.py. The letters on the keys come from the text fonts of the default archive (the regional ones lack
+them). Nothing of the game ships with the project: every font comes from the player's RomFS. The default archive is the
+same in 1.0.0 and 1.2.1 (same SHA-256), so one mod folder per version is enough.
 
 Styles:
   keyboard  the keys the Mac keyboard plays (app/launcher.m): A B X Y = J K I U, L R = Q E, ZL ZR = Option Shift,
             + - = Enter Tab, left stick = W A S D, right stick = arrow keys, stick presses = Z C, d-pad = T F G H.
   xbox      the buttons in the place a controller presses them (controllers follow the Switch's physical layout):
             A B X Y = B A Y X, L R = LB RB, ZL ZR = LT RT, + - = Menu and View, the d-pad as a cross.
+  playstation  DualSense / DualShock symbols by position like xbox: A B X Y = Circle Cross Triangle Square,
+            L R = L1 R1, ZL ZR = L2 R2, + - = Options and Create, the d-pad as a cross.
+  playstation-label  the same, but A B X Y = Cross Circle Square Triangle, for TOTK_FACE_BUTTONS=label or a
+            controls.txt with south = a, east = b, west = x, north = y.
 Prompts drawn as fixed images (some tutorial animations) keep the Switch icons: they are not glyphs of this font.
 
 Format notes (checked on 1.0.0 and 1.2.1): a .bfotf is an OpenType (CFF) font with an 8-byte header, XOR-ed with a
 32-bit key; the first word XOR 0x18029a7f gives the key and the second word, XOR the key, holds the big-endian size.
 The archive is a SARC; its members are packed again in their original order and alignment, and every member except
-External.bfotf must come out byte-identical. The archive is compressed with the zstd dictionary it used (Pack/ZsDic).
+External.bfotf must come out byte-identical. Each archive is compressed with the zstd dictionary it used (Pack/ZsDic).
+The redrawn archives are about 1.4 KB larger than the originals, past the few hundred bytes the game's resource size table
+leaves them (System/Resource/ResourceSizeTable.Product.<n>.Nin_NX_NVN.rsizetable.zs: a RESTBL, entries keyed by the CRC32
+of the path without .zs), and the game stops at start when it loads one. So the script also writes that table into the
+mod with each archive's entry at least the original entry plus what the archive grew; a table already in the mod folder
+(another mod's, or an earlier run) is the one it edits, so running again changes nothing more.
 
 Needs fontTools (python3.14 -m pip install fonttools) and Python 3.14 (compression.zstd). An existing font archive in the mod
 folder (another mod's, or an earlier run) is only overwritten with --replace. The xbox style matches the default face-button
@@ -29,13 +41,14 @@ import argparse
 import io
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 try:
     import compression.zstd as zstd
 except ImportError:
     sys.exit('needs Python 3.14 (compression.zstd): run it with python3.14')
-from make_mod_manifest import VERSIONS, manifest, read_index
+from make_mod_manifest import VERSIONS, read_index, write_manifest
 
 try:
     from fontTools.pens.boundsPen import BoundsPen
@@ -47,10 +60,29 @@ try:
 except ImportError:
     sys.exit('needs fontTools: pip install fonttools')
 
-ARCHIVE = 'Font/Font.Nin_NX_NVN.bfarc.zs'
+ARCHIVE = 'Font/Font.Nin_NX_NVN.bfarc.zs'  # the default archive; the text fonts for the key letters are read from it
 FONT = 'scft/External.bfotf'
 TEXT_FONTS = ('scft/ninP_RodinNTLG-B_DH_003_subset.bfotf', 'scft/nintendo_NTLG-DB_DH_002.bfotf')
 MAGIC = 0x18029a7f
+
+
+def restbl_offsets(table):
+    """CRC32 of a RomFS path without .zs -> offset of its size in the RESTBL `table`."""
+    assert table[:6] == b'RESTBL'
+    count = struct.unpack_from('<I', table, 14)[0]
+    return {struct.unpack_from('<I', table, 22 + i * 8)[0]: 22 + i * 8 + 4 for i in range(count)}
+
+
+def grow_restbl(table, original, growth):
+    """`table` with the entry of each path in `growth` (RomFS path -> bytes) at least its entry in the `original` table
+    plus that growth."""
+    at, base = restbl_offsets(table), restbl_offsets(original)
+    out = bytearray(table)
+    for path, extra in growth.items():
+        h = zlib.crc32(path.removesuffix('.zs').encode())
+        need = struct.unpack_from('<I', original, base[h])[0] + extra
+        struct.pack_into('<I', out, at[h], max(struct.unpack_from('<I', out, at[h])[0], need))
+    return bytes(out)
 
 
 def sarc_members(data):
@@ -279,7 +311,71 @@ def xbox_style(g):
     }
 
 
-STYLES = {'keyboard': keyboard_style, 'xbox': xbox_style}
+def oriented(pen, points, hole):
+    """A polygon counter-clockwise (filled) or clockwise (a hole), whatever order the points come in."""
+    area = sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(points, points[1:] + points[:1]))
+    polygon(pen, points if (area > 0) != hole else points[::-1])
+
+
+def playstation_style(g, by_label=False):
+    """DualSense / DualShock symbols. By position (the default mapping): A B X Y = Circle Cross Triangle Square.
+    by_label (TOTK_FACE_BUTTONS=label, or controls.txt south = a, east = b, west = x, north = y): Cross Circle Square Triangle."""
+    def face(symbol, advance=640):
+        def draw(pen):
+            cx, s = advance / 2, R * 0.50   # symbol half size
+            circle(pen, cx, CY, R)
+            if symbol == 'circle':
+                circle(ReverseContourPen(pen), cx, CY, s); circle(pen, cx, CY, s * 0.70)
+            elif symbol == 'square':
+                oriented(pen, [(cx - s, CY - s), (cx + s, CY - s), (cx + s, CY + s), (cx - s, CY + s)], hole=True)
+                t = s * 0.70
+                oriented(pen, [(cx - t, CY - t), (cx + t, CY - t), (cx + t, CY + t), (cx - t, CY + t)], hole=False)
+            elif symbol == 'triangle':
+                pts = [(cx, CY + s * 1.10), (cx - s * 1.10, CY - s * 0.75), (cx + s * 1.10, CY - s * 0.75)]
+                gx, gy = cx, sum(y for _, y in pts) / 3
+                oriented(pen, pts, hole=True)
+                oriented(pen, [(gx + (x - gx) * 0.62, gy + (y - gy) * 0.62) for x, y in pts], hole=False)
+            else:   # cross: one 12-point outline, so the two strokes do not overlap as separate holes
+                a, w = s * 1.05, s * 0.22 * 2 ** 0.5   # arm reach along the diagonal, half stroke width
+                pts = [(cx, CY + w), (cx + a - w, CY + a), (cx + a, CY + a - w), (cx + w, CY),
+                       (cx + a, CY - a + w), (cx + a - w, CY - a), (cx, CY - w), (cx - a + w, CY - a),
+                       (cx - a, CY - a + w), (cx - w, CY), (cx - a, CY + a - w), (cx - a + w, CY + a)]
+                oriented(pen, pts, hole=True)
+        return advance, draw
+    def bumper(label, advance=820):
+        def draw(pen):
+            rounded(pen, 40, Y0 + 70, advance - 40, Y1 - 70, 70, 150); g.hole(pen, label, advance / 2, CY, 230, advance - 200)
+        return advance, draw
+    def trigger(label, advance=760):
+        def draw(pen):
+            rounded(pen, 60, Y0, advance - 60, Y1, 60, 230); g.hole(pen, label, advance / 2, CY - 20, 230, advance - 220)
+        return advance, draw
+    def options(advance=640):   # three bars, as on the DualSense Options button
+        def draw(pen):
+            circle(pen, advance / 2, CY, R); reverse = ReverseContourPen(pen)
+            for dy in (-115, 0, 115):
+                rounded(reverse, advance / 2 - 150, CY + dy - 38, advance / 2 + 150, CY + dy + 38, 38)
+        return advance, draw
+    def create(advance=640):   # three short strokes rising to the right, as on the Create button
+        def draw(pen):
+            circle(pen, advance / 2, CY, R); cx = advance / 2
+            for dx in (-110, 0, 110):
+                oriented(pen, [(cx + dx - 30, CY - 150), (cx + dx + 30, CY - 150), (cx + dx + 30, CY + 150), (cx + dx - 30, CY + 150)], hole=True)
+        return advance, draw
+    dpad_style = xbox_style(g)
+    a, b, x, y = ('cross', 'circle', 'square', 'triangle') if by_label else ('circle', 'cross', 'triangle', 'square')
+    icons = {
+        0xE040: face(a), 0xE041: face(b), 0xE042: face(x), 0xE043: face(y),
+        0xE044: bumper('L1'), 0xE045: bumper('R1'), 0xE046: trigger('L2'), 0xE047: trigger('R2'),
+        0xE04B: options(), 0xE04C: create(),
+    }
+    for cp in (0xE049, 0xE060, 0xE061, 0xE062, 0xE063, 0xE064, 0xE065):   # the d-pad is drawn as for Xbox
+        icons[cp] = dpad_style[cp]
+    return icons
+
+
+STYLES = {'keyboard': keyboard_style, 'xbox': xbox_style, 'playstation': playstation_style,
+          'playstation-label': lambda g: playstation_style(g, by_label=True)}
 
 
 def redraw(otf, text_fonts, style):
@@ -315,14 +411,16 @@ def main():
         if not version:
             parser.error('name the game version with --version (or name the mod folder v0, v112, v121 or v143)')
         romfs = args.app / f'Contents/Resources/totk/extracted/{version}/romfs'
-    if (args.mod / ARCHIVE).exists() and not args.replace:
-        parser.error(f'{args.mod / ARCHIVE} already exists (another mod\'s font archive, or an earlier run): '
-                     'pass --replace to overwrite it')
     for need in ('romfs.bin', 'runtime-index.bin'):
         if not (romfs / need).is_file():
             parser.error(f'{romfs / need} not found')
 
     index = read_index(romfs / 'runtime-index.bin')
+    archives = [ARCHIVE] + sorted(p for p in index if p.startswith('Font/') and p.endswith('.bfarc.zs') and p != ARCHIVE)
+    existing = [str(args.mod / p) for p in archives if (args.mod / p).exists()]
+    if existing and not args.replace:
+        parser.error(f'{", ".join(existing)} already exist(s) (another mod\'s font archive, or an earlier run): '
+                     'pass --replace to overwrite')
     with (romfs / 'romfs.bin').open('rb') as image:
         def read(path):
             offset, size = index[path]; image.seek(offset); data = image.read(size); assert len(data) == size; return data
@@ -330,28 +428,45 @@ def main():
         pack = zstd.decompress(read('Pack/ZsDic.pack.zs'))
         for lo, hi in sarc_members(pack).values():
             d = zstd.ZstdDict(pack[lo:hi]); dictionaries[d.dict_id] = d
-        raw = read(ARCHIVE)
-    info = zstd.get_frame_info(raw); dictionary = dictionaries[info.dictionary_id]
-    archive = zstd.decompress(raw, zstd_dict=dictionary); assert len(archive) == info.decompressed_size
-    members = sarc_members(archive)
-    otf, key = bfotf_decode(archive[slice(*members[FONT])])
-    assert otf[:4] == b'OTTO', 'External.bfotf did not decode to an OpenType font'
-    text_fonts = [TTFont(io.BytesIO(bfotf_decode(archive[slice(*members[name])])[0])) for name in TEXT_FONTS]
-    new_otf, count = redraw(otf, text_fonts, args.style)
-    new_blob = bfotf_encode(new_otf, key); assert bfotf_decode(new_blob)[0] == new_otf
-    new_archive = repack(archive, FONT, new_blob)
-    data = zstd.compress(new_archive, level=19, zstd_dict=dictionary)
-    assert zstd.decompress(data, zstd_dict=dictionary) == new_archive
-    assert zstd.get_frame_info(data).dictionary_id == info.dictionary_id
+        raws = {path: read(path) for path in archives}
+        restbl = next(p for p in index if p.startswith('System/Resource/ResourceSizeTable.') and p.endswith('.rsizetable.zs'))
+        restbl_raw = read(restbl)
 
-    target = args.mod / ARCHIVE; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
-    print(f'{target}: {count} icons redrawn ({args.style}), {len(data)} bytes')
-    lines, _, added, misspelt = manifest(args.mod, romfs)
-    if misspelt:
-        sys.exit('manifest not written: ' + ', '.join(f'{a} (the RomFS has {b})' for a, b in misspelt))
-    (args.mod / 'manifest.tsv').write_text('# path\tsize\tsha256\toriginal_sha256 (generated by scripts/make_mod_manifest.py)\n'
-                                           + '\n'.join(lines) + '\n')
-    print(f'{args.mod / "manifest.tsv"}: {len(lines)} files ({len(lines) - len(added)} replaced, {len(added)} added)')
+    text_fonts, redrawn, growth = None, {}, {}
+    for path in archives:
+        info = zstd.get_frame_info(raws[path]); dictionary = dictionaries[info.dictionary_id]
+        archive = zstd.decompress(raws[path], zstd_dict=dictionary); assert len(archive) == info.decompressed_size
+        members = sarc_members(archive)
+        if FONT not in members:
+            continue
+        if text_fonts is None:
+            text_fonts = [TTFont(io.BytesIO(bfotf_decode(archive[slice(*members[name])])[0])) for name in TEXT_FONTS]
+        otf, key = bfotf_decode(archive[slice(*members[FONT])])
+        assert otf[:4] == b'OTTO', f'External.bfotf in {path} did not decode to an OpenType font'
+        if otf not in redrawn:
+            redrawn[otf] = redraw(otf, text_fonts, args.style)
+        new_otf, count = redrawn[otf]
+        new_blob = bfotf_encode(new_otf, key); assert bfotf_decode(new_blob)[0] == new_otf
+        new_archive = repack(archive, FONT, new_blob)
+        data = zstd.compress(new_archive, level=19, zstd_dict=dictionary)
+        assert zstd.decompress(data, zstd_dict=dictionary) == new_archive
+        assert zstd.get_frame_info(data).dictionary_id == info.dictionary_id
+
+        growth[path] = len(new_archive) - len(archive)
+        target = args.mod / path; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
+        print(f'{target}: {count} icons redrawn ({args.style}), {len(data)} bytes')
+
+    target = args.mod / restbl
+    original = zstd.decompress(restbl_raw)
+    table = zstd.decompress(target.read_bytes()) if target.exists() else original
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(zstd.compress(grow_restbl(table, original, growth), level=19))
+    print(f'{target}: ' + ', '.join(f'{p} {g:+d}' for p, g in growth.items()))
+    found = write_manifest(args.mod, romfs)
+    if found.misspelt:
+        sys.exit('manifest not written: ' + ', '.join(f'{a} (the RomFS has {b})' for a, b in found.misspelt))
+    print(f'{args.mod / "manifest.tsv"}: {len(found.lines)} files '
+          f'({len(found.lines) - len(found.added)} replaced, {len(found.added)} added)')
 
 
 if __name__ == '__main__':

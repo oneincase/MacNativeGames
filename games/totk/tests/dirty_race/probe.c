@@ -87,6 +87,39 @@ static void stamp_order(size_t pg) {
     EXPECT("#90: stamp after protect (old order): the writes are missed", 0, nvn_dirty_since(page, 16, after));
 }
 
+#if defined(GAME_BOTW)
+/* BOTW: pool B starts on pool A's last page. B gets a range for its own pages only; a texture of B across the border is
+   tracked through both ranges; destroying B keeps A's range (the Hero's Path bug), destroying A first leaves B's texture
+   untracked (dirty) and A's protected page writable; a pool inside A has no range and its destruction leaves A alone. */
+static void overlap(size_t pg) {
+    uint8_t *R = mmap(NULL, 6 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (R == MAP_FAILED) { perror("mmap"); exit(2); }
+    uint8_t *A = R, *B = R + 2 * pg + pg / 2, *C = R + pg / 2; size_t as = 2 * pg + pg / 2, bs = 2 * pg, ts = pg + pg / 2;
+    nvn_dirty_add_range(A, as); nvn_dirty_add_range(B, bs);
+    EXPECT("BOTW: B's texture across A's last page is tracked", 1, nvn_dirty_tracked(B, ts));
+    uint64_t s = nvn_dirty_now(); nvn_dirty_protect(B, ts);
+    EXPECT("BOTW: no write yet: clean", 0, nvn_dirty_since(B, ts, s));
+    R[3 * pg + 8] = 1;   // B's own page, through the fault handler
+    EXPECT("BOTW: a write to B's own page is seen", 1, nvn_dirty_since(B, ts, s));
+    s = nvn_dirty_now(); nvn_dirty_protect(B, ts);
+    R[2 * pg + 8] = 1;   // the shared page, in A's range
+    EXPECT("BOTW: a write to the shared page is seen", 1, nvn_dirty_since(B, ts, s));
+    EXPECT("BOTW: ... and A's own texture there too", 1, nvn_dirty_since(A + 2 * pg, 16, s));
+    nvn_dirty_add_range(C, pg / 4); nvn_dirty_remove_range(C);
+    EXPECT("BOTW: a pool inside A gone: A still tracked", 1, nvn_dirty_tracked(A, as));
+    nvn_dirty_remove_range(B);
+    EXPECT("BOTW: B gone: A still tracked", 1, nvn_dirty_tracked(A, as));
+    EXPECT("BOTW: B gone: its own pages untracked", 0, nvn_dirty_tracked(R + 3 * pg, 16));
+    nvn_dirty_add_range(B, bs); s = nvn_dirty_now(); nvn_dirty_protect(B, ts);
+    nvn_dirty_remove_range(A);
+    R[2 * pg + 8] = 2;   // writable again (a read-only page with no range would crash here)
+    EXPECT("BOTW: A gone first: the shared page is writable", 2, R[2 * pg + 8]);
+    EXPECT("BOTW: A gone first: B's texture across it is untracked", 0, nvn_dirty_tracked(B, ts));
+    EXPECT("BOTW: ... and counts as dirty", 1, nvn_dirty_since(B, ts, s));
+    EXPECT("BOTW: B's own pages still tracked", 1, nvn_dirty_tracked(R + 3 * pg, pg));
+    nvn_dirty_remove_range(B);
+}
+#endif
 int main(void) {
     g_negative = getenv("TOTK_PROBE_NEGATIVE") != NULL;
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_signal; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
@@ -131,6 +164,9 @@ int main(void) {
     EXPECT("an untouched one in between is clean", 0, nvn_dirty_since(many + (size_t)(MANY / 2) * pg, 16, s2));
     if (busy_protect(pg)) return 2;
     stamp_order(pg);
+#if defined(GAME_BOTW)
+    overlap(pg);
+#endif
     printf("{\"status\":\"%s\",\"checks\":%d,\"failed\":%d}\n", g_fail ? "fail" : "pass", g_checks, g_fail);
     return g_fail != 0;
 }

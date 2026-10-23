@@ -6,7 +6,7 @@ translator (`vendor/ryujinx`, MIT) with this project's patches (`games/totk/tool
 reflection file), compiled ahead of time with .NET NativeAOT for arm64 macOS. It is here so that building the app needs
 no .NET and the app needs no .NET runtime and no Python.
 
-- Built with `games/totk/tools/totk_xlate/publish_native.sh` from the sources in this repository (.NET SDK 10.0.301).
+- Built with `games/totk/tools/totk_xlate/publish_native.sh` from the sources in this repository (.NET SDK 10.0.301; rebuilt with 10.0.402 for early fragment tests).
 - `totk_xlate.sha256` is its SHA-256; `build_app.py` refuses to package a different file.
 - NativeAOT builds are not byte-for-byte reproducible across folders (paths end up in the binary), so a rebuild gets a
   different hash; what matters is that it translates the same. Check a rebuild by replaying a shader cache through it
@@ -17,3 +17,7 @@ no .NET and the app needs no .NET runtime and no Python.
   gained the initialisation of their outputs and nothing else changed (see docs/how-it-works.md).
   The depth sampling rewrite after PR #104 (Service.cs MatchSwitchDepthSampling) changes 2,650 of the 20,368 seed MSL
   files of a 1.4.3 build, each exactly by the two rewrites; reflection and every other file are unchanged.
+  The early fragment tests flag (request field early_fragment_tests, NVN control +0x718) changes 1,722 of the 33,264
+  seed MSL files of a 1.4.3 build, each only by `[[ early_fragment_tests ]]` before the fragment entry, all of them
+  fragment shaders with the flag; the reflection files differ only by the chain name. Without the field, 1,380 replayed
+  variants of a player cache translate to the same MSL and reflection as the previous build.

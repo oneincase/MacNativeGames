@@ -151,8 +151,9 @@ static inline int rt_dup_of(const p_set_rt *r, int i) {
 /* "ashot <path>" requests (end of nvn_mtl.m), taken at the game's present call with the screenshot queue lock held */
 void botw_ashot_poll(const void *t, long cur);
 #define BOTW_ASHOT_POLL(t, cur) botw_ashot_poll((t), (cur));
-/* Uncapped pacing ignores the game's present interval 2 by default (up to 120 fps; user 2026-10-19: "放开到120帧"); the
-   real-time frame step keeps the game's speed (botw.md). TOTK_UNCAPPED_INTERVAL=0 keeps the interval (up to 60 fps). */
+/* Uncapped pacing ignores the game's present interval 2 by default (user 2026-10-19: "放开到120帧"; 2026-10-22: 120 by default, up to 240 with TOTK_UNCAPPED_HZ); the
+   real-time frame step keeps the game's speed (botw.md). TOTK_UNCAPPED_INTERVAL=0 keeps the interval where a clock
+   divides it (TOTK_UNCAPPED_HZ, or the display rate on a phone). */
 #define UNCAPPED_INTERVAL_FROM_ENV(e) ((e) ? atoi(e) != 0 : 1)
 /* TOTK_T2B_LOG=1 (diagnostics, the black save thumbnail): every texture-to-buffer copy is logged with its source
    texture and destination, and after the GPU is done with how many destination bytes are not zero (end of nvn_mtl.m) */
@@ -174,11 +175,16 @@ int botw_dead_keep(uint64_t serial);
 void botw_dead_forget(const uint64_t *serials, size_t n);
 #define BOTW_DEAD_FORGET(s, n) botw_dead_forget((s), (n));
 /* Key 3 (MetalFX 2K): Breath of the Wild's own upscale of the finished 1600x900 picture into the 1920x1080 canvas is the
-   fragment shader 0af88d51 (a 3-vertex triangle: five texel reads around the fragment's own coordinates, an edge-directed
+   fragment shader bd7ffdd4 (a 3-vertex triangle: texel reads around the fragment's own coordinates, an edge-directed
    sharpening of the sampled colour; no dynamic resolution, so the valid region is the whole source). MetalFX replaces the
    whole draw (mfxup_dock; botw.md). */
 void botw_mfx_scene_ready(void);   /* the upscale draw happened (or MetalFX replaced it): the canvas holds the scene */
-#define BOTW_MFXUP_DOCK_KEY(fs) int botw_ = !strncmp((fs)->key, "0af88d51bb12a2346b03bb2586d131def5a631271df192779b701efba6eb7f70-", 65); if (botw_) botw_mfx_scene_ready();
+/* The same shader in 1.6.0 and 1.9.0. It was first recorded as 0af88d51, the key the runtime gave it before the control
+   section's own size went into the key (2026-10-20, botw.md); its code is byte for byte that of bd7ffdd4, the key since,
+   so 1.6.0 never matched the old one: no scene for key 2 (#177) and no MetalFX in place of the upscale for key 3
+   (2026-10-23). 1.9.0 found bd7ffdd4 by its 1600x900 source and 1920x1080 target on the Kakariko route. */
+#define BOTW_MFXUP_KEY "bd7ffdd435c6c3bc997653d5fb9a0cc7f2f411dd51ce88c3cafe6574c8624908-"
+#define BOTW_MFXUP_DOCK_KEY(fs) int botw_ = !strncmp((fs)->key, BOTW_MFXUP_KEY, 65); if (botw_) botw_mfx_scene_ready();
 #define BOTW_AND_NOT_DOCK && !botw_
 #define BOTW_MFXUP_DOCK_REGION(cw, ch, src) if (botw_ && !why) { (cw) = (src).width; (ch) = (src).height; }
 /* Breath of the Wild's upscale draw writes RGB only (mask 0x7): the canvas keeps its cleared alpha, which nothing reads
@@ -193,12 +199,45 @@ int botw_mfx_ui_draw(void *prog);   /* a draw into the canvas after the upscale 
 void botw_mfx_frame_reset(void);
 #define MFX_UI_DRAW(pr) botw_mfx_ui_draw((__bridge void *)(pr))
 #define BOTW_MFX_FRAME_RESET() botw_mfx_frame_reset();
+/* A frame that draws no UI into the canvas has no scene copy; the first draw into a presented texture after the upscale
+   takes the whole canvas as the scene and clears the UI layer (end of nvn_mtl.m). */
+void botw_mfx_no_ui_scene(void);
+#define BOTW_MFX_NO_UI_SCENE() botw_mfx_no_ui_scene();
+/* Key 4 (ultrawide, game_patches_botw.c): every draw of this game into the canvas is a 6-index quad of its UI layouts
+   (HUD, menus, map, the inventory's Link) except the upscale of the scene (a full-screen triangle) and the menus'
+   blurred picture of it (a quad, botw_uw_scene_picture), which keep the full width. The quads drawn before the upscale are covered by it, so all of
+   them are squeezed back to the middle 16:9 (the game's UI shaders are not TOTK's). */
+#define UW_UI_BEGINS(pr) 1
+int botw_uw_scene_picture(void);   /* end of nvn_mtl.m */
+#define UW_NOT_UI_DRAW(vs, dw, di) ((dw ? dw->count : di ? di->count : 0) != 6 || botw_uw_scene_picture())
 #define MFX_CAM_SLOT 0
 #define MFX_CAM_SIZE 2336
+/* Write-back staging (docs/botw-v1.9.0-port.md; end of nvn_mtl.m). Breath of the Wild invalidates 1x1 and 3x3 GPU-written textures every
+   frame. The write-back waited for all GPU work (mtl_finish_gpu) and made one blit round trip per texture on the game
+   thread: Kakariko ran at 49 FPS, 59 with "flag writeback 0". Now the submission that renders such a texture copies it
+   into a shared stage buffer at its end (botw_wb_stage_encode); the invalidate waits only for the fences of the listed
+   renderings and swizzles a staged texture from its stage. fence: the submission that rendered it last; stage_fence:
+   the submission whose end copied it into stage. */
+#define BOTW_WB_ENT_FIELDS uint64_t fence; void *stage; uint64_t stage_fence;
+void botw_wb_sub_note(uint64_t serial);
+#define BOTW_WB_NOTED(e, k) (e)->fence = g_fence + 1; botw_wb_sub_note(k);
+#define BOTW_WB_STAGE_FREE(e) if ((e)->stage) { defer_obj_release((__bridge id)(e)->stage); CFRelease((e)->stage); }
+void botw_wb_stage_encode(void);
+#define BOTW_WB_STAGE() botw_wb_stage_encode();
+#define WB_WAIT_GPU(list, nl) { uint64_t need_ = 0; for (int i_ = 0; i_ < (nl); i_++) { if ((list)[i_]->fence > need_) need_ = (list)[i_]->fence; \
+        if ((list)[i_]->stage_fence > need_) need_ = (list)[i_]->stage_fence; } if (need_) mtl_wait(need_, UINT64_MAX); while (atomic_load(&g_up_pending)) usleep(1000); }
+int botw_wb_from_stage(void *e);   /* 1 written back from the stage, 0 failed, -1 not staged */
+#define BOTW_WB_FROM_STAGE(e, ok, layers) { int s_ = botw_wb_from_stage(e); if (s_ >= 0) { (ok) = s_; (layers) = 0; } }
+/* BOTW (nvn_mtl.m, after a re-upload): the range that tracked the texture can be gone by now (a neighbour pool destroyed,
+   nvn_dirty.c); its protect then did nothing, and a kept "tracked" would let the replay's shortcut call it clean next time */
+#define BOTW_REUP_TRACKED(pk, t) (pk)->tracked = nvn_dirty_tracked((t)->mem, (t)->L.size);
 #else
 #define MFX_CANVAS_FMT_OK(f) pf_is_float(f)
 #define MFX_UI_DRAW(pr) mfx_ui_vs(pr->sh[0]->key)
+#define UW_UI_BEGINS(pr) mfx_ui_vs(pr->sh[0]->key)
+#define UW_NOT_UI_DRAW(vs, dw, di) !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6
 #define BOTW_MFX_FRAME_RESET()
+#define BOTW_MFX_NO_UI_SCENE()
 #define MFX_CAM_SLOT 1
 #define MFX_CAM_SIZE 2368
 #define BOTW_MFXUP_MASK_BAD (S.chmask.mask & 0xf) != 0xf
@@ -213,12 +252,34 @@ void botw_mfx_frame_reset(void);
 #define BOTW_DEAD_KEEP(k)
 #define BOTW_TEX_RELEASE_KEEP(k)
 #define BOTW_DEAD_FORGET(s, n)
+#define BOTW_WB_ENT_FIELDS
+#define BOTW_WB_NOTED(e, k)
+#define BOTW_WB_STAGE_FREE(e)
+#define BOTW_WB_STAGE()
+#define WB_WAIT_GPU(list, nl) mtl_finish_gpu();
+#define BOTW_WB_FROM_STAGE(e, ok, layers)
 #define UNCAPPED_INTERVAL_FROM_ENV(e) e && atoi(e)
 #define BOTW_RT_DUP_CLEARS()
 #define BOTW_RT_DUP_SKIP(i)
 #define BOTW_RT_DUP_PREDICT(r, cf)
 #define BOTW_RT_DUP_CLEAR_TO_FIRST(c)
 #define BOTW_ASHOT_POLL(t, cur)
+#define BOTW_REUP_TRACKED(pk, t)
+#endif
+/* Key 5 (MetalFX temporal anti-aliasing, totk_taa.m): the compose draw that samples the linear HDR scene at fragment
+   texture slot 0 before tone mapping. TOTK: 0ac9a549 (tone mapping and bloom). Breath of the Wild 1.9.0: f7ee6fe1 (two
+   texel reads: the 1600x900 R11G11B10F scene at slot 0, the 320x180 bloom at slot 1; it writes the 1600x900 RGB10A2
+   picture that the upscale draw bd7ffdd4 then reads), found by those textures on the Kakariko route. 1.6.0: d14b1c38,
+   from the same archive (uking_pass_shader.sharcb), the same 1280 bytes of code and 99.4 % of its instruction words
+   equal to 1.9.0's (the nearest of all 1.6.0 fragment shaders; the next is 57 %); f7ee6fe1 is not in 1.6.0 (#178). */
+#ifdef GAME_BOTW
+#ifdef GAME_BOTW190
+#define TAA_COMPOSE(fs) !strncmp(fs->key, "f7ee6fe10b925543e905dfc9437ce67dc21a118d465b03bb3c9eccafdf2e33c4-", 65)
+#else
+#define TAA_COMPOSE(fs) !strncmp(fs->key, "d14b1c38f70d2ed8355a18183099d088e798b831f919c8be4d1f797a3cdc2689-", 65)
+#endif
+#else
+#define TAA_COMPOSE(fs) !strncmp(fs->key, "0ac9a54938974396", 16)
 #endif
 typedef struct { float depth; int32_t depth_mask, stencil, stencil_mask; } p_clear_ds;
 typedef struct { int32_t first, n; float v[16][6]; } p_viewports;          // x, y, w, h, 近, 远（近远由 DEPTH_RANGE 覆盖） | x, y, w, h, near, far (near and far are overridden by DEPTH_RANGE)
@@ -298,6 +359,7 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v);
 void mtl_reg_samp(int id, const samp_par *p);
 void mtl_prog_release(prog_t *p);
+void mtl_prog_prefetch(const prog_t *p);   // TOTK_SHADER_PREFETCH=1: start compiling the program's known shader variants in the background
 // 新序号（> 0，全局递增）
 // New serial (> 0, globally increasing)
 uint64_t nvn_new_serial(void);

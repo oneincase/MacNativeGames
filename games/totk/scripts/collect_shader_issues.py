@@ -3,15 +3,16 @@
 issue form) into games/totk/assets/shader_list.tsv; with --game botw, Breath of the Wild's (label shader-list-botw, its own
 form) into games/botw/assets/shader_list.tsv.
 
-A player's game writes shader-list-contribution.txt (third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h) and every 500
+A player's game writes shader-list-contribution.txt (third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h) and every 50
 new rows asks the player to attach it to such an issue. "Submit automatically" (gh on the player's Mac) sends it as a
 secret gist linked from an issue titled "Shader list: ..." in the form's layout; such an issue has no label (GitHub drops
 labels set by people without write access), so issues are found by label or by that title. This tool downloads each
-attachment or gist file, keeps only V rows (shader key + bind state; anything else in a contribution is dropped) and
-reports what each issue adds. Nothing changes unless
+attachment or gist file, keeps only V rows (shader key + bind state) and R / B rows (render pipelines; anything else in a contribution is dropped) and
+reports what each issue adds. With --seed (a prepared seed of the selected game version), rows its built-in variants
+serve are dropped too: the list keeps only non-default variants (user 2026-10-22). Nothing changes unless
 asked: --apply writes the list, --close also thanks each merged issue and closes it.
 
-usage: collect_shader_issues.py [--game totk|botw] [--repo owner/name] [--apply] [--close] [--issue N ...]
+usage: collect_shader_issues.py [--game totk|botw] [--repo owner/name] [--seed <seed folder>] [--apply] [--close] [--issue N ...]
 needs: the GitHub CLI (gh), signed in."""
 import argparse
 import json
@@ -23,7 +24,8 @@ from pathlib import Path
 
 TOTK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOTK / 'scripts'))
-from shader_list import KEY, ShaderList, canonical  # noqa: E402
+from shader_list import KEY, ShaderList, canonical, warm_row  # noqa: E402
+from prepare_shader_seed import builtin_serves  # noqa: E402
 
 # Per game: the list, the issue form's label, the title prefix of the launcher's automatic submissions (GAME_CONTRIB_TITLE)
 GAMES = {'totk': (TOTK / 'assets/shader_list.tsv', 'shader-list', 'Shader list:'),
@@ -50,6 +52,8 @@ def contribution_rows(text):
         if not line.strip() or line.startswith('#'):
             continue
         fields = line.split('\t')
+        if fields[0] in ('R', 'B') and warm_row(fields):   # a render pipeline: contribution_pipelines
+            continue
         deps = None
         if len(fields) == 3 and fields[0] == 'V' and KEY.match(fields[1]):
             try:
@@ -61,6 +65,18 @@ def contribution_rows(text):
         else:
             rows.add((fields[1], deps))
     return rows, dropped
+
+
+def contribution_pipelines(text):
+    """The render pipeline rows (R, and B with its border recipe) of a contribution file, in order, without repeats
+    (nvn_mtl.m pso_contribute; user 2026-10-22: collected with the shaders)."""
+    rows = []
+    for line in text.splitlines():
+        fields = line.split('\t')
+        row = warm_row(fields) if fields[0] in ('R', 'B') else None
+        if row and row not in rows:
+            rows.append(row)
+    return rows
 
 
 def gh(*args):
@@ -87,6 +103,7 @@ def main():
     ap.add_argument('--game', choices=sorted(GAMES), default='totk', help='whose list and issues: totk (default) or botw')
     ap.add_argument('--repo', default=REPO)
     ap.add_argument('--issue', type=int, nargs='*', help="only these issues (default: every open issue with the game's label)")
+    ap.add_argument('--seed', type=Path, help='a prepared seed (build/shader-seed/<version>): drop rows its built-in variants serve')
     ap.add_argument('--apply', action='store_true', help='write the merged rows to the shared list')
     ap.add_argument('--close', action='store_true', help='with --apply: comment on each merged issue and close it')
     args = ap.parse_args()
@@ -101,24 +118,34 @@ def main():
         issues = [i for i in issues if i['number'] in args.issue]
     token = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True).stdout.strip()
     shared = ShaderList.load(shader_list)
-    before = len(shared.variants)
+    before, before_pipes = len(shared.variants), sum(1 for row in shared.warm if row[0] in 'RB')
     merged = []
     for issue in issues:
         urls = attachment_urls(issue['body'])
-        rows, dropped, problems = set(), 0, []
+        rows, pipes, dropped, problems = set(), [], 0, []
         for url in urls:
             try:
-                got, bad = contribution_rows(download(url, token))
+                text = download(url, token)
+                got, bad = contribution_rows(text)
                 rows |= got; dropped += bad
+                pipes += [row for row in contribution_pipelines(text) if row not in pipes]
             except (OSError, ValueError) as error:
                 problems.append(f'{url}: {error}')
+        builtin = {r for r in rows if builtin_serves(args.seed, *r)} if args.seed else set()
+        rows -= builtin
         new = rows - shared.variants
         shared.variants |= rows
+        new_pipes = [row for row in pipes if row not in shared.warm]
+        for row in new_pipes:
+            shared.add_warm(row, 'm')
         print(f"#{issue['number']} {issue['author']['login']}: {len(urls)} file(s), {len(rows)} rows, {len(new)} new"
-              + (f', {dropped} lines dropped' if dropped else '') + ''.join(f'\n  {p}' for p in problems))
-        if rows and not problems:
-            merged.append((issue['number'], len(rows), len(new)))
-    print(f'shared shader list: {before} -> {len(shared.variants)} variants')
+              + (f', {len(pipes)} pipeline rows, {len(new_pipes)} new' if pipes else '')
+              + (f', {dropped} lines dropped' if dropped else '')
+              + (f', {len(builtin)} default rows the seed makes dropped' if builtin else '') + ''.join(f'\n  {p}' for p in problems))
+        if (rows or builtin or pipes) and not problems:   # all default: still thanked and closed
+            merged.append((issue['number'], len(rows) + len(pipes), len(new) + len(new_pipes)))
+    print(f'shared shader list: {before} -> {len(shared.variants)} variants, '
+          f'{before_pipes} -> {sum(1 for row in shared.warm if row[0] in "RB")} render pipeline rows')
     if not args.apply:
         print('dry run: nothing written (--apply writes the list)')
         return

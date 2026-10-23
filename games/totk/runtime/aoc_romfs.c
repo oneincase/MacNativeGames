@@ -7,6 +7,7 @@
 #ifdef GAME_BOTW
 #include "runtime.h"
 #include "aoc_config.h"
+#include "game_version.h"
 #include "fs_host.h"
 #include "romfs_path.h"
 #include "totk_ui_lang.h"
@@ -40,7 +41,7 @@ static void need(int c, const char *m) { if (!c) runtime_fail(m); }
 static int present(const Vol *v) { return (AOC_PRESENT_MASK >> (v->index - 1)) & 1; }
 static void vol_dir(const Vol *v, char *out, size_t cap) {
     const char *dir = getenv("TOTK_AOC");   /* the folder holding <index>/; default beside the game's RomFS */
-    need(snprintf(out, cap, "%s/%d", dir && *dir ? dir : "extracted/botw160/aoc", v->index) < (int)cap, "add-on content path");
+    need(snprintf(out, cap, "%s/%d", dir && *dir ? dir : "extracted/" TOTK_GAME_DIR "/aoc", v->index) < (int)cap, "add-on content path");
 }
 static Entry entry(const Vol *v, uint64_t i) { Entry e; memcpy(&e, v->index_bytes + 24 + i * 24, 24); return e; }
 static const char *entry_name(const Vol *v, Entry e) { return (const char *)v->index_bytes + v->strings_offset + e.name; }

@@ -39,6 +39,8 @@ static size_t size(int type){return (size_t)rows[valid(type)].font_bytes;}
 static void request_load(int type){(void)type;}
 static unsigned char vr_mode(void){return 0;}
 static void vr_mode_change(void){fprintf(stderr,"[botw] Labo VR mode is not available\n");}
+/* 1.9.0 asks whether it runs on a Switch 2 ("Ounce"): no, it gets the original Switch's paths. */
+static unsigned char running_on_ounce(void){return 0;}
 #endif
 void *runtime_font_override(const char *name){
  static const struct{const char *name;void *fn;} entries[]={
@@ -47,7 +49,8 @@ void *runtime_font_override(const char *name){
   {"_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE",size}
 #ifdef GAME_BOTW
   ,{"_ZN2nn2pl21RequestSharedFontLoadENS0_14SharedFontTypeE",request_load},{"_ZN2nn2pl8IsVrModeEv",vr_mode},
-  {"_ZN2nn2pl11BeginVrModeEv",vr_mode_change},{"_ZN2nn2pl9EndVrModeEv",vr_mode_change}
+  {"_ZN2nn2pl11BeginVrModeEv",vr_mode_change},{"_ZN2nn2pl9EndVrModeEv",vr_mode_change},
+  {"_ZN2nn2pl16IsRunningOnOunceEv",running_on_ounce}
 #endif
   };
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;

@@ -381,3 +381,61 @@ Same scripted deck run (`DM_EXP_CLEAR_SER=41`, then holding W and turning the ca
   pre-pass and the colour-pass vertex shaders read for one object, and compare the matrices (the previous-frame camera
   for motion vectors is the first suspect: a binding or offset mixed up between the two programs).
 - The cached MSL of `cd871b70` (stencil gathered as `texture2d<uint>`) is still the hand-edited one on this machine.
+
+### 2026-10-22: the holes were colour draws the replay dropped, not depth failures; indirect draws resolved on the GPU
+
+Fixed. The ghosts, trails and see-through characters while the camera moves are gone (scripted deck run, plain and with
+`DM_EXP_CLEAR_SER=41`: no magenta while turning; shots `BY3_build/debug/fix-turning.png`).
+
+How it was found (the 2026-10-19 conclusion was wrong: `DM_EXP_NODEPTH_SER=41` filling the holes only shows that some
+colour draw reaches each pixel with no depth test, not that the draw meant for it exists):
+- Xcode-beta could not replay `deck1.gputrace` (the replayer died with segmentation fault 11), so no Pixel History.
+- Ruled out: `TOTK_RT_CONTINUE=0` (still holes); the hoist / defer / fuse rewrites are off by default
+  (`DM_NVN_TBDR` unset), so they never ran. Both vertex shaders of one object compute the position with the same
+  expression from the same buffers (same addresses, same content hash).
+- Most colour draws test depth `EQUAL` (df 3), not `LEQUAL`. New measurement knob `DM_EXP_EQ_SER=<serial>`
+  (`DM_EXP_EQ_FUNC`, default `LessEqual`): EQUAL draws into that target use another compare. With `LessEqual` the
+  holes stay, so they are not a last-bit depth mismatch.
+- With the camera turning the holes are mostly sky and sea. Pass dumps of a still and two turning frames: the colour
+  pass has fewer draws when turning, and the replay drops none (no `cond-*` / `no-pipeline` skips).
+- New measurement knob `DM_EXP_VIS_FILL=<bytes>`: an inline update of exactly that size writes 0xffff in every word.
+  With 81920 (the per-object visibility words the frame starts by resetting) there are **no holes**.
+- A read watch on that buffer (`DM_NVN_WATCH_SB=4f5eed91:0 TOTK_WATCH_READ=1`) caught the readers: not the game, but
+  the replay's own `draw_resolve`. Logging it in a turning frame: the colour pass is 524
+  `MultiDrawElementsIndirectCount` records (max 1), each counted by its object's visibility word, which the depth
+  pre-pass of the same submission sets (`4f5eed91`: `s0[id] = 0xffff`). The replay read those counts on the CPU while
+  encoding, where memory still holds the last completed frame's words: 208 of 524 objects were skipped. With a still
+  camera the old visibility is the new one, so the picture was right; objects coming into view were not drawn, and
+  the background behind them failed the depth test against the depth the pre-pass had written for them.
+
+The fix (`nvn_mtl.m`, platform layer; TotK never issues indirect draws): the first indirect record met scans ahead in
+replay order (the current list, the callers, the submission's remaining handles) up to the next op that may write
+memory on the GPU (another target, copy, update, dispatch, texture clear, barrier). One compute dispatch, ordered after
+everything replayed so far, writes each record's Metal indirect arguments into the arena (instance count 0 when
+index >= *count). The draws are encoded with `drawIndexedPrimitives` / `drawPrimitives` `indirectBuffer:` (new render
+stream packets). Quads and 8-bit indices keep the CPU path. `TOTK_GPU_INDIRECT=0` restores the CPU read.
+
+Cost, same run: 1.3 to 1.6 resolve dispatches per frame (one per frame, about 170 draws each; each may end the
+current render pass once). Replay CPU 2.3 -> 3.1 ms per frame, because the draws the GPU counts out (instance count 0,
+as on the Switch) are now encoded too. Frame pacing is unchanged within the noise of a windowed test run (frames over
+16.7 ms: 125 / 300 before, 120 / 300 after); GPU time per frame about 3.4 ms in both.
+
+Verified in play (2026-10-22): the installed app (`make install`) on the user's own save, camera moving: no ghosts and
+no trails.
+
+Still open: the stencil-as-depth variant answer for `cd871b70` (see 2026-10-19); the hand-edited cached MSL is still
+on this machine.
+
+### 2026-10-22: "Improved LOD v2" works now; where the picture's softness comes from
+
+- **LOD v2.** Scripted deck run with `60fps,res-1600x900,improved-lod-v2` on the build with `07bba12`: clean geometry,
+  no blocks or smears (`BY3_build/debug/lod2-fixed.png`). The 2026-10-19 breakage was the indirect-draw bug. With
+  every object at LOD 0, more objects come into view between frames, so more of them were dropped. The launcher still
+  warns about the patch and leaves it off in every preset; that can go.
+- **Motion blur.** Pass dumps of a still and a turning combat frame have the same post chain: composite `58d326a2`,
+  effects (`2b6896d7`, `aad35b71`: weapon and enemy trails, part of the game's look), bloom / glow chain, exposure,
+  tone map `d616fe5d`, then the UI drawn into the same 1600x900 target. There is no full-screen motion-blur pass, and
+  `58d326a2` does not read depth.
+- **Softness.** The user's setup (log): 900p internal, MetalFX spatial 1600x900 -> 3840x2160 (x2.4) at 120 Hz full
+  screen, pacing fine (p99 about 9 ms). The softness most likely comes from that upscale, and the UI is upscaled with
+  the scene. The game has no TAA, so it has no jitter and no velocity buffer for MetalFX temporal.

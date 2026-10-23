@@ -12,6 +12,18 @@ thing for macOS. The rewrites of versions 1.0.0, 1.1.2 and 1.4.3 were verified s
 inputs against the original in an emulator, with negative controls); the build checks that your rewrite is byte for
 byte the selected version (`games/totk/assets/expected-v1.0.0.json` / `expected-v1.1.2.json` / `expected-v1.4.3.json`).
 
+The rewrites are what makes the code the app's own: it is bound by SHA-256, so a patch cannot be applied while the game
+runs. A player mod that changes the code therefore merges its main-module patches *before* that step
+(`--mod <mod folder>`, `games/totk/scripts/mod_exefs.py`): an IPS / IPS32 / pchtxt patch is applied to the verified
+retail main (a `.pchtxt` says in `@nsobid-` which build of main it is for, with `@enabled` / `@disabled` switching the
+sections on and off and `@flag offset_shift 0x100` required before the first patch line; an `.ips` carries no id, so it counts as a
+main patch only when it is named `main` or after main's build id), refused if it lands on a site the app patches itself (the 60 FPS, resolution, ultrawide and cloth sites,
+and the rewriter's registered cuts - `games/totk/scripts/patch_sites.py` reads them out of the C sources, and the signed
+jump tables out of `patch_nso.py`), and the
+merged module is then rewritten and bound like the retail one. Extra code modules a mod ships are not loaded: the app
+loads the three modules below. The same build replaces the version's player mod folder with the mod's RomFS files only
+when `--install-mod-romfs` is given (`games/totk/scripts/mod_folder.py`): that folder may hold files of the player's own.
+
 The loader maps the three rewritten modules (main, sdk, subsdk0) at their original layout, resolves their imports
 against each other, and starts the game's own `nn::init::Start`.
 
@@ -30,6 +42,31 @@ either: the shared cache fills `0x1_8000_0000..0xF_C000_0000`, and the system re
 place in `0x70_0000_0000..2^39`. When the fixed layout does not fit, the host places stack, heap and alias region side
 by side in one free hole (as the iOS layout does) and shrinks the alias region in 4 GiB steps, down to 8 GiB, until it
 fits; the game uses less than 3 GiB of it. The `guest layout` log line shows the result. macOS 26 keeps the fixed layout.
+
+The pool the game is told it owns is `app_pool()` in `runtime/services.c`: one retail figure for every version, 3,285 MiB (`0xcd500000`), plus the page-rounded amount that the
+`TOTK_OUTPUT_RES` / `TOTK_RENDER_RES` HeapDef overlay hands to the texture heaps. `TOTK_APP_POOL` replaces that whole sum rather than adding to it, so a value chosen for a big resolution overlay has to carry its
+own margin; `GetInfo` 6 and 21 report whatever the two give.
+
+The game does not use the pool directly: during startup it asks for a main heap of the pool minus about 1,170-1,200 MiB of images and system margin, and that heap is what the game sizes itself
+by. Three points measured on 1.2.1 with the 2560x1440 overlay: pool 3,373 MiB gives the usual 2,204 MiB heap (`0x89c00000`), 5,120 MiB gives 3,924 MiB (`0xf5400000`), 5,248 MiB gives
+4,052 MiB (`0xfd400000`). Two bounds apply. `svcSetHeapSize` refuses a request above `HEAP_CAP` (4 GiB) or above the pool minus the mapped images, so the heap cannot be raised
+past 4,096 MiB without raising the cap too. And the heap sits in the low reservation after the stack (6 GiB on the Mac; on iOS the reservation ends right at the
+heap cap, with no slack). `TOTK_MEM_LOG=1` logs every `SetHeapSize` and `GetInfo` call.
+
+That margin is worth knowing about because a mod that sorts "game memory" into tiers by measuring that heap reads the retail 2,204 MiB as its smallest tier, and can then refuse a resolution the
+host serves without any trouble - warning about not enough memory while nothing is short of RAM. Raising the pool moves the game heap into the next tier, and an app bundle can carry the setting
+without a code change, as a LaunchServices environment entry (re-sign the bundle afterwards):
+
+```sh
+P="Tears of the Kingdom.app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$P"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment:TOTK_APP_POOL string 0x148000000" "$P"
+codesign -f -s - "Tears of the Kingdom.app"
+```
+
+The next packaging writes a new Info.plist, so the entry has to be added again after each build.
+
+The memory is real, though: the committed heap grows by the same amount, so on a 16 GiB Mac expect more paging, not a free upgrade.
 
 ## The graphics (games/totk/third_party/d2r_gfx/gfx/nvn)
 
@@ -69,6 +106,12 @@ Historical 1.1.2 Ultrahand captures and the current 1.4.3 Recall pair are hosted
 On Maxwell, a fragment shader reads `(0, 0, 0, 1)` for every component of an input its vertex shader never writes. The Ryujinx translator gives a vertex shader those defaults only for the inputs the next stage reads, which it learns from `SetNextStage`; the service translates every shader on its own, so no next stage is set and nothing was initialised. SPIRV-Cross starts the output struct at zero (`main0_out out = {};`), so the unwritten components reached the fragment shader as 0. The drop marker of a held item depends on them: its vertex shader writes only `xyz` of one output and its fragment shader multiplies the alpha by that output's `w`, so the marker comes out fully transparent. Patch `0005` initialises every user output a vertex shader writes to `(0, 0, 0, 1)` when no next stage is set; the shader's own stores then replace the components it writes.
 
 Over the 18,064 startup variants of a 1.4.3 build, the patched translator changed 6,679 of the 7,000 vertex functions, each only by these initial stores (the variable numbering of the output struct shifts with them); none of the 10,849 fragment and 215 compute shaders changed. With the patch, the marker and its arrow show under a held material on 1.4.3 (Apple M2 Max). The title background gets slightly darker (mean luminance 61.2 -> 57.0): in another native port of this game, the same change was traced to the volumetric light pass, which multiplies the unwritten `w` into the translation column of its shadow matrix, so with `w = 0` the translation was lost. An existing shader cache keeps the vertex functions it already has (the seed import preserves shaders collected on the Mac), so the fix reaches an existing install once its cache is cleared or the chain name changes.
+
+## Early fragment tests
+
+Many surfaces are drawn twice: a depth prepass (alpha test, depth written) and then the G-buffer pass, which colours only the samples whose depth is EQUAL to the prepass's and writes no depth. The material fragment shaders of the G-buffer pass also store a per-tile flag to memory. A Metal fragment function that stores to memory has its depth test after it runs, unless it declares `[[early_fragment_tests]]`, and on Apple GPUs that late test saw a depth an ulp away from the one the prepass wrote along contour lines: the G-buffer kept its clear value there, and the stone lattice in front of the Great Sky Island start was covered in rows of dark dots (every resolution). The two vertex functions compute bit-identical positions, in the MSL and in the compiled AIR, and `preserveInvariance` changed nothing.
+
+On the Switch these shaders test depth first. Byte `+0x718` of a fragment shader's NVN control section is its early-fragment-tests flag: the game's NVN driver reads it with the other fragment flags at `+0x719..+0x71d`, and Ryujinx receives it as the 3D engine's `EarlyZForce`. The runtime's translation requests and `prepare_shader_seed.py` pass it as `early_fragment_tests` (0x880-byte sections only; Breath of the Wild's shorter ones are not read), and `totk_xlate` gives it to the Ryujinx translator, whose SPIR-V then declares `EarlyFragmentTests` and the MSL `[[early_fragment_tests]]`. Of the 13,645 fragment shaders of 1.4.3, 1,677 set the flag, among them 775 of the 840 that store without discarding; none of them writes depth or a sample mask. The flagged shaders' MSL changes under the same variant names, so the translation chain went from `totk-native-v7-unverified` to `totk-native-v8-unverified`: a v7 cache would keep serving them without the attribute.
 
 ## Buffer copies through aliased memory
 

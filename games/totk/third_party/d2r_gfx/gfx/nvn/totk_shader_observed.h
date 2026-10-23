@@ -37,21 +37,35 @@ static NSSet<NSString *> *totk_shader_observed_keys(NSMutableDictionary *state) 
 
 // A key gets at most one append attempt per process. Persistence is best effort:
 // a full/read-only cache must not block drawing or repeatedly retry each frame.
+// The key is live at once; the file is written on a serial queue (the submit thread spent milliseconds per new shader
+// opening and appending, 2026-10-22), and whatever is still queued is written before the process exits.
+static dispatch_queue_t totk_shader_observed_queue;
+static void totk_shader_observed_flush(void) { if (totk_shader_observed_queue) dispatch_sync(totk_shader_observed_queue, ^{}); }
 static BOOL totk_shader_observed_note(NSMutableDictionary *state, NSString *key) {
     if (!state || !totk_shader_scope_hex(key, 64)) return NO;
+    NSString *path; NSData *line;
     @synchronized (state) {
         NSMutableSet<NSString *> *keys = state[@"keys"];
         if ([state[@"scope"] containsObject:key] || [keys containsObject:key]) return NO;
         [keys addObject:key];
-        NSString *path = state[@"path"];
-        NSData *line = [[key stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        if (![state[@"valid"] boolValue]) {
+        path = state[@"path"];
+        line = [[key stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        totk_shader_observed_queue = dispatch_queue_create("totk.shader.observed", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        atexit(totk_shader_observed_flush);
+    });
+    dispatch_async(totk_shader_observed_queue, ^{
+        BOOL valid; NSDictionary *identity;
+        @synchronized (state) { valid = [state[@"valid"] boolValue]; identity = state[@"identity"]; }
+        if (!valid) {
             NSFileManager *fm = NSFileManager.defaultManager;
-            if (![fm createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil]) return YES;
-            NSData *header = [NSJSONSerialization dataWithJSONObject:state[@"identity"] options:NSJSONWritingSortedKeys error:nil];
+            if (![fm createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil]) return;
+            NSData *header = [NSJSONSerialization dataWithJSONObject:identity options:NSJSONWritingSortedKeys error:nil];
             NSMutableData *data = [header mutableCopy]; [data appendBytes:"\n" length:1]; [data appendData:line];
-            if ([data writeToFile:path options:NSDataWritingAtomic error:nil]) state[@"valid"] = @YES;
-            return YES;
+            if ([data writeToFile:path options:NSDataWritingAtomic error:nil]) { @synchronized (state) { state[@"valid"] = @YES; } }
+            return;
         }
         int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CLOEXEC);
         if (fd >= 0) {
@@ -64,6 +78,6 @@ static BOOL totk_shader_observed_note(NSMutableDictionary *state, NSString *key)
             }
             close(fd);
         }
-        return YES;
-    }
+    });
+    return YES;
 }

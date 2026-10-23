@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Write the manifest.tsv of a player's RomFS mod (runtime/romfs.c loads it from TOTK_ROMFS_MODS, which the launcher sets to
-~/Library/Application Support/MacNativeGames/TOTK/mods/<version>).
+"""Write the manifest.tsv of a player's RomFS mod for Bayonetta 3 (runtime/romfs.c loads it from TOTK_ROMFS_MODS, which
+the launcher sets to each chosen mods/<name>/romfs next to the work folder; `make mods` runs this for every one).
 
-The mod folder holds the replacement files under their RomFS paths (for example Sound/Resource/Stream/Dm_OP_0001.bwav).
-Each line of the manifest names a path, the replacement's size and SHA-256 and the original's SHA-256; the game checks
-all of them at start, so a mod made for another game version stops the start instead of loading. A file the RomFS lacks
-is added (its original's SHA-256 is "-"), unless a RomFS path differs from it only in case: that is a misspelt
-replacement (paths are case-sensitive), so nothing is written. The originals come
-from the RomFS the app was built with: the app's Contents/Resources/totk/extracted/<version>/romfs (romfs.bin and
-runtime-index.bin), or a build work folder's extracted/<version>/romfs.
+The mod folder holds the replacement files under their RomFS paths. Each line of the manifest names a path, the
+replacement's size and SHA-256 and the original's SHA-256; the game checks all of them at start, so a mod made for
+another game version stops the start instead of loading. A file the RomFS lacks is added (its original's SHA-256 is
+"-"), unless a RomFS path differs from it only in case: that is a misspelt replacement (paths are case-sensitive), so
+nothing is written. The originals come from the RomFS the game was prepared with, which stays in the work folder (the app
+holds only the launcher): <work>/extracted/v120/romfs (romfs.bin and runtime-index.bin), BY3_build by default.
 
-usage: make_mod_manifest.py <mod folder> (--app <Tears of the Kingdom.app> | --romfs <folder>) [--version v143]
+usage: make_mod_manifest.py <mod folder> [--romfs <folder>]
 """
 import argparse
 import hashlib
@@ -18,7 +17,8 @@ from pathlib import Path
 import struct
 import sys
 
-VERSIONS = ('v0', 'v112', 'v121', 'v143')
+BY3 = Path(__file__).resolve().parents[1]
+DEFAULT_ROMFS = BY3/'BY3_build/extracted/v120/romfs'   # the Makefile's WORK ?= BY3_build, version 1.2.0
 CHUNK = 8 << 20
 
 
@@ -80,20 +80,13 @@ def manifest(mod, romfs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('mod', type=Path, help='the mod folder, files under their RomFS paths')
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument('--app', type=Path, help='the built Tears of the Kingdom.app')
-    source.add_argument('--romfs', type=Path, help='a folder holding romfs.bin and runtime-index.bin')
-    parser.add_argument('--version', choices=VERSIONS, help='the game version (default: the mod folder name)')
+    parser.add_argument('--romfs', type=Path, default=DEFAULT_ROMFS,
+                        help=f'a folder holding romfs.bin and runtime-index.bin (default: {DEFAULT_ROMFS.relative_to(BY3)})')
     args = parser.parse_args()
-    version = args.version or (args.mod.resolve().name if args.mod.resolve().name in VERSIONS else None)
     romfs = args.romfs
-    if args.app:
-        if not version:
-            parser.error('name the game version with --version (or name the mod folder v0, v112, v121 or v143)')
-        romfs = args.app/f'Contents/Resources/totk/extracted/{version}/romfs'
     for need in ('romfs.bin', 'runtime-index.bin'):
         if not (romfs/need).is_file():
-            parser.error(f'{romfs/need} not found')
+            parser.error(f'{romfs/need} not found: run make prepare first, or name the folder with --romfs')
     if not args.mod.is_dir():
         parser.error(f'{args.mod} is not a folder')
     lines, same, added, misspelt = manifest(args.mod, romfs)

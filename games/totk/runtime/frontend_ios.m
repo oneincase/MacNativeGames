@@ -66,6 +66,9 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
  });
 }
 void runtime_warm_done(void){}
+/* The "温控" of the present lines (hle_nvn.c): the system's thermal state, 0 nominal, 1 fair, 2 serious, 3 critical; the default
+   (-1) was never replaced on iOS, so a phone slowing down as it warmed could not be told from other causes (2026-10-23). */
+int dm_thermal_now(void){return (int)NSProcessInfo.processInfo.thermalState;}
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 static _Atomic int appActive=1;
 int runtime_front_focus(void){return atomic_load(&appActive);}
@@ -101,14 +104,15 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
     width, so there the drawable is want*16/9 columns wide (1281x890 on a 2360x1640 iPad); an iPhone keeps want rows */
  if(want>0){double h=vw/vh<16.0/9.0?round(want*16.0/9.0*vh/vw):(double)want;if(h<vh){vw=round(vw*h/vh);vh=h;}}
  metalLayer.drawableSize=CGSizeMake(vw,vh);
- fprintf(stderr,"[totk] view drawable %.0fx%.0f (screen scale %.1f, TOTK_IOS_DRAWABLE_H=%ld)\n",vw,vh,s,want);
+ fprintf(stderr,"[totk] view drawable %.0fx%.0f (screen scale %.1f, TOTK_IOS_DRAWABLE_H=%ld)\n",vw,vh,s,want);runtime_aspect_view(vw,vh);   /* full screen: the camera takes the drawable's shape (aspect_patch.h) */
  bootOverlay=[[UIView alloc] initWithFrame:host.bounds];bootOverlay.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
  bootOverlay.backgroundColor=[UIColor colorWithRed:0.035 green:0.075 blue:0.09 alpha:1];
  CGFloat w=host.bounds.size.width,h=host.bounds.size.height;
  bootStage=[[UILabel alloc] initWithFrame:CGRectMake(0,h/2-50,w,36)];bootStage.text=@(TOTK_UI("正在启动海拉鲁","Starting Hyrule"));bootStage.textColor=UIColor.whiteColor;
  bootStage.font=[UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];bootStage.textAlignment=NSTextAlignmentCenter;
- bootDetail=[[UILabel alloc] initWithFrame:CGRectMake(0,h/2-8,w,24)];bootDetail.text=@(TOTK_UI("正在准备游戏环境","Preparing the game environment"));bootDetail.textColor=[UIColor colorWithWhite:0.72 alpha:1];
+ bootDetail=[[UILabel alloc] initWithFrame:CGRectMake(24,h/2-8,w-48,36)];bootDetail.text=@(TOTK_UI("正在准备游戏环境","Preparing the game environment"));bootDetail.textColor=[UIColor colorWithWhite:0.72 alpha:1];
  bootDetail.font=[UIFont systemFontOfSize:14];bootDetail.textAlignment=NSTextAlignmentCenter;
+ bootDetail.numberOfLines=2;bootDetail.adjustsFontSizeToFitWidth=YES;bootDetail.minimumScaleFactor=0.6;   /* a message (no game data) fits in two lines */
  bootProgress=[[UIProgressView alloc] initWithFrame:CGRectMake(w/2-140,h/2+30,280,8)];bootProgress.hidden=YES;
  [bootOverlay addSubview:bootStage];[bootOverlay addSubview:bootDetail];[bootOverlay addSubview:bootProgress];[host addSubview:bootOverlay];
  NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;

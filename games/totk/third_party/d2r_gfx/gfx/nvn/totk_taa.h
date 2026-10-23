@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 int taa_enabled(void);                         // key 5 state (what the panel shows)
+int taa_effective(void);                       // a frame has been anti-aliased
 int taa_active(void);                          // the replay's state, latched from it at frame end
 int taa_ready(void);                           // this frame has the depth and camera to anti-alias (cheap check before taa_encode)
 void taa_toggle(void);                         // key 5
