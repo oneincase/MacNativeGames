@@ -70,7 +70,10 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
            场景=unit0、bloom=unit2（c220 的 [tex-unit-dbg] 与 passdump 的 tid 双向印证）。
            这里按 MSL 成员名尾部的 NVN 句柄做定点纠正，只动句柄匹配上的绑定，
            其他程序与其他标题完全不受影响。依据：docs/color-cast-root-cause-2026-10-23.md §7–§9。 */
-        if ([j[@"key"] hasPrefix:@"b41adaf5"]) {
+        if ([j[@"key"] hasPrefix:@"b41adaf5"] || [j[@"key"] hasPrefix:@"8166d5ef"] ||
+            [j[@"key"] hasPrefix:@"5aa81f6b"] || [j[@"key"] hasPrefix:@"ac309751"] ||
+            [j[@"key"] hasPrefix:@"9652ad6f"] || [j[@"key"] hasPrefix:@"72a5eb8f"] ||
+            [j[@"key"] hasPrefix:@"66ba9531"]) {
             for (int i = 0; i < o->nb; i++) if (o->b[i].kind == NVN_RB_TEX) {
                 switch (o->b[i].h) {
                 case 0x1057805Eu: o->b[i].reg = 0; break;   /* 场景 1920x1080 延迟光照输出 */
@@ -78,6 +81,9 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
                 case 0x1057005Cu: o->b[i].reg = 1; break;   /* 3D LUT 256x16 */
                 case 0x10580060u: o->b[i].reg = 3; break;   /* 3D LUT 256x16 */
                 }
+            }
+            {   static int seen; if (seen++ < 6)
+                fprintf(stderr, "[dm] [nvn-mtl] [slot-fix] %.16s 场景/bloom/LUT 槽位已按句柄纠正\n", [j[@"key"] UTF8String]);
             }
         }
         /* NieR 诊断：NIER_REG_SWAP=<key前缀>:<槽号,...> —— 按纹理绑定的出现顺序重排 NVN 槽号。
