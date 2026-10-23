@@ -12265,12 +12265,19 @@ static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
 static void present_pipeline(MTLPixelFormat format) {
     if (!g_blit_pso || g_blit_fmt != format) {
-        static const char *src_msl =
+        // 上屏提亮：游戏本体没有亮度/伽马开关，第一章节这类暗场景只能在上屏合成处压一条曲线。
+        // NIER_GAMMA 缺省 1.0（不改行为，直通）；<1 提亮暗部（0.6 约等于把 0.08 提到 0.21），>1 压暗。
+        // 只在 present 这一份 MSL 里生效，不影响游戏渲染、回读与截图。
+        float gm = 1.0f;
+        { const char *ev = getenv("NIER_GAMMA"); if (ev) { gm = (float)atof(ev); if (gm < 0.3f) gm = 0.3f; if (gm > 2.5f) gm = 2.5f; }
+          static int gm_shown; if (ev && gm_shown++ < 3) MLOG("[gamma] 上屏伽马 %.2f", gm); }
+        char src_msl[2048];
+        snprintf(src_msl, sizeof src_msl,
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
             "struct Crop { float4 rect; float4 edge; };\n"
-            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n";
+            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { float4 v = t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); return float4(pow(saturate(v.rgb), %.3f), v.a); }\n", gm);
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("出图着色器编译失败 %s", e.localizedDescription.UTF8String);
