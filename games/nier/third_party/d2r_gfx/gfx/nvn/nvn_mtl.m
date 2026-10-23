@@ -3096,6 +3096,19 @@ static void up_flush(void) {
     }
     for (int i = 0; b && i < g_nup_blits; i++) {
         up_blit *x = &g_up_blits[i];
+        /* TOTK: 防御——源缓冲越界的 blit 会在 GPU 上触发 PageFault，连带整条上传命令缓冲被丢。
+           读档时的 cube array（ser=1645 之类，guest 声明 768 层、Metal 只装 341 层）会走到这里：
+           宁可跳过这一张（内容记为未写、下次重传），也不要让一次越界毁掉整批 10326 张的上传。 */
+        if (!x->src || !x->dst) continue;
+        size_t need = x->off + x->image * (x->size.depth ? (size_t)x->size.depth - 1 : 0)
+                    + x->row * (x->size.height ? (size_t)x->size.height - 1 : 0) + x->row;
+        if (need > (size_t)x->src.length) {
+            static int guard_n;
+            if (guard_n++ < 8) MLOG("【红】上传 blit 越界已跳过：off=%zu row=%zu image=%zu size=%zux%zux%zu src=%lu 字节（第 %d 次）",
+                                    x->off, x->row, x->image, (size_t)x->size.width, (size_t)x->size.height, (size_t)x->size.depth,
+                                    (unsigned long)x->src.length, guard_n);
+            continue;
+        }
         enc_b_copy_buffer_texture(b, x->src, x->off, x->row, x->image, x->size, x->dst, x->slice, x->level, MTLOriginMake(0, 0, 0));
     }
     if (b && g_nup_decs) {   // 无 BC 的 GPU 解压（见 up_dec）：参数块里的偏移相对暂存块起点 | GPU decompression without BC (see up_dec): offsets in the parameter block are relative to the start of the staging block
@@ -3112,6 +3125,10 @@ static void up_flush(void) {
     TotkCommitOptions *o = [TotkCommitOptions new];
     NSMutableArray *staging = [g_up_keep mutableCopy];
     if (!staging) staging = [NSMutableArray array];
+    /* TOTK: 目标贴图的强引用要活到这一批真的在 GPU 上跑完（见下面 feedback）。原先在 q4_commit 之后立刻
+       removeAllObjects，读档重建纹理时旧贴图可能只剩这一份强引用 —— GPU 按裸地址 blit 已释放的纹理，
+       整条上传命令缓冲报 PageFault、这批一万多张贴图全部作废（c259–c273 帧 3300 的崩）。 */
+    NSMutableArray *texs_keep = g_up_texs; g_up_texs = nil;
     if (g_up_block && !g_up_block_pooled) [staging addObject:g_up_block];
     if (g_up_sblock && !g_up_sblock_pooled) [staging addObject:g_up_sblock];
     uint32_t pool_mask = g_up_batch_pool, spool_mask = g_up_batch_spool;
@@ -3127,6 +3144,7 @@ static void up_flush(void) {
         if (d > 0) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)(d * 1e9));
         for (id obj in staging) res_remove(obj);
         [staging removeAllObjects];
+        [texs_keep removeAllObjects];
         for (int i = 0; i < UP_POOL; i++) if (pool_mask >> i & 1) atomic_store(&g_up_pool_busy[i], 0);
         for (int i = 0; i < UP_SPOOL; i++) if (spool_mask >> i & 1) atomic_store(&g_up_spool_busy[i], 0);
         pthread_mutex_lock(&g_up_slot_mu); atomic_store(&g_up_alloc_busy[slot], 0); pthread_cond_broadcast(&g_up_slot_cv); pthread_mutex_unlock(&g_up_slot_mu);
@@ -3140,7 +3158,6 @@ static void up_flush(void) {
     [g_up_keep removeAllObjects];
     up_diag();
     g_nup_blits = 0; g_nup_decs = 0; g_nup_tcas = 0; g_nup_tcxs = 0;
-    [g_up_texs removeAllObjects];
 }
 
 void mtl_upload_wait_stats(uint64_t *n, uint64_t *ns) { *n = atomic_load(&g_up_slot_waits); *ns = atomic_load(&g_up_slot_wait_ns); }
