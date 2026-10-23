@@ -4375,10 +4375,12 @@ static void rp_end(void) { if (g_enc) {
        producer pass, on the same Metal 4 queue and before later passes reuse it. */
     { static int on = -1; static FILE *f; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
       if (on < 0) { const char *path = getenv("DM_NVN_HDRPASS_LOG"); on = path && (f = fopen(path, "w")) != NULL; }
-      if (on && atomic_load(&g_cur_frame) >= 3200) for (int i = 0; i < R.rt.n && i < 8; i++) {
+      if (on && atomic_load(&g_cur_frame) >= 2000) for (int i = 0; i < R.rt.n && i < 8; i++) {
           const tex_t *rt = R.rt.color[i]; if (!rt) continue;
           id<MTLTexture> src = tex_mtl(rt);
-          if (!src || src.pixelFormat != MTLPixelFormatRG11B10Float || src.width != 1600 || src.height != 900) continue;
+          if (!src || src.pixelFormat != MTLPixelFormatRG11B10Float) continue;
+          { static long only = -2; if (only == -2) { const char *e = getenv("DM_NVN_HDRPASS_SER"); only = e ? strtol(e, NULL, 0) : -1; }
+            if (only >= 0 && (long)rt->serial != only) continue; }
           id<MTLBuffer> rb; size_t ro = arena_alloc(64 * 64 * 4, &rb);
           blit_close(); rs_sync(); id<MTL4ComputeCommandEncoder> be = [g_cb computeCommandEncoder];
           [be barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
