@@ -44,3 +44,24 @@
 ### 下一轮唯一该做的
 
 给 `dispatch()` 的 passdump 补上 storage texture 的记录（`nvn_mtl.m:10959` 一带，`C` 行加 `img` 列表），然后重跑一次黑场景，看这 5 个 compute 里哪个写 ser=16/17。如果是 compute，那 `rp_begin_ex` 的 `gpu_owned_mark` 与回写路径也要跟着检查（compute 写完的纹理不能被当 guest 内容重传覆盖）。
+
+## 第三轮补充（同日 18:00–19:10）
+
+### 新证据
+
+1. **compute 不写纹理**：给 `dispatch()` 的 passdump 补了 storage image 记录（`S.img[5][i]` 的 ser），重跑黑场景（`c300`，帧 3866）——**5 个 dispatch 的 `i%d` 全部为空**，它们只写 storage buffer（`s0..s7`）。→ compute 不是写 ser=16/17 的人。
+2. **没有纹理拷贝写 16/17**：同帧 719 条 `X/Y/U/E` 全是 buffer 拷贝/更新（`copy_b2b`/`update_ub`/`update`），没有 `copyFromTexture` 到 16/17。
+3. **irradiance 贴图抓不到**：`1056807E` 对应 reg12 = ser3982（32x32），`DM_NVN_TEXPNG=3982` 报「不在序号表」→ 它不是通过 `nvnTextureInitialize` 创建的（可能是直接 Metal 纹理或跨 serial 共享）。`ser=1645`（16x16 cube array，341 层）和 `ser=103`（960x540）能抓到。
+4. **8 个 render pass FS 改红仍然无效**（见第二轮），而 passdump 确认这 5 个 pass 就是唯一写 16/17 的 render pass。
+
+### 现在的矛盾
+
+- render pass 是唯一可能的写者，但改它们的最终输出无效；
+- compute 和拷贝都排除了；
+- 16/17 里有亮点（2B 光环），说明写入确实发生。
+
+**最可能的解释：我改的 MSL 不是运行时实际编译的那一份。** `rt-totk-native-v4-unverified/` 下同一个 key 可能存在多个变体（`-<hash>_b`），而 `probe` 脚本用 `ls | head -1` 只改第一个。需要先确认运行日志里到底加载了哪个变体（`TOTK_KEEP_MSL=1` 或打印 key）。
+
+### 修正
+
+上一轮说「8 个 FS 不是写者」下得太早——应该是「改它们的输出没有可观测效果」，原因可能是改错了文件，而不是它们不写。
