@@ -5254,7 +5254,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
 
 static int stage_of(NSString *zh) {
     if ([zh isEqualToString:@"顶点"]) return 0; if ([zh isEqualToString:@"像素"]) return 1; if ([zh isEqualToString:@"计算"]) return 5;
-    if ([zh isEqualToString:@"外壳"]) return 3; if ([zh isEqualToString:@"域"]) return 4; return -1;
+    if ([zh isEqualToString:@"外壳"]) return 3; if ([zh isEqualToString:@"域"]) return 4; if ([zh isEqualToString:@"几何"]) return 2; return -1;
 }
 #define NVN_RT_RANGE_RO_IMPL 1
 // 私有续用只接受明确RO的B反射，sbuf缺rw不把默认0当证明；不改变既有反射/翻译链。
