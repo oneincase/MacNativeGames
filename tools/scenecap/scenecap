@@ -244,7 +244,7 @@ def cmd_frame_stats(args: argparse.Namespace) -> int:
     sys.path.insert(0, os.path.join(_HERE, "compare"))
     from scenecap_compare.framestats import frame_stats, render_report  # noqa: E402  (imported on demand)
 
-    stats = frame_stats(args.replay_dir)
+    stats = frame_stats(args.replay_dir, jobs=args.jobs)
     text = render_report(stats)
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")
@@ -340,6 +340,8 @@ def build_parser() -> argparse.ArgumentParser:
     frames = subparsers.add_parser("frame-stats", help="report per-frame stability inside one replay directory")
     frames.add_argument("replay_dir", metavar="DIR", help="replay output directory")
     frames.add_argument("-o", "--output", metavar="FILE", default=None, help="write the report to FILE")
+    frames.add_argument("--jobs", type=int, default=0, metavar="N",
+                        help="parallel worker processes (default: CPU count; 1 disables)")
     frames.set_defaults(func=cmd_frame_stats)
     return parser
 

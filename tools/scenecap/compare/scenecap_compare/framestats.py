@@ -58,8 +58,8 @@ def _group_by_frame(replay: ReplayDir) -> dict[int, dict[str, PassEntry]]:
     return by_frame
 
 
-def frame_stats(replay_dir) -> FrameStats:
-    """统计同一重放目录里相邻帧的稳定性。"""
+def frame_stats(replay_dir, jobs: int = 0) -> FrameStats:
+    """统计同一重放目录里相邻帧的稳定性（jobs>1 时按帧对切分到多进程）。"""
     replay = replay_dir if isinstance(replay_dir, ReplayDir) else load_replay_dir(replay_dir)
     by_frame = _group_by_frame(replay)
     if len(by_frame) < 2:
@@ -67,6 +67,29 @@ def frame_stats(replay_dir) -> FrameStats:
 
     order = sorted(by_frame)
     thresholds = Thresholds()
+
+    # 先把要比较的 PNG 对算出来，渲染/解码都按对切分
+    tasks: list[tuple[str, str, str, int, int, int]] = []
+    for base_frame, cand_frame in zip(order, order[1:]):
+        base_list = sorted(by_frame[base_frame].values(), key=lambda entry: entry.index)
+        cand_list = sorted(by_frame[cand_frame].values(), key=lambda entry: entry.index)
+        for position, (base_entry, cand_entry) in enumerate(zip(base_list, cand_list)):
+            tasks.append((str(replay.png_path(base_entry)), str(replay.png_path(cand_entry)),
+                          base_entry.encoding or "srgb", base_frame, cand_frame, position))
+    workers = jobs if jobs and jobs > 0 else 0
+    if workers > 1 and len(tasks) > 64:
+        import concurrent.futures
+        import multiprocessing
+
+        workers = min(workers, multiprocessing.cpu_count() or 1)
+        slices = [tasks[i::workers] for i in range(workers)]
+        slices = [chunk for chunk in slices if chunk]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            gathered = [item for batch in pool.map(_stats_slice, slices) for item in batch]
+        gathered.sort(key=lambda item: (item.base_frame, int(item.slug.lstrip("#"))))
+        return FrameStats(tuple(order), tuple(gathered),
+                          sum(1 for item in gathered if item.identical))
+
     decoded: dict[tuple[int, str], object] = {}
     pairs: list[FramePair] = []
     identical = 0
@@ -108,6 +131,27 @@ def frame_stats(replay_dir) -> FrameStats:
 
 def _fmt(value: float) -> str:
     return "∞" if value == float("inf") else f"{value:.2f}"
+
+
+def _stats_slice(tasks: list[tuple]) -> list[FramePair]:
+    """Worker: decode and compare one slice of frame pairs."""
+    out: list[FramePair] = []
+    thresholds = Thresholds()
+    for base_png, cand_png, encoding, base_frame, cand_frame, position in tasks:
+        try:
+            a = decode_png(open(base_png, "rb").read())
+            b = decode_png(open(cand_png, "rb").read())
+        except (PngError, OSError):
+            continue
+        if a.width != b.width or a.height != b.height:
+            continue
+        try:
+            metrics = compare_rasters(a, b, thresholds, encoding)
+        except MetricError:
+            continue
+        out.append(FramePair(base_frame, cand_frame, f"#{position}", metrics.psnr_db,
+                             metrics.diff_pixel_ratio, metrics.max_channel_error, a.data == b.data))
+    return out
 
 
 def render_report(stats: FrameStats) -> str:
