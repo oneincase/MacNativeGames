@@ -107,7 +107,7 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{[NSCursor setHiddenUntilMouseMoves:YES];runtime_input_key(e.keyCode,1);}
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==101){extern void runtime_scenecap_hotkey(void);runtime_scenecap_hotkey();return;}[NSCursor setHiddenUntilMouseMoves:YES];runtime_input_key(e.keyCode,1);}   /* F9: capture a scenecap scene package */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end
@@ -132,7 +132,7 @@ static NSString *shortcut_text(void){
  }
  /* Keys 3 (picture modes) and 4 (21:9) are not listed: for Odyssey runtime_output_mode_cycle and runtime_aspect_toggle
     are stubs (runtime/game_patches.c), so those keys do nothing. */
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)")),[NSString stringWithUTF8String:interp]];
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\nF9  抓帧（生成 scenecap 场景包）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\nF9  Capture a scenecap scene package")),[NSString stringWithUTF8String:interp]];
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
  self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];

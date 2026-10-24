@@ -200,7 +200,17 @@ tools/scenecap/scenecap verify /tmp/nier-scene.nvs
 - 捕获线程是回放层的决策线程；编码线程不调用钩子。
 - 生成的 cache 目录（`<pkg>.scenecap-cache/`）属于重放器，可随时删除。
 
-### 3.4 记录什么、丢弃什么
+### 3.4 窗口内快捷键（F9）
+
+不想开终端、也不想接输入脚本时，直接在游戏窗口里按 **F9**：下一帧边界起写出一个包，路径形如
+`/tmp/scenecap-20261024-183500.nvs`（时间戳命名）。
+
+- 不需要设任何环境变量；`SCENECAP_DIR` 可换目录（例如 `SCENECAP_DIR=$HOME/scenecap`）。
+- 与 `scenecap <path>` 命令走同一条路径（`dm_gfx_scenecap_next`），只是路径自动生成。
+- 窗口右上角的快捷键说明会多列一行 `F9  抓帧（生成 scenecap 场景包）`。
+- 落盘后照常 `scenecap verify` / `scenecap replay`。
+
+### 3.5 记录什么、丢弃什么
 
 每个被保留的帧记录：全部 render pass（附件 level/layer、load/store、clear 值、尺寸与像素格式）、
 每个保留 draw（pipeline、顶点/索引范围、实例数、图元、draw 时刻状态、完整 argument table）、每个

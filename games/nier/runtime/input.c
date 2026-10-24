@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdatomic.h>
 typedef struct{int64_t sampling;uint64_t buttons;int32_t lx,ly,rx,ry;uint32_t attributes,pad;} NpadState;
 _Static_assert(sizeof(NpadState)==40,"Npad full-key ABI");
@@ -217,6 +218,19 @@ static void *input_file(void *arg) {
         else runtime_fail("invalid diagnostic input command");
     }
     fclose(f); return NULL;
+}
+/* F9 in the game window: record the next rendered frames as one .nvs scene package (tools/scenecap), with no terminal
+   and no input script. Writes to $TMPDIR (or /tmp); set SCENECAP_DIR to choose another directory. */
+void runtime_scenecap_hotkey(void) {
+    extern void dm_gfx_scenecap_next(const char *path);
+    char path[1024];
+    const char *dir = getenv("SCENECAP_DIR");
+    if (!dir || !*dir) dir = "/tmp";
+    time_t now = time(NULL); struct tm tmv; localtime_r(&now, &tmv);
+    snprintf(path, sizeof path, "%s/scenecap-%04d%02d%02d-%02d%02d%02d.nvs", dir,
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    dm_gfx_scenecap_next(path);
+    fprintf(stderr, "[scenecap] 快捷键抓帧：%s（下一帧写出；SCENECAP_DIR 可改目录）\n", path);
 }
 __attribute__((constructor)) static void input_file_start(void) {
     const char *e = getenv("TOTK_INPUT_FILE"); if (!e || !*e) return;

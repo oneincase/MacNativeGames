@@ -114,7 +114,7 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{runtime_input_key(e.keyCode,1);}
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==101){extern void runtime_scenecap_hotkey(void);runtime_scenecap_hotkey();return;}runtime_input_key(e.keyCode,1);}   /* F9: capture a scenecap scene package */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 /* The game has no mouse controls. In native full screen, keep the pointer out of the picture while idle, but show it again
@@ -204,7 +204,7 @@ static NSString *shortcut_text(void){
  NSString *ratio=!ar?@"16:9":fabsf(ar*9-21)<0.05f?@"21:9":[NSString stringWithFormat:@"%.2f:1",ar];
  NSString *shape=step==1?[NSString stringWithFormat:@(TOTK_UI("适配窗口 %@","fit to window %@")),ratio]:step==2?ratio:@"16:9";
  if(step<0)shape=@(TOTK_UI("本游戏暂不支持","not available in this game"));   /* runtime_aspect_step -1: this game version has no aspect sites */
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  提示：全部 → 只显示 FPS → 隐藏\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  画面比例：当前 %@（按键切换）\n5  边缘平滑（MetalFX 时间性）：%@\n6  手柄类型：当前 %@（按键切换）\n7  鼠标操作：当前 %@（按键切换）","Shortcuts\n1  Overlays: all → FPS only → off\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Aspect ratio: %@ (current; press to cycle)\n5  Edge smoothing (MetalFX Temporal): %@\n6  Controller type: %@ (current; press to cycle)\n7  Mouse: %@ (current; press to switch)")),[NSString stringWithUTF8String:interp],picture,shape,
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  提示：全部 → 只显示 FPS → 隐藏\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  画面比例：当前 %@（按键切换）\n5  边缘平滑（MetalFX 时间性）：%@\n6  手柄类型：当前 %@（按键切换）\n7  鼠标操作：当前 %@（按键切换）\nF9  抓帧（生成 scenecap 场景包）","Shortcuts\n1  Overlays: all → FPS only → off\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Aspect ratio: %@ (current; press to cycle)\n5  Edge smoothing (MetalFX Temporal): %@\n6  Controller type: %@ (current; press to cycle)\n7  Mouse: %@ (current; press to switch)\nF9  Capture a scenecap scene package")),[NSString stringWithUTF8String:interp],picture,shape,
   taa_enabled()?(taa_effective()?@(TOTK_UI("开","on")):@(TOTK_UI("开（未生效）","on (not in effect)"))):@(TOTK_UI("关","off")),pad_type_text(),
   runtime_mouse_enabled()?@(TOTK_UI("开（视角、按键，⌘Tab 释放指针）","on (camera, buttons; Command-Tab frees the pointer)")):@(TOTK_UI("关","off"))];
 }
