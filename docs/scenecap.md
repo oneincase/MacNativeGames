@@ -300,6 +300,10 @@ tools/scenecap/scenecap replay scene.nvs -o out/
 ```sh
 # 两次实时重放互比
 tools/scenecap/scenecap diff out-a out-b -o report.md
+# 大包可以指定并行度；默认就按 CPU 核数切开
+tools/scenecap/scenecap diff out-a out-b -o report.md --jobs 8
+# 默认只给失败的 pass 出差异图；想每题都出图时加 --all-diffs
+tools/scenecap/scenecap diff out-a out-b -o report.md --all-diffs
 
 # 与已提交的基线比
 tools/scenecap/scenecap diff --baseline baselines/nier-title out -o report.md

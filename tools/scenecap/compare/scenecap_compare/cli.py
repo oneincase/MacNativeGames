@@ -35,7 +35,7 @@ from .report import (
     render_report,
     write_report,
 )
-from .results import DiffResult, compare_dirs
+from .results import DiffResult, compare_dirs, compare_dirs_parallel
 
 __all__ = ["main", "build_parser"]
 
@@ -95,6 +95,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-diff-images",
         action="store_true",
         help="不生成差异图（只产出度量与报告）",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        metavar="N",
+        help="并行进程数（默认按 CPU 核数；1 表示不用并行）",
+    )
+    parser.add_argument(
+        "--all-diffs",
+        action="store_true",
+        help="对每个 pass 都输出差异图（默认只对失败的 pass 输出，避免干净的回归跑出成千上万张白图）",
     )
     parser.add_argument(
         "--baseline",
@@ -180,12 +192,14 @@ def _normal_mode(args, command: str, stdout) -> int:
         )
     thresholds = Thresholds(args.max_channel_delta, args.max_diff_pixel_ratio)
     report_path = _report_path(args)
-    result = compare_dirs(
+    result = compare_dirs_parallel(
         args.paths[0],
         args.paths[1],
         thresholds,
         diff_dir=_diff_dir(args, report_path),
         write_diff_images=not args.no_diff_images,
+        all_diffs=args.all_diffs,
+        jobs=args.jobs,
     )
     return _emit(command, result, args, stdout)
 
@@ -257,12 +271,13 @@ def _baseline_mode(args, command: str, stdout) -> int:
         return EXIT_OK
     verify_baseline(baseline_dir)
     thresholds = Thresholds(args.max_channel_delta, args.max_diff_pixel_ratio)
-    result = compare_dirs(
+    result = compare_dirs_parallel(
         load_baseline_replay(baseline_dir),
         candidate,
         thresholds,
         diff_dir=_diff_dir(args, report_path),
         write_diff_images=not args.no_diff_images,
+        jobs=args.jobs,
     )
     return _emit(command, result, args, stdout)
 

@@ -527,7 +527,7 @@ class CliTests(unittest.TestCase):
             ],
         )
         report = self.root / "diff.md"
-        code, _, _ = run_cli([str(self.base), str(changed), "-o", str(report)])
+        code, _, _ = run_cli([str(self.base), str(changed), "-o", str(report), "--all-diffs"])
         self.assertEqual(code, 1)
         diff_dir = self.root / "diff.diff"
         images = sorted(diff_dir.glob("diff_*.png"))
@@ -688,7 +688,7 @@ class CliTests(unittest.TestCase):
         custom = self.root / "custom-diffs"
         report = self.root / "c.md"
         code, _, _ = run_cli(
-            [str(self.base), str(self.cand), "-o", str(report), "--diff-dir", str(custom)]
+            [str(self.base), str(self.cand), "-o", str(report), "--diff-dir", str(custom), "--all-diffs"]
         )
         self.assertEqual(code, 0)
         self.assertEqual(len(list(custom.glob("diff_*.png"))), 2)

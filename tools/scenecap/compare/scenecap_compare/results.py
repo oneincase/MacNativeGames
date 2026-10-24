@@ -146,6 +146,8 @@ def compare_dirs(
     *,
     diff_dir=None,
     write_diff_images: bool = True,
+    all_diffs: bool = False,
+    indices: list[int] | None = None,
 ) -> DiffResult:
     """比较两个重放目录。返回结构化结果（不抛输入错误以外的异常）。"""
     thresholds = thresholds or Thresholds()
@@ -158,7 +160,8 @@ def compare_dirs(
         diff_path.mkdir(parents=True, exist_ok=True)
 
     results: list[PassResult] = []
-    for index in sorted(set(base.passes) | set(cand.passes)):
+    targets = indices if indices is not None else sorted(set(base.passes) | set(cand.passes))
+    for index in targets:
         base_entry = base.passes.get(index)
         cand_entry = cand.passes.get(index)
         slug = (cand_entry or base_entry).slug  # type: ignore[union-attr]
@@ -228,7 +231,9 @@ def compare_dirs(
                         reasons.append(f"无法比较：{exc}")
                     else:
                         reasons.extend(metrics.failures(thresholds))
-                    if write_diff_images and diff_path is not None:
+                    # Only failing passes get a diff image by default: a clean 60-frame run would otherwise
+                    # write thousands of identical white PNGs and dominate the runtime.
+                    if write_diff_images and diff_path is not None and (all_diffs or reasons):
                         target = (
                             diff_path
                             / f"diff_{index:03d}_{safe_slug(slug)}.png"
@@ -269,3 +274,53 @@ def compare_dirs(
         passes=tuple(results),
         diff_dir=diff_path if write_diff_images else None,
     )
+
+
+def _compare_slice(payload: tuple) -> tuple:
+    """Worker: compare one slice of passes and drop the rasters (they are large and not serializable cheaply)."""
+    import dataclasses
+
+    base_path, cand_path, thresholds, diff_dir, write_diff_images, all_diffs, chunk = payload
+    result = compare_dirs(base_path, cand_path, thresholds, diff_dir=diff_dir,
+                          write_diff_images=write_diff_images, all_diffs=all_diffs, indices=list(chunk))
+    return tuple(dataclasses.replace(item, base_raster=None, cand_raster=None) for item in result.passes)
+
+
+def compare_dirs_parallel(
+    base_dir,
+    cand_dir,
+    thresholds: Thresholds | None = None,
+    *,
+    diff_dir=None,
+    write_diff_images: bool = True,
+    all_diffs: bool = False,
+    jobs: int = 0,
+) -> DiffResult:
+    """比较两个重放目录，按 pass 切分到多个进程。
+
+    每个 worker 独立解码自己那批 PNG；返回时丢掉 Raster，避免跨进程搬运几十 MB。
+    """
+    import concurrent.futures
+    import dataclasses
+    import multiprocessing
+
+    thresholds = thresholds or Thresholds()
+    base = base_dir if isinstance(base_dir, ReplayDir) else load_replay_dir(base_dir)
+    cand = cand_dir if isinstance(cand_dir, ReplayDir) else load_replay_dir(cand_dir)
+    if not base.passes:
+        raise InputError(f"基线目录 {base.path} 的 index.json 没有任何 pass")
+    indices = sorted(set(base.passes) | set(cand.passes))
+    workers = jobs if jobs and jobs > 0 else (multiprocessing.cpu_count() or 4)
+    if workers <= 1 or len(indices) <= 32:
+        return compare_dirs(base_dir, cand_dir, thresholds, diff_dir=diff_dir,
+                            write_diff_images=write_diff_images, all_diffs=all_diffs)
+
+    chunks = [indices[i::workers] for i in range(workers)]
+    chunks = [chunk for chunk in chunks if chunk]
+    payloads = [(str(base.path), str(cand.path), thresholds, None if diff_dir is None else str(diff_dir),
+                 write_diff_images, chunk) for chunk in chunks]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        gathered = [item for batch in pool.map(_compare_slice, payloads) for item in batch]
+    gathered.sort(key=lambda item: item.index)
+    return DiffResult(base=base, cand=cand, thresholds=thresholds,
+                      passes=tuple(gathered), diff_dir=Path(diff_dir) if diff_dir else None)
