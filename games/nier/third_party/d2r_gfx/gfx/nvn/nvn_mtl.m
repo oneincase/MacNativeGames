@@ -13316,12 +13316,14 @@ static void *link_main(void *arg) {   // 显示节拍线程：切到节拍模式
     g_link_started = 0;
     return NULL;
 }
-/* DM_PRESENT_LINK_FALLBACK=1 (Bayonetta 3's launcher; default off, TOTK unchanged): when the display link goes silent while
-   the app is active (macOS pauses CAMetalDisplayLink for a window it believes covered, e.g. full screen on another
-   monitor while another app has focus), present in classic mode instead of dropping frames, so the picture keeps moving;
-   the link is tried again once the window has been reported visible for 10 s. */
+/* DM_PRESENT_LINK_FALLBACK (default ON for nier; set =0 to turn it off): when the display link goes silent while
+   the app is active (macOS pauses CAMetalDisplayLink for a window it believes covered — e.g. the window is behind
+   another app's window, or full screen on another monitor while another app has focus), present in classic mode
+   instead of dropping frames, so the picture keeps moving; the link is tried again once the window has been
+   reported visible for 10 s. Previously default off (Bayonetta 3's launcher only), which is why a covered window
+   showed nothing at all. */
 static _Atomic int g_link_fallback; static _Atomic uint64_t g_link_fallback_at;
-static int link_fallback_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_PRESENT_LINK_FALLBACK"); on = e && !strcmp(e, "1"); } return on; }
+static int link_fallback_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_PRESENT_LINK_FALLBACK"); on = !(e && !strcmp(e, "0")); } return on; }
 static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象的状态对齐到 g_dm_present_link 与省电模式（运行中可改） | Called every frame by the game's present thread: aligns the display link object's state to g_dm_present_link and the power-saving mode (can change at run time)
     static int applied; int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
