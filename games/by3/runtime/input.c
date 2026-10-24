@@ -143,7 +143,7 @@ __attribute__((constructor)) static void input_script_start(void) {
 /* Optional local integration-test command stream. Appending complete lines lets tests inspect each
    actual frame before choosing the next input, instead of guessing load/menu timings. Disabled normally.
    Commands: key <Mac keycode> <milliseconds>, down/up <Mac keycode>, shot <path>, wshot <path>, passdump <frames>, gpucapture <path>.gputrace, querylog <frames>, anomdump,
-   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), close. */
+   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), scenecap [<path>] (record scene packages), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
 extern void runtime_front_request_close(void);
 static void *input_file(void *arg) {
@@ -203,6 +203,13 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
+        } else if (!strncmp(line, "scenecap", 8) && (line[8] == 0 || line[8] == ' ' || line[8] == '\n' || line[8] == '\r')) {
+            /* "scenecap [<path>]": record the next rendered frames as one .nvs scene package (tools/scenecap) */
+            extern void dm_gfx_scenecap_next(const char *path);
+            line[strcspn(line, "\r\n")] = 0;
+            const char *sc_arg = line + 8;          /* "scenecap" is 8 characters: skip it, then one or more spaces */
+            while (*sc_arg == ' ') sc_arg++;
+            dm_gfx_scenecap_next(*sc_arg ? sc_arg : NULL);
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
         else runtime_fail("invalid diagnostic input command");
     }

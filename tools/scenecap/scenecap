@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""scenecap — capture, inspect, replay and compare scenecap .nvs scene packages.
+
+    scenecap verify <package.nvs>     container, hashes and manifest reference integrity (exit 0 only when clean)
+    scenecap info <package.nvs>       header, chunk directory and capture summary
+    scenecap cat <package.nvs> <id>   write one decompressed chunk to stdout
+    scenecap manifest <package.nvs>   print the scene manifest as JSON
+    scenecap synth <out.nvs>          write the synthetic package (single triangle, 4x4 texture)
+    scenecap replay <package.nvs> -o <dir>   replay the package offline into pass PNGs
+    scenecap diff <before-dir> <after-dir> -o <report.md>   pixel regression report
+    scenecap --version
+
+Exit codes: 0 success / no regression, 1 invalid package or regression, 2 usage or I/O failure,
+3 the replayer produced at least one unsupported pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(_HERE, "python"))
+
+import scenecap_pkg  # noqa: E402  (after sys.path setup)
+
+
+def _print_directory(package: scenecap_pkg.Package) -> None:
+    print(f"  chunks        {len(package.chunks)}")
+    for chunk in package.chunks:
+        compression = "zstd" if chunk.compressed else "raw"
+        print(
+            f"    {chunk.id:<48} {chunk.kind:<10} {chunk.raw_size:>10} B  {compression:<4} "
+            f"sha256 {chunk.sha256.hex()[:16]}…"
+        )
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    report = scenecap_pkg.verify_package(args.package)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "path": report.path,
+                    "ok": report.ok,
+                    "chunks": report.chunks,
+                    "manifest_bytes": report.manifest_bytes,
+                    "capture": report.capture,
+                    "errors": report.errors,
+                    "warnings": report.warnings,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif not args.quiet:
+        print(report.render())
+    elif not report.ok:  # --quiet still reports the failures
+        for error in report.errors:
+            print(f"error: {error}", file=sys.stderr)
+    return 0 if report.ok else 1
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    try:
+        package = scenecap_pkg.read_package(args.package)
+    except scenecap_pkg.PackageError as exc:
+        print(f"{args.package}: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "path": package.path,
+                    "format": f"{package.major}.{package.minor}",
+                    "flags": package.flags,
+                    "file_size": package.file_size,
+                    "manifest": {
+                        "offset": package.manifest_offset,
+                        "stored_bytes": package.manifest_stored_size,
+                        "raw_bytes": package.manifest_raw_size,
+                        "sha256": package.manifest_sha256.hex(),
+                    },
+                    "capture": package.manifest.get("capture", {}),
+                    "chunks": [
+                        {
+                            "id": chunk.id,
+                            "kind": chunk.kind,
+                            "compression": "zstd" if chunk.compressed else "none",
+                            "offset": chunk.offset,
+                            "stored_bytes": chunk.stored_size,
+                            "raw_bytes": chunk.raw_size,
+                            "sha256": chunk.sha256.hex(),
+                        }
+                        for chunk in package.chunks
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    print(f"path          {package.path}")
+    print(f"format        {package.major}.{package.minor} ({scenecap_pkg.VERSION} reader)")
+    print(f"file size     {package.file_size} B")
+    print(f"manifest      {package.manifest_raw_size} B raw / {package.manifest_stored_size} B stored")
+    print(f"generator     {package.envelope.get('nvs', {}).get('generator', '?')}")
+    capture = package.manifest.get("capture", {})
+    if capture:
+        print(
+            "capture       {game} ({title_id}) {game_version}, port {port_version}, frames {frame_first}..{last} "
+            "on {gpu} / macOS {macos} / Metal {metal}".format(
+                last=int(capture.get("frame_first", 0)) + int(capture.get("frame_count", 1)) - 1, **capture
+            )
+        )
+        print(f"captured at   {capture.get('captured_at', '?')} from commit {capture.get('git_commit', '?')}")
+    print(
+        f"scene         {len(package.manifest.get('passes', []))} pass(es), "
+        f"{len(package.manifest.get('pipelines', []))} pipeline(s), "
+        f"{len(package.manifest.get('draws', []))} draw(s), "
+        f"{len(package.manifest.get('resources', []))} resource(s)"
+    )
+    _print_directory(package)
+    return 0
+
+
+def cmd_cat(args: argparse.Namespace) -> int:
+    try:
+        package = scenecap_pkg.read_package(args.package)
+        data = package.payload(args.chunk)
+    except scenecap_pkg.PackageError as exc:
+        print(f"{args.package}: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def cmd_manifest(args: argparse.Namespace) -> int:
+    try:
+        package = scenecap_pkg.read_package(args.package)
+    except scenecap_pkg.PackageError as exc:
+        print(f"{args.package}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(package.manifest, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_synth(args: argparse.Namespace) -> int:
+    """Write the synthetic package through the replayer's own generator (single source of truth)."""
+    sys.path.insert(0, os.path.join(_HERE, "replay"))
+    import scenecap_synth  # noqa: E402  (optional developer surface, imported on demand)
+
+    return scenecap_synth.main(list(args.synth_args))
+
+
+def _replay_binary() -> str:
+    return os.environ.get("SCENECAP_REPLAY") or os.path.join(_HERE, "replay", "build", "scenecap_replay")
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    binary = _replay_binary()
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        print(
+            f"scenecap: the replayer is not built: {binary}\n"
+            "build it with `make tools/scenecap/replay/build/scenecap_replay` "
+            "(or set SCENECAP_REPLAY to an existing scenecap_replay)",
+            file=sys.stderr,
+        )
+        return 2
+    # argparse.REMAINDER keeps the replayer's own --no-cache/--validate-only/--verbose untouched.
+    command = [binary, args.package, *args.replay_args]
+    try:
+        return subprocess.call(command)
+    except OSError as exc:
+        print(f"scenecap: cannot run {binary}: {exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Forward to the comparison tool; it owns the report format and the exit codes."""
+    sys.path.insert(0, os.path.join(_HERE, "compare"))
+    from scenecap_compare.cli import main as compare_main  # noqa: E402  (imported on demand)
+
+    return compare_main(["diff", *args.diff_args])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="scenecap",
+        description="Inspect and verify scenecap .nvs scene packages (format " + scenecap_pkg.VERSION + ").",
+    )
+    parser.add_argument("--version", action="version", version=f"scenecap {scenecap_pkg.VERSION}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    verify = subparsers.add_parser("verify", help="verify a package: structure, hashes and manifest references")
+    verify.add_argument("package")
+    verify.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    verify.add_argument("--quiet", action="store_true", help="print nothing unless verification fails")
+    verify.set_defaults(func=cmd_verify)
+
+    info = subparsers.add_parser("info", help="print the header, chunk directory and capture summary")
+    info.add_argument("package")
+    info.add_argument("--json", action="store_true")
+    info.set_defaults(func=cmd_info)
+
+    cat = subparsers.add_parser("cat", help="write one decompressed chunk to stdout")
+    cat.add_argument("package")
+    cat.add_argument("chunk")
+    cat.set_defaults(func=cmd_cat)
+
+    manifest = subparsers.add_parser("manifest", help="print the scene manifest")
+    manifest.add_argument("package")
+    manifest.set_defaults(func=cmd_manifest)
+
+    synth = subparsers.add_parser("synth", help="write the synthetic self-test package")
+    synth.add_argument("output", help="path of the .nvs package to write")
+    synth.add_argument("--raw", action="store_true", help="store blobs verbatim instead of zstd frames")
+    synth.add_argument("--indexed", action="store_true", help="draw through an index buffer")
+    synth.add_argument("--compute", action="store_true", help="append a compute pass the replayer must report")
+    synth.add_argument("--broken-shader", action="store_true", help="store MSL that fails to compile")
+    synth.add_argument("--pixel-format", default=None, help="pixel format of the colour attachment")
+
+    def _synth(args: argparse.Namespace) -> int:
+        forwarded: list[str] = [args.output]
+        if args.raw:
+            forwarded.append("--raw")
+        if args.indexed:
+            forwarded.append("--indexed")
+        if args.compute:
+            forwarded.append("--compute")
+        if args.broken_shader:
+            forwarded.append("--broken-shader")
+        if args.pixel_format:
+            forwarded.extend(["--pixel-format", args.pixel_format])
+        args.synth_args = forwarded
+        return cmd_synth(args)
+
+    synth.set_defaults(func=_synth)
+
+    replay = subparsers.add_parser(
+        "replay", help="replay a package offline into one PNG per pass (needs a Metal device)"
+    )
+    replay.add_argument("package")
+    replay.add_argument("replay_args", nargs=argparse.REMAINDER, help="options passed to scenecap_replay")
+    replay.set_defaults(func=cmd_replay)
+
+    diff = subparsers.add_parser("diff", help="compare two replay output directories")
+    diff.add_argument("diff_args", nargs=argparse.REMAINDER, help="arguments passed to the comparison tool")
+    diff.set_defaults(func=cmd_diff)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "diff":
+        # The comparison tool owns its own option surface (--baseline, --update-baseline, -o, ...).
+        # argparse's REMAINDER subparser rejects an option-first tail, so hand it over verbatim.
+        sys.path.insert(0, os.path.join(_HERE, "compare"))
+        from scenecap_compare.cli import main as compare_main  # noqa: E402  (imported on demand)
+
+        return compare_main(argv)
+    parser = build_parser()
+    if not argv:  # bare `scenecap`: print the usage instead of an argparse traceback line
+        parser.print_help()
+        return 0
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except BrokenPipeError:  # e.g. `scenecap cat ... | head`
+        return 0
+    except scenecap_pkg.PackageError as exc:
+        print(f"scenecap: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

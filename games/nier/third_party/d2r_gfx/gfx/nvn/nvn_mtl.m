@@ -17,6 +17,7 @@
 #include <objc/runtime.h>
 #include <fcntl.h>
 #include "nvn_mtl.h"
+#include "scenecap_nvn.h"
 #include "nvn_obj.h"
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
@@ -27,6 +28,7 @@
 #include "totk_sysload.h"
 /* TOTK_MFX_UPSCALE: for the one compose draw that samples the smaller scene, the scene texture and its MetalFX upscale
    (mfxup_draw before the draw, encode_args swaps the binding). */
+static _Atomic long g_td_frame = -2;   /* TOTK: hoisted so RTPROBE can gate on the texdump frame */
 static __strong id<MTLTexture> g_mfxup_src, g_mfxup_out; static __unsafe_unretained id g_mfxup_sh;
 static _Atomic uint64_t g_mfxup_last;   // game frame of the last MetalFX upscale (the FPS box shows " MFX" while recent)
 static _Atomic uint64_t g_mfxi_last;    // game frame of the last interpolated frame shown (the FPS box shows "+<generated>" while recent)
@@ -1877,7 +1879,7 @@ static int ub_skip(const char *key) {   // 本相要不要丢掉这个片元着�
     for (int i = 0; i < g_ub_nk[uc]; i++) { const char *k = g_ub_keys[uc][i]; if (k[0] == '@') continue; if (k[0] == '*' || !strncmp(key, k, strlen(k))) return 1; }
     return 0;
 }
-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); }
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); scenecap_nvn_frame(f); }
 // GPU 计时登记：提交前 gpu_tag_begin(帧)，完成时 gpu_tag_done(帧, GPU 起, GPU 止)（CACurrentMediaTime 基准秒）。
 // 旧队列命令缓冲走 gpu_tag_f；Metal 4 主提交在 mtl_sub_commit 的 feedback 里回填（换 Metal 4 时调用点全丢，「计时」行的 GPU 一栏成了空）
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
@@ -3377,6 +3379,19 @@ static unsigned mip_drop_of(const tex_t *t) {
     return 1;
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk) {
+    /* TOTK diagnostic DM_NVN_MEMDUMP=<serial>: dump the guest bytes of one texture's first upload (first 1 MiB), so a
+       texture that is never written by a render pass or a copy can be checked for being all zero at the source. */
+    { static int md = -1; static int done; if (md < 0) { const char *e = getenv("DM_NVN_MEMDUMP"); md = e ? atoi(e) : 0; }
+      if (md && !done && (long)t->serial == md) { done = 1;
+        size_t n = t->L.size < (1u << 20) ? (size_t)t->L.size : (1u << 20);
+        FILE *fp = fopen("/tmp/nvn_memdump.bin", "wb");
+        size_t w = fp ? fwrite(t->mem, 1, n, fp) : 0; if (fp) fclose(fp);
+        MLOG("[memdump] ser=%llu size=%zu wrote=%zu path=/tmp/nvn_memdump.bin", (unsigned long long)t->serial, (size_t)t->L.size, w); } }
+    /* TOTK diagnostic DM_NVN_PROBEWHITE=<serial>: overwrite that texture's guest bytes with RGBA16F 1.0 everywhere
+       before its first upload, to test whether a probe/IBL texture with too little content is what darkens the world. */
+    { static long pw = -1; if (pw < 0) { const char *e = getenv("DM_NVN_PROBEWHITE"); pw = e ? atol(e) : 0; }
+      if (pw && (long)t->serial == pw && t->mem && t->L.size) { memset(t->mem, 0x3C, (size_t)t->L.size);
+        MLOG("[probewhite] ser=%llu filled %zu bytes with 0x3C (half 1.0)", (unsigned long long)t->serial, (size_t)t->L.size); } }
     MTLTextureDescriptor *d = tex_desc(t, t->has_layout);   // TOTK: default-layout mirrored textures keep render-target usage
     if (!d) return nil;
     unsigned drop = mip_drop_of(t);   // TOTK (iPhone): the copy starts at the game's level `drop` (see mip_drop_of)
@@ -4370,7 +4385,7 @@ static void rp_end(void) { if (g_enc) {
                  (unsigned long long)g_stat_pass, (int)(g_stat_draw - g_pt_draw_base), (unsigned long)R.rt.n, b);
         }
     }
-    sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_lay.active = 0;
+    sd_finish(); scenecap_nvn_pass_end(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_lay.active = 0;
     /* Diagnostic: inspect each full-size HDR render target immediately after its
        producer pass, on the same Metal 4 queue and before later passes reuse it. */
     { static int on = -1; static FILE *f; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -4398,16 +4413,28 @@ static void rp_end(void) { if (g_enc) {
        DM_NVN_RTPROBE=<ser>、DM_NVN_RTPROBE_LOG=<path>（缺省 /tmp/rtprobe.txt）。
        与帧末 texdump 对照，判定"写入后的内容"是否等于"帧末内容"，以及 tint 是否在写入即刻就存在。 */
     { static long psr = -2; static FILE *pf; static long pfrom = -1, pto = -1;
+      static long psrs[16]; static int pnsr;   /* TOTK: DM_NVN_RTPROBE takes a comma list (16,17,24,...) so one run can watch the whole chain */
       if (psr == -2) { const char *e = getenv("DM_NVN_RTPROBE"); psr = e ? strtol(e, NULL, 0) : -1;
           if (psr >= 0) { const char *p = getenv("DM_NVN_RTPROBE_LOG"); pf = fopen(p ? p : "/tmp/rtprobe.txt", "w");
                           const char *a = getenv("DM_NVN_RTPROBE_FROM"), *b = getenv("DM_NVN_RTPROBE_TO");
                           pfrom = a ? strtol(a, NULL, 0) : 0;
-                          pto = b ? strtol(b, NULL, 0) : 0x7fffffffffffffffL; } }
+                          pto = b ? strtol(b, NULL, 0) : 0x7fffffffffffffffL;
+                          psrs[pnsr++] = psr;
+                          for (const char *q = strchr(e, ','); q && pnsr < 16; q = strchr(q + 1, ',')) psrs[pnsr++] = strtol(q + 1, NULL, 0); } }
       long long pfr = (long long)atomic_load(&g_cur_frame);
-      if (psr >= 0 && pf && pfr >= pfrom && pfr <= pto) for (int i = 0; i < R.rt.n && i < 8; i++) {
-          const tex_t *rt = R.rt.color[i]; if (!rt || (long)rt->serial != psr) continue;
+      static long pmax = -2, pcnt;
+      if (pmax == -2) { const char *e = getenv("DM_NVN_RTPROBE_MAX"); pmax = e ? strtol(e, NULL, 0) : 4000; }
+      if (psr >= 0 && pf && pfr >= pfrom && pfr <= pto && pcnt < pmax) {
+        const tex_t *rts[9]; int nrt = 0;
+        for (int i = 0; i < R.rt.n && i < 8; i++) rts[nrt++] = R.rt.color[i];   /* TOTK: colour attachments only - blitting R.rt.depth faults (depth view) */
+        for (int ii = 0; ii < nrt; ii++) { const tex_t *rt = rts[ii]; if (!rt) continue;
+          { int hit = 0; for (int k = 0; k < pnsr; k++) if (psrs[k] == (long)rt->serial) hit = 1; if (!hit) continue; }
           id<MTLTexture> src = tex_mtl(rt);
-          if (!src || src.pixelFormat != MTLPixelFormatRG11B10Float) continue;
+          if (!src) continue;
+          /* TOTK: RG11B10F is decoded by hand; R32F / D32F are plain floats (needed for ser=27 linear depth and ser=4 depth) */
+          int isf = (src.pixelFormat == MTLPixelFormatRG11B10Float);
+          int is32 = (src.pixelFormat == MTLPixelFormatR32Float || src.pixelFormat == MTLPixelFormatDepth32Float);
+          if (!isf && !is32) continue;
           { static int cal; if (!cal++) { id oo = serial_get((uint64_t)psr); id<MTLTexture> tt = [oo isKindOfClass:[NvPkg class]] ? ((NvPkg *)oo)->tex : oo; MLOG("[rtprobe] 校准 ser=%ld attachment=%p serial_get=%p 同=%d", psr, (__bridge void *)src, (__bridge void *)tt, (int)(tt == src)); } }
           uint32_t W = (uint32_t)src.width, H = (uint32_t)src.height;
           id<MTLBuffer> rb; size_t ro = arena_alloc((size_t)W * H * 4, &rb);
@@ -4416,9 +4443,18 @@ static void rp_end(void) { if (g_enc) {
           enc_b_copy_texture_buffer(be, src, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(W, H, 1), rb, ro, (size_t)W * 4, (size_t)W * H * 4);
           m4_end(be);
           uint64_t fr = atomic_load(&g_cur_frame), pass = g_stat_pass;
-          [g_commit_blocks addObject:^{ const uint32_t *v = (const uint32_t *)((const uint8_t *)rb.contents + ro);
+          long ser_c = (long)rt->serial; int is32c = is32;
+          [g_commit_blocks addObject:^{
               double sum[3] = {0}; unsigned nfin[3] = {0}, cnt[3] = {0};
               float mn[3] = {INFINITY, INFINITY, INFINITY}, mx[3] = {-INFINITY, -INFINITY, -INFINITY};
+              if (is32c) {   /* TOTK: plain float target (R32F linear depth or D32F depth): channel 0 only */
+                  const float *fv = (const float *)((const uint8_t *)rb.contents + ro);
+                  for (uint32_t q = 0; q < W * H; q++) {
+                      float f = fv[q];
+                      if (!isfinite(f)) { nfin[0]++; continue; }
+                      sum[0] += f; cnt[0]++; if (f < mn[0]) mn[0] = f; if (f > mx[0]) mx[0] = f; }
+              } else {
+              const uint32_t *v = (const uint32_t *)((const uint8_t *)rb.contents + ro);
               for (uint32_t q = 0; q < W * H; q++) {
                   uint32_t z = v[q];
                   for (int j = 0; j < 3; j++) {
@@ -4431,14 +4467,16 @@ static void rp_end(void) { if (g_enc) {
                       else f = (1.0f + mf) * exp2f((float)ex - 15.0f);
                       if (!isfinite(f)) { nfin[j]++; continue; }
                       sum[j] += f; cnt[j]++; if (f < mn[j]) mn[j] = f; if (f > mx[j]) mx[j] = f; } }
+              }
               fprintf(pf, "F%llu p%llu ser=%ld %ux%u mean=%.4f,%.4f,%.4f min=%.4f,%.4f,%.4f max=%.4f,%.4f,%.4f nonfinite=%u,%u,%u\n",
-                  (unsigned long long)fr, (unsigned long long)pass, psr, W, H,
+                  (unsigned long long)fr, (unsigned long long)pass, ser_c, W, H,
                   cnt[0] ? sum[0] / cnt[0] : 0.0, cnt[1] ? sum[1] / cnt[1] : 0.0, cnt[2] ? sum[2] / cnt[2] : 0.0,
                   cnt[0] ? mn[0] : 0.f, cnt[1] ? mn[1] : 0.f, cnt[2] ? mn[2] : 0.f,
                   cnt[0] ? mx[0] : 0.f, cnt[1] ? mx[1] : 0.f, cnt[2] ? mx[2] : 0.f,
                   nfin[0], nfin[1], nfin[2]);
               fflush(pf); }];
-      } }
+          pcnt++;
+      } } }
     nt_watch_after_pass();
     for (int i = 0; i < g_nblk_wb; i++) blk_copy(g_blk_wb[i].aux, 1, g_blk_wb[i].dst, &g_blk_wb[i]);   // TOTK: block-render results into the compressed texture
     g_nblk_wb = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); if (g_lp.count) lp_finish(); fz_end();
@@ -4789,6 +4827,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (!g_enc) g_rpb_why = 3;
     args_dirty_all();
     g_stat_pass++;
+    scenecap_nvn_pass_begin((__bridge void *)pd, (uint32_t)g_pass.tw, (uint32_t)g_pass.th);
     g_pt_draw_base = g_stat_draw;
     if (lay_n) { g_lay.active = 1; g_lay.base = g_lay.cur = lay_first; g_lay.count = lay_n; if (g_cg_force_layers) g_lay.cur = g_cg_cur;
         if (!g_lay.passes++) MLOG("[totk] layered pass: first one covers layers %d-%d of a %lux%lu level", lay_first, lay_first + lay_n - 1, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
@@ -5130,10 +5169,46 @@ static MTLCompileOptions *totk_precise_opts(void) {
    memory pressure in the middle of a compile (iPad, 2026-10-18: "Compilation failed due to an interrupted connection:
    XPC_ERROR_CONNECTION_INTERRUPTED" while the shader warm-up was running); it restarts on the next request, so such a
    failure is retried instead of being taken as a broken shader. */
+/* TOTK diag 2026-10-24: DM_NVN_MSL_PATCH=<file> applies literal string replacements to the translated MSL before it is
+   compiled. Each line is "old<TAB>new" (literal, not a regex); a line without a tab is ignored.
+   Why this exists: the shader service rewrites <variant>_b.metal on every run (it writes a temp file and renames over the
+   target, so chmod 444 does not stop it), which makes a hand-edited cache file useless as the basis of an experiment --
+   the edit is gone by the time the shader is compiled. Patching the source string in memory is the only reliable seam. */
+static NSString *dm_msl_patch(NSString *src) {
+    static int on = -1;
+    static NSArray<NSArray<NSString *> *> *rules = nil;
+    if (on < 0) {
+        on = 0;
+        const char *p = getenv("DM_NVN_MSL_PATCH");
+        if (p && *p) {
+            NSString *txt = [NSString stringWithContentsOfFile:@(p) encoding:NSUTF8StringEncoding error:nil];
+            NSMutableArray *a = [NSMutableArray array];
+            for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+                NSRange t = [line rangeOfString:@"\t"];
+                if (t.location == NSNotFound || t.location == 0) continue;
+                [a addObject:@[[line substringToIndex:t.location], [line substringFromIndex:t.location + 1]]];
+            }
+            rules = a;
+            on = (int)a.count;
+            MLOG("[mslpatch] %d rule(s) loaded from %s", on, p);
+        }
+    }
+    if (!on || !rules) return src;
+    NSMutableString *s = [src mutableCopy];
+    int n = 0;
+    for (NSArray<NSString *> *r in rules) {
+        if (![s containsString:r[0]]) continue;
+        n += (int)[[s componentsSeparatedByString:r[0]] count] - 1;
+        [s replaceOccurrencesOfString:r[0] withString:r[1] options:0 range:NSMakeRange(0, s.length)];
+    }
+    MLOG("[mslpatch] %d replacement(s) in a %lu-byte source", n, (unsigned long)src.length);
+    return s;
+}
 static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
     NSError *e = nil;
+    NSString *psrc = dm_msl_patch(src);
     for (int attempt = 1;; attempt++) {
-        id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:psrc options:totk_precise_opts() error:&e];
         BOOL interrupted = !lib && [e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"];
         if (lib || !interrupted || attempt == 4) { if (err) *err = e; return lib; }
         MLOG("【红】着色器编译服务连接中断（第 %d 次），%d ms 后重试", attempt, attempt * 100);
@@ -7510,7 +7585,18 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     id<MTLDepthStencilState> s = hm_get_id(&g_dss, &k);
     if (s) return s;
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
-    if (has_depth && S.ds.dt) { d.depthCompareFunction = (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw; }
+    if (has_depth && S.ds.dt) { MTLCompareFunction cf = (MTLCompareFunction)(S.ds.df - 1);
+        /* TOTK diagnostic DM_NVN_EQUAL2LEQUAL: NVN depth EQUAL assumes the prepass wrote bit-identical depth with the
+           same transform. A different vertex shader in the lighting pass can miss by one ULP and discard every pixel,
+           which would leave the scene RT holding only emissive/additive content. */
+        static int e2l = -1; if (e2l < 0) e2l = getenv("DM_NVN_EQUAL2LEQUAL") ? 1 : 0;
+        if (e2l && cf == MTLCompareFunctionEqual) cf = MTLCompareFunctionLessEqual;
+        /* TOTK diagnostic DM_NVN_DEPTH_ALWAYS: force every depth comparison to ALWAYS so a lighting pass cannot be rejected
+           by depth at all. Distinguishes "fragment never shaded" (nothing changes) from "fragment shaded but depth-tested
+           out" (the scene appears). Diagnostic only -- it also paints geometry that should be hidden. */
+        static int dalways = -1; if (dalways < 0) dalways = getenv("DM_NVN_DEPTH_ALWAYS") ? 1 : 0;
+        if (dalways) cf = MTLCompareFunctionAlways;
+        d.depthCompareFunction = cf; d.depthWriteEnabled = S.ds.dw; }
     if (has_stencil && S.ds.st) {
         MTLStencilDescriptor *f = [MTLStencilDescriptor new], *b = [MTLStencilDescriptor new];
         f.stencilCompareFunction = (MTLCompareFunction)(S.ds.sf_f - 1); f.stencilFailureOperation = (MTLStencilOperation)(S.ds.fail_f - 1);
@@ -7855,6 +7941,11 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
+                { static int cbx = -1; static int cbn; if (cbx < 0) cbx = getenv("DM_NVN_CBX") ? 1 : 0;
+                  if (cbx && nvn_stage == 1 && reg == 1 && u->size >= 40 && cbn < 12) { cbn++;
+                     const float *fp = (const float *)u->addr;
+                     MLOG("[cbx] F%llu p%llu st1 cb1 size=%llu f0..9 = %g %g %g %g %g %g %g %g %g %g", (unsigned long long)g_cur_frame, (unsigned long long)g_stat_pass, (unsigned long long)u->size,
+                          fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7], fp[8], fp[9]); } }
                 // DM_NVN_CBDUMP=目录：同时把整块 uniform 原样存盘（F帧_p通道_st阶段_cb槽_地址.bin），供真值侧按客体地址逐字节对
                 // DM_NVN_CBDUMP=directory: also saves the whole uniform block to disk as-is (F<frame>_p<pass>_st<stage>_cb<slot>_<address>.bin), for the ground-truth side to compare byte by byte by guest address
                 static const char *cbd; static int cbd_init; if (!cbd_init) { cbd = getenv("DM_NVN_CBDUMP"); cbd_init = 1; }
@@ -10630,6 +10721,11 @@ frz_plain:;
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // 管线只依赖（程序, 通道目标, 混合 / 颜色 / 写掩码 / 多重采样状态, 顶点布局）：这些没变就沿用上次的
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
+    /* TOTK diagnostic DM_NVN_RED27=1: for draws whose colour target 0 is the linear-depth RT (serial 27), force the
+       colour write mask to full so the deliberately red fragment shader becomes visible downstream. Answers
+       "did pass 149541's 434 big draws rasterise at all?" - if they never rasterise, nothing on screen changes. */
+    { static int red27 = -1; if (red27 < 0) { const char *e = getenv("DM_NVN_RED27"); red27 = e && atoi(e); }
+      if (red27 && R.rt.n >= 1 && R.rt.color[0] && (long)R.rt.color[0]->serial == 27) { static int n27; if (n27++ < 3) MLOG("[red27] pass %llu forcing full colour mask (vc=%d)", g_stat_pass, (int)(dw ? dw->count : di ? di->count : 0)); S.chmask.mask = 0xffffffffu; } }
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
@@ -10848,6 +10944,7 @@ frz_plain:;
     udc_note_draw(pr);
     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
+    scenecap_nvn_draw(dw, di);
     if (ind.kind == 1 && dw && prim != 7) {   /* NieR P2: the count lives in the record, written by the compaction kernel */
         use_rec("buf", ind.args, 16, 0, NULL);
         enc_r_draw_indirect(en, mp, ind.args); g_gs_ind_draws++;
@@ -11052,6 +11149,7 @@ static void dispatch(const p_dispatch *dp) {
     if (cpr->missing) { static uint64_t n; if (!n++) MLOG("[shader-miss] 计算着色器还没翻译：跳过这个派发（以后同类不再提示）"); return; }
     NvShader *cs = cpr->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
+    scenecap_nvn_dispatch(dp);
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
@@ -12051,7 +12149,7 @@ static void shot_body(id<MTLTexture> src, const char *path, int screen, const in
 // 诊断用：在下一帧第一次开通道前等 GPU 做完，再把每张（取该帧用到的 mip 级）全屏采样画进 RGBA8 存 PNG（浮点格式按 [0,1] 截断）
 // ---------- DM_NVN_TEXDUMP=frame number:path (%d in the path is replaced with "index*100+mip level"): save each color render target used by that frame as an image ----------
 // Diagnostic: before the first render pass of the next frame is opened, wait for the GPU to finish, then draw each one (the mip level used by that frame) by full-screen sampling into RGBA8 and save as PNG (float formats are clamped to [0,1])
-static _Atomic long g_td_frame = -2; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
+static _Atomic long g_td_frame; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
 static _Atomic int g_td_auto_armed;
 // TOTK: DM_NVN_TEXPNG_FS=片元着色器键前缀：记下该着色器实际绑定过的贴图序号，帧转储时连同各级 mip 一起存成 PNG（序号每次运行都变，按着色器选更稳）
 // TOTK: DM_NVN_TEXPNG_FS=fragment shader key prefix: remember the serials of textures that shader actually bound, and dump them with every mip level at frame dump time (serials change per run; selecting by shader is stable)
@@ -15053,3 +15151,8 @@ void botw_serial_note(uint64_t serial, const char *what) {
     for (int i = 0; i < c; i++) if (seen[i] == serial) { MLOG("[tile] f%llu ser=%llu %s", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)serial, what); return; }
 }
 #endif
+
+/* scenecap: structured scene capture hooks (tools/scenecap/capture/scenecap_nvn.inc).  The glue reads this
+ * file's replay state, so it is included here, after every definition it uses.  Inert unless SCENECAP=1. */
+#define SCENECAP_NVN_TOTK 0
+#include "scenecap_nvn.inc"

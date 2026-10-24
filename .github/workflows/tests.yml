@@ -35,3 +35,8 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all tests/test_controller_map.c -o "$RUNNER_TEMP/test-controller-map"
           "$RUNNER_TEMP/test-controller-map"
+      - name: Check the scenecap .nvs container format
+        run: |
+          python -m unittest discover -s tools/scenecap/tests -v
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all -Itools/scenecap/format tools/scenecap/format/nvs_format.c tools/scenecap/tests/test_nvs_format.c -o "$RUNNER_TEMP/test-nvs-format"
+          "$RUNNER_TEMP/test-nvs-format"
