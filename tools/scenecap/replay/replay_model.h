@@ -12,6 +12,10 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /* Small fixed-size vectors; Objective-C properties cannot have array types. */
+typedef struct ScGrid {
+    uint32_t v[3];
+} ScGrid;
+
 typedef struct ScVec4 {
     double v[4];
 } ScVec4;
@@ -282,6 +286,14 @@ typedef NS_OPTIONS(NSUInteger, ScResourceUsage) {
 @property (nonatomic, readonly) BOOL indexed;
 @end
 
+@interface ScDispatch : NSObject
+@property (nonatomic, copy) NSString *ident;
+@property (nonatomic, copy) NSString *passId;
+@property (nonatomic, copy) NSString *pipelineId;
+@property (nonatomic) ScGrid grid;
+@property (nonatomic, strong, nullable) ScArgumentTable *argumentTable;
+@end
+
 @interface ScPass : NSObject
 @property (nonatomic, copy) NSString *ident;
 @property (nonatomic) BOOL hasFrame;
@@ -311,6 +323,7 @@ typedef NS_OPTIONS(NSUInteger, ScResourceUsage) {
 @property (nonatomic, copy) NSArray<ScResource *> *resources;
 @property (nonatomic, copy) NSArray<ScPipeline *> *pipelines;
 @property (nonatomic, copy) NSArray<ScPass *> *passes;
+@property (nonatomic, copy, readonly) NSArray<ScDispatch *> *dispatches;
 @property (nonatomic, copy) NSArray<ScDraw *> *draws;
 @property (nonatomic, copy) NSArray<NSDictionary<NSString *, id> *> *frames;
 

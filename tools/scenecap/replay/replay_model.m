@@ -65,6 +65,9 @@
 }
 @end
 
+@implementation ScDispatch
+@end
+
 @implementation ScPass
 - (NSString *)kindName
 {
@@ -306,6 +309,8 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
 - (void)parsePipelines:(NSDictionary *)manifest errors:(NSMutableArray<NSString *> *)errors;
 - (void)parsePasses:(NSDictionary *)manifest errors:(NSMutableArray<NSString *> *)errors;
 - (void)parseDraws:(NSDictionary *)manifest errors:(NSMutableArray<NSString *> *)errors;
+- (void)parseDispatches:(NSDictionary *)manifest errors:(NSMutableArray<NSString *> *)errors;
+- (NSArray<ScBufferBinding *> *)parseBufferBindings:(NSArray *)entries where:(NSString *)where errors:(NSMutableArray<NSString *> *)errors;
 - (NSArray<ScBufferBinding *> *)parseBufferBindings:(NSArray *)entries
                                                where:(NSString *)where
                                               errors:(NSMutableArray<NSString *> *)errors;
@@ -314,9 +319,13 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ScPipeline *> *pipelineMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ScPass *> *passMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ScDraw *> *drawMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, ScDispatch *> *dispatchMap;
+@property (nonatomic, strong) NSMutableArray<ScDispatch *> *dispatchList;
 @end
 
 @implementation ScScene
+
+- (NSArray<ScDispatch *> *)dispatches { return self.dispatchList ?: @[]; }
 
 + (instancetype)sceneWithManifest:(NSDictionary<NSString *, id> *)manifest
                            errors:(NSMutableArray<NSString *> *)errors
@@ -327,6 +336,8 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
     scene.pipelineMap = [NSMutableDictionary dictionary];
     scene.passMap = [NSMutableDictionary dictionary];
     scene.drawMap = [NSMutableDictionary dictionary];
+    scene.dispatchMap = [NSMutableDictionary dictionary];
+    scene.dispatchList = [NSMutableArray array];
 
     NSDictionary *capture = sc_dict(manifest, @"capture", @"manifest", errors, YES);
     if (capture) {
@@ -360,6 +371,7 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
     [scene parsePipelines:manifest errors:errors];
     [scene parsePasses:manifest errors:errors];
     [scene parseDraws:manifest errors:errors];
+    [scene parseDispatches:manifest errors:errors];
     [scene crossCheck:errors];
     return scene;
 }
@@ -812,6 +824,50 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
         [parsed addObject:pass];
     }
     self.passes = parsed;
+}
+
+- (void)parseDispatches:(NSDictionary *)manifest errors:(NSMutableArray<NSString *> *)errors {
+    NSArray *entries = sc_array(manifest, @"dispatches", @"manifest", errors, NO);
+    for (NSUInteger i = 0; i < entries.count; i++) {
+        if (![entries[i] isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *dict = entries[i];
+        NSString *where = [NSString stringWithFormat:@"manifest.dispatches[%lu]", (unsigned long)i];
+        ScDispatch *d = [[ScDispatch alloc] init];
+        d.ident = sc_string_or(dict, @"id", where, errors, @"");
+        d.passId = sc_string_or(dict, @"pass", where, errors, @"");
+        d.pipelineId = sc_string_or(dict, @"pipeline", where, errors, @"");
+        NSArray *grid = sc_array(dict, @"grid", where, errors, NO);
+        for (NSUInteger g = 0; g < 3; g++) {
+            d.grid.v[g] = (grid && grid.count > g) ? (uint32_t)[grid[g] unsignedLongLongValue] : 1;
+        }
+        NSDictionary *table = sc_dict(dict, @"argument_table", where, errors, NO);
+        if (table) {
+            ScArgumentTable *parsed = [[ScArgumentTable alloc] init];
+            NSString *tw = sc_join_where(where, @"argument_table");
+            parsed.vertexBuffers = [self parseBufferBindings:sc_array(table, @"vertex_buffers", tw, errors, NO)
+                                                       where:sc_join_where(tw, @"vertex_buffers") errors:errors];
+            parsed.uniformBuffers = [self parseBufferBindings:sc_array(table, @"uniform_buffers", tw, errors, NO)
+                                                        where:sc_join_where(tw, @"uniform_buffers") errors:errors];
+            parsed.fragmentBuffers = [self parseBufferBindings:sc_array(table, @"fragment_buffers", tw, errors, NO)
+                                                         where:sc_join_where(tw, @"fragment_buffers") errors:errors];
+            NSArray *textures = sc_array(table, @"textures", tw, errors, NO);
+            NSMutableArray<ScTextureBinding *> *parsedTex = [NSMutableArray array];
+            for (NSUInteger t = 0; textures && t < textures.count; t++) {
+                if (![textures[t] isKindOfClass:[NSDictionary class]]) continue;
+                NSString *texWhere = [NSString stringWithFormat:@"%@.textures[%lu]", tw, (unsigned long)t];
+                ScTextureBinding *b = [[ScTextureBinding alloc] init];
+                NSNumber *slot = sc_integer(textures[t], @"index", texWhere, errors, YES, 0);
+                b.index = slot ? slot.unsignedIntValue : 0;
+                b.stage = sc_integer(textures[t], @"stage", texWhere, errors, NO, 0);
+                b.textureId = sc_string(textures[t], @"texture", texWhere, errors, YES);
+                [parsedTex addObject:b];
+            }
+            parsed.textures = parsedTex;
+            d.argumentTable = parsed;
+        }
+        if (d.ident.length) self.dispatchMap[d.ident] = d;
+        [self.dispatchList addObject:d];
+    }
 }
 
 - (void)parseDraws:(NSDictionary *)manifest errors:(NSMutableArray<NSString *> *)errors

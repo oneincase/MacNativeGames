@@ -207,6 +207,7 @@ static int ScRun(NSArray<NSString *> *arguments) {
     }
 
     NSMutableArray<NSDictionary *> *passEntries = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *dispatchEntries = [NSMutableArray array];
     NSMutableArray<NSDictionary *> *unsupported = [NSMutableArray array];
     NSMutableArray<NSDictionary *> *errors = [NSMutableArray arrayWithArray:ScMissingReflectionErrors(scene)];
     NSMutableDictionary *device = [NSMutableDictionary dictionaryWithDictionary:@{@"name" : @"unknown", @"metal_version" : @"unknown"}];
@@ -246,6 +247,38 @@ static int ScRun(NSArray<NSString *> *arguments) {
     if (result == ScExitOk) {
         for (NSUInteger index = 0; index < scene.passes.count; index++) {
             ScPass *pass = scene.passes[index];
+            if (pass.kind == ScPassKindCompute) {
+                BOOL failed = NO;
+                for (ScDispatch *d in scene.dispatches) {
+                    if (![d.passId isEqualToString:pass.ident]) continue;
+                    NSError *dispatchError = nil;
+                    BOOL ok = [renderer dispatchPass:d error:&dispatchError];
+                    NSMutableDictionary *entry = [@{@"pass" : pass.ident, @"dispatch" : d.ident,
+                                                    @"grid" : @[@(d.grid.v[0]), @(d.grid.v[1]), @(d.grid.v[2])]} mutableCopy];
+                    if (ok) {
+                        entry[@"status"] = @"ok";
+                        if (verbose) printf("pass %03lu %s: dispatch %s ok\n", (unsigned long)index,
+                                            pass.ident.UTF8String, d.ident.UTF8String);
+                    } else {
+                        entry[@"status"] = @"failed";
+                        NSString *why = dispatchError.localizedDescription ?: @"dispatch failed";
+                        entry[@"reason"] = why;
+                        failed = YES;
+                        fprintf(stderr, "scenecap_replay: dispatch \"%s\": %s\n", d.ident.UTF8String,
+                                why.UTF8String);
+                    }
+                    [dispatchEntries addObject:entry];
+                }
+                if (failed) result = ScExitFailure;
+                /* A compute pass writes storage textures in place and has no colour attachment,
+                 * so it is executed but still exports nothing. */
+                NSString *noImage = @"no colour attachment to export";
+                [unsupported addObject:@{@"pass" : @(index), @"reason" : noImage, @"pass_id" : pass.ident}];
+                if (verbose) printf("pass %03lu %s: unsupported (%s)\n", (unsigned long)index,
+                                    pass.ident.UTF8String, noImage.UTF8String);
+                if (result == ScExitOk) result = ScExitUnsupported;
+                continue;
+            }
             if (pass.kind != ScPassKindRender) {
                 NSString *reason = [NSString stringWithFormat:@"%@ passes are not replayed yet", pass.kindName];
                 [unsupported addObject:@{@"pass" : @(index), @"reason" : reason, @"pass_id" : pass.ident}];
@@ -344,6 +377,7 @@ static int ScRun(NSArray<NSString *> *arguments) {
         },
         @"device" : device,
         @"passes" : passEntries,
+        @"dispatches" : dispatchEntries,
         @"unsupported" : unsupported,
         @"errors" : errors,
     };

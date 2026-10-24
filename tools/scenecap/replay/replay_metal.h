@@ -54,6 +54,8 @@ NS_ASSUME_NONNULL_BEGIN
 /* Encodes one render pass and reads its main colour attachment back.  Returns nil with *error set on failure, and
  * nil without *error when the pass has no colour attachment to export (the caller records it as unsupported). */
 - (nullable ScPassImage *)renderPass:(ScPass *)pass drawCount:(NSUInteger *)drawCount error:(NSError **)error;
+/* Compute passes write storage textures in place; nothing is exported for them. */
+- (BOOL)dispatchPass:(ScDispatch *)dispatch error:(NSError **)error;
 
 /* Serialises the pipeline archive when caching is enabled.  Failures are warnings, never fatal. */
 - (BOOL)flushCacheWithError:(NSError **)error;

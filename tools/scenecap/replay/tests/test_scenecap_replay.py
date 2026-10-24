@@ -204,7 +204,7 @@ class ReplayTests(SynthFixture):
 
         index = read_index(output)
         self.assertEqual(index["schema"], "scenecap.replay/1")
-        self.assertEqual(set(index), {"schema", "package", "device", "passes", "unsupported", "errors"})
+        self.assertEqual(set(index), {"schema", "package", "device", "passes", "dispatches", "unsupported", "errors"})
         package = index["package"]
         self.assertEqual(package["path"], self.package)
         self.assertRegex(package["sha256"], r"^[0-9a-f]{64}$")
@@ -335,7 +335,7 @@ class ReplayTests(SynthFixture):
 
 
 class FailureTests(SynthFixture):
-    def test_compute_pass_is_reported_as_unsupported(self) -> None:
+    def test_compute_pass_is_dispatched_and_exports_nothing(self) -> None:
         require_metal(self)
         package = os.path.join(self.directory, "compute.nvs")
         write_package(package, with_compute_pass=True)
@@ -346,8 +346,11 @@ class FailureTests(SynthFixture):
         self.assertEqual(len(index["unsupported"]), 1)
         entry = index["unsupported"][0]
         self.assertEqual(entry["pass"], 1)
-        self.assertIn("compute", entry["reason"])
+        self.assertIn("colour attachment", entry["reason"])
         self.assertEqual([item["index"] for item in index["passes"]], [0])
+        # A compute pass is executed rather than dropped; the package has no dispatch record for it,
+        # so the dispatch list stays empty and nothing is exported.
+        self.assertEqual(index["dispatches"], [])
 
     def test_missing_blob_fails_and_names_the_resource(self) -> None:
         package = os.path.join(self.directory, "missing.nvs")

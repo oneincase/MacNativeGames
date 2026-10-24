@@ -314,6 +314,7 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     NSMutableDictionary<NSString *, id<MTLTexture>> *_textures;
     NSMutableDictionary<NSString *, id<MTLBuffer>> *_buffers;
     NSMutableDictionary<NSString *, id<MTLLibrary>> *_libraries;
+    NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *_computeStates;
     NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *_pipelines;
     NSMutableDictionary<NSString *, id<MTLDepthStencilState>> *_depthStates;
     NSMutableDictionary<NSString *, id<MTLSamplerState>> *_samplers;
@@ -353,6 +354,7 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     renderer->_textures = [NSMutableDictionary dictionary];
     renderer->_buffers = [NSMutableDictionary dictionary];
     renderer->_libraries = [NSMutableDictionary dictionary];
+    renderer->_computeStates = [NSMutableDictionary dictionary];
     renderer->_pipelines = [NSMutableDictionary dictionary];
     renderer->_depthStates = [NSMutableDictionary dictionary];
     renderer->_samplers = [NSMutableDictionary dictionary];
@@ -1475,6 +1477,109 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     }
 
     if (drawCount != NULL) *drawCount = encoded;
+    return YES;
+}
+
+
+#pragma mark - compute
+
+- (nullable id<MTLComputePipelineState>)computeStateForStage:(ScStage *)stage
+                                                  ofPipeline:(ScPipeline *)pipeline
+                                                       error:(NSError **)error {
+    NSString *key = stage.mslBlobId;
+    if (key.length == 0) {
+        if (error) *error = ScReplayError(@"pipeline \"%@\": compute stage has no MSL blob", pipeline.ident);
+        return nil;
+    }
+    id<MTLComputePipelineState> cached = _computeStates[key];
+    if (cached != nil) return cached;
+    id<MTLLibrary> library = [self libraryForStage:stage ofPipeline:pipeline error:error];
+    if (library == nil) return nil;
+    id<MTLFunction> function = [self functionForStage:stage ofPipeline:pipeline error:error];
+    if (function == nil) return nil;
+    MTLComputePipelineDescriptor *descriptor = [MTLComputePipelineDescriptor new];
+    descriptor.computeFunction = function;
+    NSError *pipelineError = nil;
+    id<MTLComputePipelineState> state = [_device newComputePipelineStateWithDescriptor:descriptor
+                                                                              options:MTLPipelineOptionNone
+                                                                           reflection:nil
+                                                                                error:&pipelineError];
+    if (state == nil) {
+        if (error) {
+            *error = ScReplayError(@"pipeline \"%@\": Metal refused the compute pipeline state: %@", pipeline.ident,
+                                   pipelineError.localizedDescription ?: @"unknown Metal error");
+        }
+        return nil;
+    }
+    _computeStates[key] = state;
+    return state;
+}
+
+/* Execute one dispatch so the storage textures it writes are correct for the render passes that follow.
+ * A dispatch has no colour attachment, so nothing is exported for it. */
+- (BOOL)dispatchPass:(ScDispatch *)dispatch error:(NSError **)error {
+    ScPipeline *pipeline = [_scene pipelineNamed:dispatch.pipelineId];
+    if (pipeline == nil) {
+        if (error) *error = ScReplayError(@"dispatch \"%@\": unknown pipeline \"%@\"", dispatch.ident, dispatch.pipelineId);
+        return NO;
+    }
+    ScStage *kernel = nil;
+    for (ScStage *stage in pipeline.stages) {
+        if (stage.kind == ScStageKernel) { kernel = stage; break; }
+    }
+    if (kernel == nil) {
+        if (error) *error = ScReplayError(@"dispatch \"%@\": pipeline \"%@\" has no compute stage", dispatch.ident, pipeline.ident);
+        return NO;
+    }
+    id<MTLComputePipelineState> state = [self computeStateForStage:kernel ofPipeline:pipeline error:error];
+    if (state == nil) return NO;
+
+    id<MTLCommandBuffer> commandBuffer = [_queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (encoder == nil) {
+        if (error) *error = ScReplayError(@"dispatch \"%@\": cannot create a compute command encoder", dispatch.ident);
+        return NO;
+    }
+    encoder.label = dispatch.ident;
+    [encoder setComputePipelineState:state];
+    ScArgumentTable *table = dispatch.argumentTable;
+    NSArray<NSArray<ScBufferBinding *> *> *bufferLists = @[table.vertexBuffers, table.uniformBuffers, table.fragmentBuffers];
+    for (NSArray<ScBufferBinding *> *list in bufferLists) {
+        for (ScBufferBinding *binding in list) {
+            ScResource *resource = [_scene resourceNamed:binding.resourceId];
+            if (resource == nil || resource.isTexture) continue;
+            id<MTLBuffer> buffer = [self bufferForResource:resource error:error];
+            if (buffer == nil) { [encoder endEncoding]; return NO; }
+            [encoder setBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
+        }
+    }
+    for (ScTextureBinding *binding in table.textures) {
+        ScResource *resource = [_scene resourceNamed:binding.textureId];
+        if (resource == nil || !resource.isTexture) continue;
+        id<MTLTexture> texture = [self textureForResource:resource error:error];
+        if (texture == nil) { [encoder endEncoding]; return NO; }
+        [encoder setTexture:texture atIndex:binding.index];
+    }
+    for (ScSamplerBinding *binding in table.samplers) {
+        id<MTLSamplerState> sampler = [self samplerStateForBinding:binding error:error];
+        if (sampler == nil) continue;
+        [encoder setSamplerState:sampler atIndex:binding.index];
+    }
+    MTLSize groups = MTLSizeMake((NSUInteger)MAX(dispatch.grid.v[0], 1u), (NSUInteger)MAX(dispatch.grid.v[1], 1u),
+                                 (NSUInteger)MAX(dispatch.grid.v[2], 1u));
+    /* The NVN threadgroup size is baked into the translated MSL; 64 matches every kernel observed so far. */
+    MTLSize local = MTLSizeMake(64, 1, 1);
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:local];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status == MTLCommandBufferStatusError) {
+        if (error) {
+            *error = ScReplayError(@"dispatch \"%@\": the command buffer failed: %@", dispatch.ident,
+                                   commandBuffer.error.localizedDescription ?: @"unknown Metal error");
+        }
+        return NO;
+    }
     return YES;
 }
 

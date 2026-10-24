@@ -457,6 +457,18 @@ sleep 22 && printf 'scenecap /tmp/nier.nvs\n' >> /tmp/sc-in.txt
 - 测试：`tools/scenecap/tests/`、`tools/scenecap/replay/tests/`、`tools/scenecap/compare/tests/`
   与顶层 `make check`
 
+### 9.4 compute pass 重放
+
+重放器现在会**执行** compute pass（此前一律记为 unsupported）：
+
+- `tools/scenecap/replay/replay_model.m` 解析 manifest 顶层的 `dispatches[]`（`id`/`pass`/`pipeline`/`grid`/`argument_table`）。
+- `replay_metal.m` 的 `dispatchPass:error:` 建 compute pipeline（按 `stage.mslBlobId` 缓存）、绑 buffer/texture/sampler、`dispatchThreadgroups:` 后 `waitUntilCompleted`；threadgroup 大小固定 64×1×1。
+- `index.json` 新增顶层 `dispatches[]`：每项 `{pass, dispatch, grid, status, reason?}`；compute pass 仍列入 `unsupported`，原因统一为 `no colour attachment to export`（它没有可导出的颜色附件）。
+
+实测（`/tmp/scenecap-20261024-232638.nvs`，60 帧）：1860 pass 里 120 个 compute 全部 `status=ok`，`unsupported` 180 条（全部是 `no colour attachment`），`errors` 空。
+
+**已知限制**：本次实测中 120 个 compute 执行后，导出 PNG 与"compute 未执行"时逐像素一致（0 差异）。说明 dispatch 的结构（pipeline/绑定/grid）已跑通，但写入结果没有反映到后续采样里，需要继续核对 storage texture 的写绑定与 threadgroup 尺寸；在那之前不要把 compute 结果当作可信输入。
+
 ## 9. 开发构建与指令式抓帧（推荐用法）
 
 发布产物里不应该带抓帧钩子：默认 `SCENECAP=0` 时 `scenecap_capture.c` / `nvs_format.c` 不进编译，`nvn_mtl.m` 的 7 处钩子、`input.c` 的 `scenecap` 命令、`frontend.m` 的 F9/F10 全部由 `#if SCENECAP_HOOKS` 排除。实测发布构建 `strings nier-native | grep -c scenecap` 为 0。
