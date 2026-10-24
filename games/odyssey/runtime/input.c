@@ -242,6 +242,7 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
+#if SCENECAP_HOOKS
         } else if (!strncmp(line, "scenecap", 8) && (line[8] == 0 || line[8] == ' ' || line[8] == '\n' || line[8] == '\r')) {
             /* "scenecap [<path>] [<frames>]": record the next rendered frames as one .nvs scene package (tools/scenecap) */
             extern void dm_gfx_scenecap_next(const char *path);
@@ -264,6 +265,7 @@ static void *input_file(void *arg) {
                     dm_gfx_scenecap_next(sc_target);
                 }
             }
+#endif
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
         else runtime_fail("invalid diagnostic input command");
     }
@@ -271,6 +273,7 @@ static void *input_file(void *arg) {
 }
 /* F9 in the game window: record the next rendered frames as one .nvs scene package (tools/scenecap), with no terminal
    and no input script. Writes to $TMPDIR (or /tmp); set SCENECAP_DIR to choose another directory. */
+#if SCENECAP_HOOKS
 void runtime_scenecap_hotkey(void) {
     extern void dm_gfx_scenecap_next(const char *path);
     char path[1024];
@@ -301,6 +304,7 @@ void runtime_scenecap_record(unsigned nframes) {
     fprintf(stderr, "[scenecap] 快捷键录制 %u 帧：%s（抓满后写出；SCENECAP_DIR / SCENECAP_RECORD_FRAMES 可改）\n",
             nframes, path);
 }
+#endif
 __attribute__((constructor)) static void input_file_start(void) {
     const char *e = getenv("TOTK_INPUT_FILE"); if (!e || !*e) return;
     pthread_t t; if (pthread_create(&t, NULL, input_file, (void *)e)) runtime_fail("diagnostic input thread"); pthread_detach(t);

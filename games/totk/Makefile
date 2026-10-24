@@ -1,7 +1,8 @@
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m)
 GFX_OBJECTS := $(addprefix build/gfx/,$(addsuffix .o,$(GFX_SRC)))
 NATIVE_OPT ?= -O2
-GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include
+SCENECAP ?= 0
+GFX_FLAGS := -std=gnu11 -DSCENECAP_HOOKS=$(SCENECAP) -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include
 
 PY := .venv/bin/python
 # GPU work outside build/totk-native waits for the game slot too (the game binary takes it itself): one game or GPU

@@ -456,3 +456,44 @@ sleep 22 && printf 'scenecap /tmp/nier.nvs\n' >> /tmp/sc-in.txt
 - 多游戏同步：`tools/scenecap/sync.py`
 - 测试：`tools/scenecap/tests/`、`tools/scenecap/replay/tests/`、`tools/scenecap/compare/tests/`
   与顶层 `make check`
+
+## 9. 开发构建与指令式抓帧（推荐用法）
+
+发布产物里不应该带抓帧钩子：默认 `SCENECAP=0` 时 `scenecap_capture.c` / `nvs_format.c` 不进编译，`nvn_mtl.m` 的 7 处钩子、`input.c` 的 `scenecap` 命令、`frontend.m` 的 F9/F10 全部由 `#if SCENECAP_HOOKS` 排除。实测发布构建 `strings nier-native | grep -c scenecap` 为 0。
+
+### 9.1 编一个能抓帧的开发版
+
+```sh
+make -C games/nier runtime WORK=/Volumes/bit2t/switch/totk/NIER_build -j8 SCENECAP=1
+```
+
+`SCENECAP` 变化不会自动触发 `nvn_mtl.m` 重编，切换开关后先 `touch games/nier/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m`。开发版启动后会在 `/tmp/scenecap-<pid>.sock` 上监听，日志里有一行 `scenecap: control socket /tmp/scenecap-<pid>.sock`。
+
+### 9.2 用 CLI 下发抓帧
+
+```sh
+# 抓 3 帧连续画面（默认写到 /tmp/scene.nvs）
+./tools/scenecap/scenecap capture --name nier-native --frames 3 --out /tmp/scene.nvs --wait
+
+# 只抓一帧
+./tools/scenecap/scenecap capture --name nier-native --out /tmp/one.nvs --wait
+
+# 按 pid 指定（多开时）
+./tools/scenecap/scenecap capture --pid 12345 --frames 10 --out /tmp/ten.nvs
+```
+
+`--name` 按进程名找（`nier-native`），`--wait` 轮询文件大小直到稳定再返回。指令只设置请求状态，真正的捕获仍由渲染线程在帧边界开始/结束，所以不会打断 pass。
+
+### 9.3 重放与对比
+
+```sh
+./tools/scenecap/scenecap verify /tmp/scene.nvs
+./tools/scenecap/scenecap replay /tmp/scene.nvs -o /tmp/out
+./tools/scenecap/scenecap diff --baseline /tmp/base /tmp/out
+```
+
+### 9.4 开发版崩溃排查记录
+
+`scenecap_capture.c` 的 `sc_ready()` 不能在编码线程里启动捕获：它会被 `scenecap_nvn_pass_begin/draw/dispatch` 调用，而那些钩子跑在 Metal 编码线程上（`TOTK_RENDER_STREAM=1`），在里面做 host 读取会触发 `FATAL render stream: sync inside a streamed pass`。现在 `sc_ready()` 只查状态，启动统一由 `scenecap_nvn_frame`（游戏线程的 `mtl_set_frame`）负责。
+
+另一个坑：`#if SCENECAP_HOOKS` 包裹 `nvn_mtl.m` 的钩子时 `#endif` 后面不能跟代码（`#endif enc_r_end(g_enc);` 这种写法会静默改变语义），必须让每个 `#endif` 独占一行。

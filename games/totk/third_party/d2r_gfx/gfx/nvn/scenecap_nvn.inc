@@ -13,6 +13,10 @@ static const char sc_attrs_probe[] __attribute__((unused)) = "scenecap-attrs-pro
 #include "scenecap_capture.h"
 
 #include <time.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #if !defined(SCENECAP_NVN_TOTK)
 #error "define SCENECAP_NVN_TOTK (0 for nier, 1 for totk) before including scenecap_nvn.inc"
@@ -534,12 +538,66 @@ int scenecap_nvn_on(void) {
     return on;
 }
 
-static int sc_ready(void) {
-    if (g_sc_state == 0) {
-        if (!scenecap_nvn_on() && !atomic_load(&g_sc_requested)) sc_start(NULL, 0);
-        if (!scenecap_nvn_on() && !atomic_load(&g_sc_requested)) return 0;
-        sc_start(NULL, 0);
+/* --------------------------------------------------------------------------------------------------------- *
+ * Development control socket: a capture-enabled build (SCENECAP_HOOKS=1) listens on
+ * /tmp/scenecap-<pid>.sock so the CLI can drive captures without a hotkey or input file:
+ *     capture <frames> <path>   start a multi-frame capture at the next frame boundary
+ *     single <path>             capture one frame
+ *     status                    report the capture state
+ * The thread only sets the same atomics the input command sets; every capture decision still runs on the
+ * game's render thread.  Not present in builds that leave SCENECAP_HOOKS at 0.                              */
+static void *sc_ctl_main(void *arg) {
+    (void)arg;
+    char sock_path[128];
+    snprintf(sock_path, sizeof sock_path, "/tmp/scenecap-%d.sock", (int)getpid());
+    unlink(sock_path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", sock_path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 4) != 0) { close(fd); return NULL; }
+    sc_log("control socket %s", sock_path);
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0) continue;
+        char buf[1200], reply[1200];
+        ssize_t n = read(c, buf, sizeof buf - 1);
+        if (n > 0) {
+            buf[n] = 0;
+            char *nl = strchr(buf, '\n'); if (nl) *nl = 0;
+            if (!strncmp(buf, "capture ", 8) || !strncmp(buf, "single ", 7)) {
+                int single = buf[0] == 's';
+                char *p = buf + (single ? 7 : 8);
+                unsigned frames = single ? 1 : (unsigned)strtoul(p, &p, 10);
+                while (*p == ' ') p++;
+                if (!*p) snprintf(reply, sizeof reply, "error missing path\n");
+                else {
+                    pthread_mutex_lock(&g_mu);
+                    snprintf(g_sc_request, sizeof g_sc_request, "%s", p);
+                    pthread_mutex_unlock(&g_mu);
+                    atomic_store(&g_sc_want_frames, frames ? frames : 1);
+                    atomic_store(&g_sc_requested, 1);
+                    snprintf(reply, sizeof reply, "ok %s\n", p);
+                }
+            } else if (!strncmp(buf, "status", 6)) {
+                snprintf(reply, sizeof reply, "state %d\n", g_sc_state);
+            } else snprintf(reply, sizeof reply, "error unknown command\n");
+            (void)!write(c, reply, strlen(reply));
+        }
+        close(c);
     }
+}
+static void sc_ctl_start(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, sc_ctl_main, NULL) == 0) pthread_detach(t);
+}
+__attribute__((constructor)) static void sc_ctl_boot(void) { sc_ctl_start(); }
+
+/* Only inspects state: the hooks below run inside the render encoder (and possibly on its own thread), so
+ * staring a capture here would do host reads inside a streamed pass.  The frame hook owns every start. */
+static int sc_ready(void) {
     return g_sc_state == 2 && g_sc_cap && scenecap_active(g_sc_cap);
 }
 
@@ -550,6 +608,7 @@ void scenecap_nvn_frame(uint64_t frame) {
         if (g_sc_state == 0) g_sc_state = 1;
         return;
     }
+    if (g_sc_state == 0 && scenecap_nvn_on()) sc_start(NULL, 0);
     if (atomic_load(&g_sc_requested)) {
         char path[sizeof g_sc_request];
         pthread_mutex_lock(&g_mu);

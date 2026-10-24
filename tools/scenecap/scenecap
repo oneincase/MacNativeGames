@@ -161,6 +161,63 @@ def _replay_binary() -> str:
     return os.environ.get("SCENECAP_REPLAY") or os.path.join(_HERE, "replay", "build", "scenecap_replay")
 
 
+def _capture_pid(args: argparse.Namespace) -> int:
+    if args.pid:
+        return args.pid
+    if not args.name:
+        raise SystemExit("scenecap: capture needs --pid or --name")
+    out = subprocess.run(["pgrep", "-f", args.name], capture_output=True, text=True)
+    pids = [int(x) for x in out.stdout.split()]
+    if not pids:
+        raise SystemExit(f"scenecap: no running process matches {args.name!r}")
+    return pids[0]
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    import socket as _socket
+    import time as _time
+
+    pid = _capture_pid(args)
+    sock = f"/tmp/scenecap-{pid}.sock"
+    if not os.path.exists(sock):
+        print(
+            f"scenecap: {sock} does not exist — the process must be a SCENECAP=1 development build "
+            f"that has rendered at least one frame"
+        )
+        return 2
+    out = os.path.abspath(args.out or f"/tmp/scenecap-{pid}.nvs")
+    frames = args.frames or 1
+    request = f"capture {frames} {out}\n" if frames > 1 else f"single {out}\n"
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(sock)
+            conn.sendall(request.encode())
+            reply = conn.recv(1024).decode(errors="replace").strip()
+    except OSError as exc:
+        print(f"scenecap: cannot talk to {sock}: {exc}")
+        return 2
+    print(f"scenecap: {reply}")
+    if not reply.startswith("ok"):
+        return 1
+    if not args.wait:
+        return 0
+    deadline = _time.time() + args.timeout
+    last = -1
+    while _time.time() < deadline:
+        if os.path.exists(out):
+            size = os.path.getsize(out)
+            if size > 0 and size == last:
+                break
+            last = size
+        _time.sleep(0.5)
+    if os.path.exists(out):
+        print(f"scenecap: {out} ({os.path.getsize(out)} B)")
+        return 0
+    print(f"scenecap: timed out waiting for {out}")
+    return 1
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     binary = _replay_binary()
     if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
@@ -240,6 +297,17 @@ def build_parser() -> argparse.ArgumentParser:
         return cmd_synth(args)
 
     synth.set_defaults(func=_synth)
+
+    capture = subparsers.add_parser(
+        "capture", help="drive a running SCENECAP=1 development build over its control socket"
+    )
+    capture.add_argument("--pid", type=int, help="process id of the running game")
+    capture.add_argument("--name", help="match a running process by name (pgrep -f)")
+    capture.add_argument("--frames", type=int, default=1, help="frames to record (default 1)")
+    capture.add_argument("--out", help="output package path (default /tmp/scenecap-<pid>.nvs)")
+    capture.add_argument("--wait", action="store_true", help="wait until the package file stops growing")
+    capture.add_argument("--timeout", type=float, default=300.0, help="seconds for --wait (default 300)")
+    capture.set_defaults(func=cmd_capture)
 
     replay = subparsers.add_parser(
         "replay", help="replay a package offline into one PNG per pass (needs a Metal device)"
