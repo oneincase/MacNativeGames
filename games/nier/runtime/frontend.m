@@ -100,7 +100,7 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{if(e.keyCode==101){extern void runtime_scenecap_hotkey(void);runtime_scenecap_hotkey();return;}runtime_input_key(e.keyCode,1);}   /* F9: capture a scenecap scene package */
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==101){extern void runtime_scenecap_hotkey(void);runtime_scenecap_hotkey();return;}if(e.keyCode==109){extern void runtime_scenecap_record(unsigned);runtime_scenecap_record(0);return;}runtime_input_key(e.keyCode,1);}   /* F9: capture a scenecap scene package */
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end
@@ -129,7 +129,7 @@ static NSString *shortcut_text(void){
  else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K"));
  else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u")),w,h];
  else picture=@(TOTK_UI("关闭","off"));
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关\nF9  抓帧（生成 scenecap 场景包）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off\nF9  Capture a scenecap scene package")),[NSString stringWithUTF8String:interp],picture];
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关\nF9  抓帧（生成 scenecap 场景包）\nF10 录制（默认 60 帧）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off\nF9  Capture a scenecap scene package\nF10 Record a clip (60 frames by default)")),[NSString stringWithUTF8String:interp],picture];
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
  self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];

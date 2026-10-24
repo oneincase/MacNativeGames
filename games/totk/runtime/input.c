@@ -228,19 +228,34 @@ static void *input_file(void *arg) {
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
         } else if (!strncmp(line, "scenecap", 8) && (line[8] == 0 || line[8] == ' ' || line[8] == '\n' || line[8] == '\r')) {
-            /* "scenecap [<path>]": record the next rendered frames as one .nvs scene package (tools/scenecap) */
+            /* "scenecap [<path>] [<frames>]": record the next rendered frames as one .nvs scene package (tools/scenecap) */
             extern void dm_gfx_scenecap_next(const char *path);
+            extern void dm_gfx_scenecap_record(const char *path, unsigned frames);
             line[strcspn(line, "\r\n")] = 0;
             const char *sc_arg = line + 8;          /* "scenecap" is 8 characters: skip it, then one or more spaces */
             while (*sc_arg == ' ') sc_arg++;
-            dm_gfx_scenecap_next(*sc_arg ? sc_arg : NULL);
+            if (!*sc_arg) {
+                dm_gfx_scenecap_next(NULL);
+            } else {
+                char sc_target[1024];
+                snprintf(sc_target, sizeof sc_target, "%s", sc_arg);
+                char *sc_sp = strrchr(sc_target, ' ');
+                char *sc_end = NULL;
+                long sc_frames = (sc_sp && sc_sp[1]) ? strtol(sc_sp + 1, &sc_end, 10) : 0;
+                if (sc_sp && sc_sp[1] && sc_end && !*sc_end && sc_frames > 0) {
+                    *sc_sp = 0;
+                    dm_gfx_scenecap_record(sc_target, (unsigned)sc_frames);
+                } else {
+                    dm_gfx_scenecap_next(sc_target);
+                }
+            }
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
         else runtime_fail("invalid diagnostic input command");
     }
     fclose(f); return NULL;
 }
 /* F9 in the game window: record the next rendered frames as one .nvs scene package (tools/scenecap), with no terminal
-   and no input script. Writes to /tmp; set SCENECAP_DIR to choose another directory. */
+   and no input script. Writes to $TMPDIR (or /tmp); set SCENECAP_DIR to choose another directory. */
 void runtime_scenecap_hotkey(void) {
     extern void dm_gfx_scenecap_next(const char *path);
     char path[1024];
@@ -250,7 +265,26 @@ void runtime_scenecap_hotkey(void) {
     snprintf(path, sizeof path, "%s/scenecap-%04d%02d%02d-%02d%02d%02d.nvs", dir,
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     dm_gfx_scenecap_next(path);
-    fprintf(stderr, "[scenecap] \u5feb\u6377\u952e\u6293\u5e27\uff1a%s\uff08\u4e0b\u4e00\u5e27\u5199\u51fa\uff1bSCENECAP_DIR \u53ef\u6539\u76ee\u5f55\uff09\n", path);
+    fprintf(stderr, "[scenecap] 快捷键抓帧：%s（下一帧写出；SCENECAP_DIR 可改目录）\n", path);
+}
+/* F10 in the game window: record a run of frames as one .nvs package (default 60 frames ~ 1 s at 60 fps;
+   SCENECAP_RECORD_FRAMES overrides). Same path rules as the F9 hotkey above. */
+void runtime_scenecap_record(unsigned nframes) {
+    extern void dm_gfx_scenecap_record(const char *path, unsigned frames);
+    char path[1024];
+    const char *dir = getenv("SCENECAP_DIR");
+    if (!dir || !*dir) dir = "/tmp";
+    if (!nframes) {
+        const char *e = getenv("SCENECAP_RECORD_FRAMES");
+        long n = (e && *e) ? strtol(e, NULL, 10) : 0;
+        nframes = n > 0 ? (unsigned)n : 60;
+    }
+    time_t now = time(NULL); struct tm tmv; localtime_r(&now, &tmv);
+    snprintf(path, sizeof path, "%s/scenecap-%04d%02d%02d-%02d%02d%02d.nvs", dir,
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    dm_gfx_scenecap_record(path, nframes);
+    fprintf(stderr, "[scenecap] 快捷键录制 %u 帧：%s（抓满后写出；SCENECAP_DIR / SCENECAP_RECORD_FRAMES 可改）\n",
+            nframes, path);
 }
 __attribute__((constructor)) static void input_file_start(void) {
     const char *e = getenv("TOTK_INPUT_FILE"); if (!e || !*e) return;

@@ -48,6 +48,7 @@ static int g_sc_state; /* 0 uninitialised, 1 disabled, 2 capturing */
 static int g_sc_in_pass;
 static char g_sc_request[1024];
 static _Atomic int g_sc_requested;
+static _Atomic unsigned g_sc_want_frames;  /* 0 = SCENECAP_FRAMES / default; set by dm_gfx_scenecap_record */
 static char g_sc_game[64], g_sc_title[64], g_sc_version[64], g_sc_commit[96], g_sc_port[64], g_sc_build[96];
 static char g_sc_gpu[128], g_sc_macos[128], g_sc_metal[64], g_sc_when[64];
 static __strong NSData *g_sc_source;  /* keeps the MSL bytes handed to the capture module alive */
@@ -478,7 +479,7 @@ static void sc_fill_metadata(scenecap_options *o) {
     o->captured_at = g_sc_when;
 }
 
-static int sc_start(const char *path) {
+static int sc_start(const char *path, uint32_t want_frames) {
     if (g_sc_state == 2) return 1;
     scenecap_options o;
     memset(&o, 0, sizeof o);
@@ -490,6 +491,7 @@ static int sc_start(const char *path) {
             if (!o.frame_count) o.frame_count = 1;
             if (!o.generator) o.generator = "scenecap-nvn/1.0";
         }
+        if (want_frames) o.frame_count = want_frames;  /* explicit count from the command line or the hotkey */
     } else if (!env_on) {
         g_sc_state = 1;
         return 0;
@@ -534,9 +536,9 @@ int scenecap_nvn_on(void) {
 
 static int sc_ready(void) {
     if (g_sc_state == 0) {
-        if (!scenecap_nvn_on() && !atomic_load(&g_sc_requested)) sc_start(NULL);
+        if (!scenecap_nvn_on() && !atomic_load(&g_sc_requested)) sc_start(NULL, 0);
         if (!scenecap_nvn_on() && !atomic_load(&g_sc_requested)) return 0;
-        sc_start(NULL);
+        sc_start(NULL, 0);
     }
     return g_sc_state == 2 && g_sc_cap && scenecap_active(g_sc_cap);
 }
@@ -555,8 +557,10 @@ void scenecap_nvn_frame(uint64_t frame) {
         pthread_mutex_unlock(&g_mu);
         atomic_store(&g_sc_requested, 0);
         g_sc_state = 0;
-        if (!sc_start(path[0] ? path : NULL)) return;
-    } else if (g_sc_state == 0 && !sc_start(NULL)) {
+        unsigned want = atomic_load(&g_sc_want_frames);
+        atomic_store(&g_sc_want_frames, 0);
+        if (!sc_start(path[0] ? path : NULL, want)) return;
+    } else if (g_sc_state == 0 && !sc_start(NULL, 0)) {
         return;
     }
     if (!g_sc_cap) return;
@@ -875,6 +879,7 @@ void scenecap_nvn_request(const char *path) {
     pthread_mutex_lock(&g_mu);
     snprintf(g_sc_request, sizeof g_sc_request, "%s", path ? path : "");
     pthread_mutex_unlock(&g_mu);
+    atomic_store(&g_sc_want_frames, 0);
     atomic_store(&g_sc_requested, 1);
     MLOG("scenecap: capture requested for the next frame (%s)", path && *path ? path : "environment path");
 }
@@ -882,6 +887,18 @@ void scenecap_nvn_request(const char *path) {
 /* The diagnostic input file ("scenecap <path>") calls this; the request is picked up at the next frame
  * boundary, on the replay thread, where the capture object may be created safely. */
 void dm_gfx_scenecap_next(const char *path) { scenecap_nvn_request(path); }
+
+/* 场景录制：从下一个帧边界开始抓连续 frames 帧，抓满后写出包。路径语义与 scenecap_nvn_request() 相同。 */
+void scenecap_nvn_record(const char *path, uint32_t frames) {
+    pthread_mutex_lock(&g_mu);
+    snprintf(g_sc_request, sizeof g_sc_request, "%s", path ? path : "");
+    pthread_mutex_unlock(&g_mu);
+    atomic_store(&g_sc_want_frames, frames ? frames : 1);
+    atomic_store(&g_sc_requested, 1);
+    MLOG("scenecap: recording %u frame(s) (%s)", frames ? frames : 1,
+         path && *path ? path : "environment path");
+}
+void dm_gfx_scenecap_record(const char *path, unsigned frames) { scenecap_nvn_record(path, frames); }
 
 void scenecap_nvn_shutdown(void) {
     if (g_sc_cap) {

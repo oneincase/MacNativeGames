@@ -109,7 +109,37 @@ static MTLPrimitiveType ScMetalPrimitive(ScPrimitiveType type) {
     }
 }
 
+
+/* SCENECAP_MSL_PATCH=<file>: literal "old<TAB>new" replacements before MSL compilation.
+   Diagnostic only; the package is never modified. */
+static NSString *ScPatchSource(NSString *src) {
+    const char *path = getenv("SCENECAP_MSL_PATCH");
+    if (path == NULL || *path == 0) return src;
+    static NSArray<NSArray<NSString *> *> *rules = nil;
+    if (rules == nil) {
+        NSString *text = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path]
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:NULL];
+        NSMutableArray *rs = [NSMutableArray array];
+        for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+            NSRange tab = [line rangeOfString:@"\t"];
+            if (tab.location == NSNotFound || tab.location == 0) continue;
+            [rs addObject:@[[line substringToIndex:tab.location], [line substringFromIndex:tab.location + 1]]];
+        }
+        rules = rs;
+        fprintf(stderr, "[scenecap] msl patch: %lu rule(s) from %s\n", (unsigned long)rules.count, path);
+    }
+    NSMutableString *out = [src mutableCopy];
+    for (NSArray<NSString *> *r in rules) {
+        NSUInteger hits = [out replaceOccurrencesOfString:r[0] withString:r[1] options:0 range:NSMakeRange(0, out.length)];
+        if (hits) fprintf(stderr, "[scenecap] msl patch: %lu replacement(s) of \"%s\"\n", (unsigned long)hits, r[0].UTF8String);
+    }
+    return out;
+}
+
 static MTLCompareFunction ScMetalCompare(ScCompareFunction fn) {
+    /* SCENECAP_DEPTH_ALWAYS=1: diagnostic override, force every depth compare to Always */
+    if (getenv("SCENECAP_DEPTH_ALWAYS")) return MTLCompareFunctionAlways;
     switch (fn) {
         case ScCompareNever: return MTLCompareFunctionNever;
         case ScCompareLess: return MTLCompareFunctionLess;
@@ -659,6 +689,7 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
         return nil;
     }
 
+    source = ScPatchSource(source);
     MTLCompileOptions *options = [MTLCompileOptions new];
     NSError *compileError = nil;
     id<MTLLibrary> library = [_device newLibraryWithSource:source options:options error:&compileError];
@@ -811,23 +842,35 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     descriptor.fragmentFunction = fragmentFunction;
     descriptor.rasterSampleCount = 1;
     if (pipeline.vertexAttributes.count > 0) {
-        /* Metal refuses a pipeline whose vertex function declares attributes but has no descriptor. */
+        /* Metal refuses a pipeline whose vertex function declares attributes but has no descriptor.
+           The capture keeps NVN stream indices verbatim (they start at 16 for the real game), while the
+           argument table binds vertex buffers at 0..N-1. Normalize the attribute/layout buffer index by
+           the minimum declared one so both sides refer to the same slots. */
+        NSUInteger attrBase = NSUIntegerMax;
+        for (ScVertexAttribute *attribute in pipeline.vertexAttributes) {
+            if (attribute.bufferIndex < attrBase) attrBase = attribute.bufferIndex;
+        }
+        if (attrBase == NSUIntegerMax) attrBase = 0;
         MTLVertexDescriptor *vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
         for (ScVertexAttribute *attribute in pipeline.vertexAttributes) {
-            if (attribute.location >= 31 || attribute.bufferIndex >= 31) continue;
+            NSUInteger slot = attribute.bufferIndex - attrBase;
+            if (attribute.location >= 31 || slot >= 31) continue;
             vertexDescriptor.attributes[attribute.location].format = (MTLVertexFormat)attribute.format;
             vertexDescriptor.attributes[attribute.location].offset = attribute.offset;
-            vertexDescriptor.attributes[attribute.location].bufferIndex = attribute.bufferIndex;
+            vertexDescriptor.attributes[attribute.location].bufferIndex = slot;
         }
         NSMutableSet<NSNumber *> *usedBuffers = [NSMutableSet set];
         for (ScVertexAttribute *attribute in pipeline.vertexAttributes) {
-            if (attribute.location < 31 && attribute.bufferIndex < 31) [usedBuffers addObject:@(attribute.bufferIndex)];
+            NSUInteger slot = attribute.bufferIndex - attrBase;
+            if (attribute.location < 31 && slot < 31) [usedBuffers addObject:@(slot)];
         }
         for (ScVertexLayout *layout in pipeline.vertexLayouts) {
-            if (layout.bufferIndex >= 31 || ![usedBuffers containsObject:@(layout.bufferIndex)]) continue;
-            vertexDescriptor.layouts[layout.bufferIndex].stride = layout.stride;
-            vertexDescriptor.layouts[layout.bufferIndex].stepFunction = (MTLVertexStepFunction)layout.stepFunction;
-            vertexDescriptor.layouts[layout.bufferIndex].stepRate = layout.stepRate;
+            if (layout.bufferIndex < attrBase) continue;
+            NSUInteger slot = layout.bufferIndex - attrBase;
+            if (slot >= 31 || ![usedBuffers containsObject:@(slot)]) continue;
+            vertexDescriptor.layouts[slot].stride = layout.stride;
+            vertexDescriptor.layouts[slot].stepFunction = (MTLVertexStepFunction)layout.stepFunction;
+            vertexDescriptor.layouts[slot].stepRate = layout.stepRate;
         }
         descriptor.vertexDescriptor = vertexDescriptor;
     }
@@ -1249,7 +1292,8 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
             [encoder setDepthStencilState:depthState];
         }
 
-        [encoder setCullMode:ScMetalCull(pipeline.cull)];
+        /* SCENECAP_CULL_NONE=1: diagnostic override (isolate winding/cull effects) */
+        [encoder setCullMode:getenv("SCENECAP_CULL_NONE") ? MTLCullModeNone : ScMetalCull(pipeline.cull)];
         [encoder setFrontFacingWinding:ScMetalWinding(pipeline.winding)];
         [encoder setTriangleFillMode:ScMetalFill(pipeline.fill)];
         if (pipeline.depthBias != 0.0 || pipeline.depthSlopeScale != 0.0 || pipeline.depthClamp != 0.0) {

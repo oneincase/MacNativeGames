@@ -207,10 +207,22 @@ tools/scenecap/scenecap verify /tmp/nier-scene.nvs
 
 - 不需要设任何环境变量；`SCENECAP_DIR` 可换目录（例如 `SCENECAP_DIR=$HOME/scenecap`）。
 - 与 `scenecap <path>` 命令走同一条路径（`dm_gfx_scenecap_next`），只是路径自动生成。
-- 窗口右上角的快捷键说明会多列一行 `F9  抓帧（生成 scenecap 场景包）`。
+- 窗口右上角的快捷键说明会多列两行：`F9  抓帧（生成 scenecap 场景包）` 与 `F10 录制（默认 60 帧）`。
 - 落盘后照常 `scenecap verify` / `scenecap replay`。
 
-### 3.5 记录什么、丢弃什么
+### 3.5 场景录制（F10 / 多帧）
+
+单帧（F9）之外，可以录一段连续帧，用来验证动画、粒子、相机运动和逐帧稳定性。
+
+- 游戏窗口里按 **F10**：从下一帧边界起录 **60 帧**（约 1 秒 @60fps），同样写到 `SCENECAP_DIR`，时间戳命名。
+  `SCENECAP_RECORD_FRAMES=120` 改默认帧数。
+- 输入文件里也可以带帧数：`scenecap /tmp/clip.nvs 120`（不写数字 = 1 帧，等同 F9）。
+- 包内 `capture.frame_count` 是这段的帧数，`frames[]` 列出每帧的 pass；`scenecap info` 会显示 `frame 2249+10`。
+- 重放时逐帧导出 PNG（文件名 `pass_<序号>_<slug>.png`），`index.json` 每个 pass 带 `frame` 字段，
+  `scenecap diff` 按 pass 顺序逐帧对比，可直接做动画回归基线。
+- 录制窗口内每帧的 pass/draw 全部保留，所以包比单帧大得多（10 帧 nier 实测约 240 MB）；按帧数预算磁盘。
+
+### 3.6 记录什么、丢弃什么
 
 每个被保留的帧记录：全部 render pass（附件 level/layer、load/store、clear 值、尺寸与像素格式）、
 每个保留 draw（pipeline、顶点/索引范围、实例数、图元、draw 时刻状态、完整 argument table）、每个

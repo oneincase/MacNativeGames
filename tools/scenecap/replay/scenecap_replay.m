@@ -297,6 +297,7 @@ static int ScRun(NSArray<NSString *> *arguments) {
                 @"index" : @(index),
                 @"kind" : @"render",
                 @"slug" : slug,
+                @"frame" : pass.hasFrame ? @(pass.frame) : [NSNull null],
                 @"width" : @(image.width),
                 @"height" : @(image.height),
                 @"pixel_format" : pass.pixelFormat.length > 0 ? pass.pixelFormat : @"unknown",

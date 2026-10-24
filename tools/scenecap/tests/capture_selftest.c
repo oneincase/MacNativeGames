@@ -154,6 +154,7 @@ static void fill_state(scenecap_state *state, int blend) {
     state->scissor[3] = 64.0f;
 }
 
+static uint32_t g_frames = 1;   /* --frames N: record N consecutive frames in one package */
 int main(int argc, char **argv) {
     const char *path = NULL;
     int env_mode = 0;
@@ -163,6 +164,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--no-host") == 0) g_no_host = 1;
         else if (strcmp(argv[i], "--coherent") == 0) g_coherent = 1;
         else if (strcmp(argv[i], "--render-only") == 0) g_render_only = 1;
+        else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) g_frames = (uint32_t)strtoul(argv[++i], NULL, 10);
         else path = argv[i];
     }
     if (!path && !env_mode) {
@@ -190,7 +192,7 @@ int main(int argc, char **argv) {
     options.metal = "4.0";
     options.captured_at = "2026-01-01T00:00:00Z";
     options.output_path = path;
-    options.frame_count = 1;
+    options.frame_count = g_frames ? g_frames : 1;
     options.compress = 0;
 
     scenecap_host host;
@@ -210,7 +212,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    scenecap_frame_begin(capture, options.first_frame);
+    for (uint32_t f = 0; f < options.frame_count; f++) {
+        if (options.frame_count > 1) printf("frame %u of %u\n", f + 1, options.frame_count);
+        scenecap_frame_begin(capture, options.first_frame + f);
 
     scenecap_attachment attachments[2];
     memset(attachments, 0, sizeof attachments);
@@ -315,6 +319,7 @@ int main(int argc, char **argv) {
     }
 
     /* Close the window explicitly: this is where the package is written. */
+    }
     if (!scenecap_finish(capture, err, sizeof err)) {
         fprintf(stderr, "scenecap_finish: %s\n", err);
         scenecap_destroy(capture);
