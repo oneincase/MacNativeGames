@@ -82,7 +82,7 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
 }
 void runtime_warm_done(void){
  atomic_store(&warmPending,0);
- dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
+ dispatch_async(dispatch_get_main_queue(), ^{bootOverlay.hidden=YES;});   /* 预热已经结束就收起覆盖层：首帧可能永远不会呈现（窗口不在前台时 Metal 不提交 drawable），旧条件会把界面永久挡在画面上 */
 }
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 /* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
