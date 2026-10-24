@@ -467,7 +467,7 @@ sleep 22 && printf 'scenecap /tmp/nier.nvs\n' >> /tmp/sc-in.txt
 
 实测（`/tmp/scenecap-20261024-232638.nvs`，60 帧）：1860 pass 里 120 个 compute 全部 `status=ok`，`unsupported` 180 条（全部是 `no colour attachment`），`errors` 空。
 
-**已知限制**：本次实测中 120 个 compute 执行后，导出 PNG 与"compute 未执行"时逐像素一致（0 差异）。说明 dispatch 的结构（pipeline/绑定/grid）已跑通，但写入结果没有反映到后续采样里，需要继续核对 storage texture 的写绑定与 threadgroup 尺寸；在那之前不要把 compute 结果当作可信输入。
+**为什么画面看起来没变**：本次包里的 10 个 compute kernel 只声明了 buffer 参数（`constant` / `device` 的 SSBO），没有 `texture2d` / `access::write` 之类的纹理写入；抽查 MSL 源码确认它们写的是 `cp_sN` 这类 storage buffer（例如把可见性列表清零），因此执行它们不会改变任何纹理，导出 PNG 与不执行时逐像素一致是预期行为，不是重放缺陷。只有 kernel 真正写纹理时，compute 结果才会反映到后续 pass 的采样上。
 
 ## 9. 开发构建与指令式抓帧（推荐用法）
 
