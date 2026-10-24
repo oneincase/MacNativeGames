@@ -1135,9 +1135,15 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
                 [errors addObject:[NSString stringWithFormat:@"manifest.frames[%lu].passes: expected strings", (unsigned long)i]];
                 continue;
             }
-            if (!self.passMap[item]) {
+            ScPass *listedPass = self.passMap[item];
+            if (!listedPass) {
                 [errors addObject:[NSString stringWithFormat:@"manifest.frames[%lu].passes: unknown pass \"%@\"",
                                                              (unsigned long)i, item]];
+            } else {
+                /* frames[] is the authoritative frame membership: stamp it onto the pass so per-frame
+                 * reports (and frame-stats) do not have to re-derive it. */
+                listedPass.hasFrame = YES;
+                listedPass.frame = (NSInteger)value;
             }
         }
     }

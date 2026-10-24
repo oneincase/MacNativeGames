@@ -309,6 +309,18 @@ tools/scenecap/scenecap diff out-a out-b -o report.md --all-diffs
 tools/scenecap/scenecap diff --baseline baselines/nier-title out -o report.md
 
 # 确认无回归后把当前结果写为新基线
+
+#### 逐帧稳定性（frame-stats）
+
+同一个重放目录内部，相邻帧之间做 PSNR / 差异比例统计，用来确认录下来的这段动画逐帧是稳定的（没有某一帧突然跳变），和"两次重放做回归"的 diff 是两件事：
+
+```bash
+tools/scenecap/scenecap frame-stats out -o frame-report.md
+```
+
+输出包括：帧数、相邻帧 pass 对数、完全相同的帧对数量、PSNR 的 min/mean/max、最差的一对，以及"所有相邻帧完全相同"的告警（说明录制窗口内画面没推进）。
+
+配对方式：pass 的 slug 是全局唯一的（`pass_<index>`），所以相邻帧之间按**帧内 pass 顺序**配对，而不是按 slug。若某帧少录/多录了 pass，多出来的那条会被跳过。
 tools/scenecap/scenecap diff --baseline baselines/nier-title out --update-baseline -o report.md
 ```
 

@@ -237,6 +237,23 @@ def cmd_replay(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_frame_stats(args: argparse.Namespace) -> int:
+    """逐帧稳定性：同一个重放目录里相邻帧的 PSNR/差异比例。"""
+    from pathlib import Path
+
+    sys.path.insert(0, os.path.join(_HERE, "compare"))
+    from scenecap_compare.framestats import frame_stats, render_report  # noqa: E402  (imported on demand)
+
+    stats = frame_stats(args.replay_dir)
+    text = render_report(stats)
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"报告：{args.output}", file=sys.stdout)
+    else:
+        print(text, end="")
+    return 0
+
+
 def cmd_diff(args: argparse.Namespace) -> int:
     """Forward to the comparison tool; it owns the report format and the exit codes."""
     sys.path.insert(0, os.path.join(_HERE, "compare"))
@@ -319,6 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     diff = subparsers.add_parser("diff", help="compare two replay output directories")
     diff.add_argument("diff_args", nargs=argparse.REMAINDER, help="arguments passed to the comparison tool")
     diff.set_defaults(func=cmd_diff)
+
+    frames = subparsers.add_parser("frame-stats", help="report per-frame stability inside one replay directory")
+    frames.add_argument("replay_dir", metavar="DIR", help="replay output directory")
+    frames.add_argument("-o", "--output", metavar="FILE", default=None, help="write the report to FILE")
+    frames.set_defaults(func=cmd_frame_stats)
     return parser
 
 
