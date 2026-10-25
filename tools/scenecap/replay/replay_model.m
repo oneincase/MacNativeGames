@@ -53,6 +53,12 @@
 @end
 
 @implementation ScArgumentTable
+- (NSArray<ScBufferBinding *> *)allBuffers {
+    NSMutableArray<ScBufferBinding *> *all = [NSMutableArray array];
+    for (NSArray<ScBufferBinding *> *list in @[self.vertexBuffers, self.uniformBuffers, self.fragmentBuffers, self.storageBuffers])
+        [all addObjectsFromArray:list ?: @[]];
+    return all;
+}
 @end
 
 @implementation ScIndexBuffer
@@ -916,9 +922,11 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
             NSNumber *start = sc_integer(index, @"start", indexWhere, errors, NO, 0);
             NSNumber *count = sc_integer(index, @"count", indexWhere, errors, YES, 1);
             NSNumber *offset = sc_integer(index, @"offset", indexWhere, errors, NO, 0);
+            NSNumber *baseVertex = sc_integer(index, @"base_vertex", indexWhere, errors, NO, 0);
             buffer.start = start ? start.unsignedLongLongValue : 0;
             buffer.count = count ? count.unsignedLongLongValue : 0;
             buffer.offset = offset ? offset.unsignedLongLongValue : 0;
+            buffer.baseVertex = baseVertex ? baseVertex.unsignedLongLongValue : 0;
             buffer.bufferId = sc_string(index, @"buffer", indexWhere, errors, NO);
             draw.index = buffer;
         }
@@ -948,6 +956,9 @@ static ScResourceUsage sc_usage_from_strings(NSArray *strings)
             parsedTable.fragmentBuffers = [self parseBufferBindings:sc_array(table, @"fragment_buffers", tableWhere, errors, NO)
                                                              where:sc_join_where(tableWhere, @"fragment_buffers")
                                                             errors:errors];
+            parsedTable.storageBuffers = [self parseBufferBindings:sc_array(table, @"storage_buffers", tableWhere, errors, NO)
+                                                            where:sc_join_where(tableWhere, @"storage_buffers")
+                                                           errors:errors];
             NSArray *textures = sc_array(table, @"textures", tableWhere, errors, NO);
             NSMutableArray<ScTextureBinding *> *parsedTextures = [NSMutableArray array];
             for (NSUInteger t = 0; textures && t < textures.count; t++) {

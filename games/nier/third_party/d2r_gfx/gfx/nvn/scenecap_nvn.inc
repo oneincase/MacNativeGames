@@ -120,13 +120,65 @@ static const char *sc_pf_name(uint32_t pf) {
     case MTLPixelFormatStencil8: return "stencil8";
     case MTLPixelFormatBC1_RGBA: return "bc1_rgba";
     case MTLPixelFormatBC1_RGBA_sRGB: return "bc1_rgba_srgb";
+    case MTLPixelFormatBC2_RGBA: return "bc2_rgba";
+    case MTLPixelFormatBC2_RGBA_sRGB: return "bc2_rgba_srgb";
     case MTLPixelFormatBC3_RGBA: return "bc3_rgba";
     case MTLPixelFormatBC3_RGBA_sRGB: return "bc3_rgba_srgb";
     case MTLPixelFormatBC4_RUnorm: return "bc4_runorm";
     case MTLPixelFormatBC5_RGUnorm: return "bc5_rgunorm";
     case MTLPixelFormatBC7_RGBAUnorm: return "bc7_rgbaunorm";
     case MTLPixelFormatBC7_RGBAUnorm_sRGB: return "bc7_rgbaunorm_srgb";
+    case MTLPixelFormatASTC_4x4_LDR: return "astc_4x4";
+    case MTLPixelFormatASTC_4x4_sRGB: return "astc_4x4_srgb";
+    case MTLPixelFormatASTC_5x5_LDR: return "astc_5x5";
+    case MTLPixelFormatASTC_5x5_sRGB: return "astc_5x5_srgb";
+    case MTLPixelFormatASTC_6x6_LDR: return "astc_6x6";
+    case MTLPixelFormatASTC_6x6_sRGB: return "astc_6x6_srgb";
+    case MTLPixelFormatASTC_8x8_LDR: return "astc_8x8";
+    case MTLPixelFormatASTC_8x8_sRGB: return "astc_8x8_srgb";
+    case MTLPixelFormatASTC_10x10_LDR: return "astc_10x10";
+    case MTLPixelFormatASTC_10x10_sRGB: return "astc_10x10_srgb";
+    case MTLPixelFormatASTC_12x12_LDR: return "astc_12x12";
+    case MTLPixelFormatASTC_12x12_sRGB: return "astc_12x12_srgb";
     default: return "unknown";
+    }
+}
+
+/* Block-compressed layout: returns 1 and fills (bw,bh,bbs) for BC/ASTC; 0 for linear formats. */
+static int sc_block_layout(MTLPixelFormat pf, NSUInteger *bw, NSUInteger *bh, NSUInteger *bbs) {
+    switch (pf) {
+    case MTLPixelFormatBC1_RGBA:
+    case MTLPixelFormatBC1_RGBA_sRGB:
+    case MTLPixelFormatBC4_RUnorm:
+        *bw = 4; *bh = 4; *bbs = 8; return 1;
+    case MTLPixelFormatBC2_RGBA:
+    case MTLPixelFormatBC2_RGBA_sRGB:
+    case MTLPixelFormatBC3_RGBA:
+    case MTLPixelFormatBC3_RGBA_sRGB:
+    case MTLPixelFormatBC5_RGUnorm:
+    case MTLPixelFormatBC7_RGBAUnorm:
+    case MTLPixelFormatBC7_RGBAUnorm_sRGB:
+        *bw = 4; *bh = 4; *bbs = 16; return 1;
+    case MTLPixelFormatASTC_4x4_LDR:
+    case MTLPixelFormatASTC_4x4_sRGB:
+        *bw = 4; *bh = 4; *bbs = 16; return 1;
+    case MTLPixelFormatASTC_5x5_LDR:
+    case MTLPixelFormatASTC_5x5_sRGB:
+        *bw = 5; *bh = 5; *bbs = 16; return 1;
+    case MTLPixelFormatASTC_6x6_LDR:
+    case MTLPixelFormatASTC_6x6_sRGB:
+        *bw = 6; *bh = 6; *bbs = 16; return 1;
+    case MTLPixelFormatASTC_8x8_LDR:
+    case MTLPixelFormatASTC_8x8_sRGB:
+        *bw = 8; *bh = 8; *bbs = 16; return 1;
+    case MTLPixelFormatASTC_10x10_LDR:
+    case MTLPixelFormatASTC_10x10_sRGB:
+        *bw = 10; *bh = 10; *bbs = 16; return 1;
+    case MTLPixelFormatASTC_12x12_LDR:
+    case MTLPixelFormatASTC_12x12_sRGB:
+        *bw = 12; *bh = 12; *bbs = 16; return 1;
+    default:
+        return 0;
     }
 }
 
@@ -286,13 +338,13 @@ static int sc_host_texture_info(void *user, uint64_t serial, scenecap_texture_in
 }
 
 static size_t sc_pixel_bytes(MTLPixelFormat pf) {
+    /* Depth32Float_Stencil8 is snapshotted with MTLBlitOptionDepthFromDepthStencil → 4-byte depth floats. */
     switch (pf) {
     case MTLPixelFormatR8Unorm:
     case MTLPixelFormatR8Snorm:
     case MTLPixelFormatR8Uint:
     case MTLPixelFormatR8Sint:
     case MTLPixelFormatStencil8:
-    case MTLPixelFormatBC4_RUnorm:
         return 1;
     case MTLPixelFormatR16Unorm:
     case MTLPixelFormatR16Snorm:
@@ -304,7 +356,6 @@ static size_t sc_pixel_bytes(MTLPixelFormat pf) {
     case MTLPixelFormatRG8Uint:
     case MTLPixelFormatRG8Sint:
     case MTLPixelFormatDepth16Unorm:
-    case MTLPixelFormatBC5_RGUnorm:
         return 2;
     case MTLPixelFormatR32Uint:
     case MTLPixelFormatR32Sint:
@@ -319,12 +370,9 @@ static size_t sc_pixel_bytes(MTLPixelFormat pf) {
     case MTLPixelFormatBGRA8Unorm:
     case MTLPixelFormatBGRA8Unorm_sRGB:
     case MTLPixelFormatDepth32Float:
+    case MTLPixelFormatDepth32Float_Stencil8:
     case MTLPixelFormatRGB10A2Unorm:
     case MTLPixelFormatRG11B10Float:
-    case MTLPixelFormatBC1_RGBA:
-    case MTLPixelFormatBC1_RGBA_sRGB:
-    case MTLPixelFormatBC3_RGBA:
-    case MTLPixelFormatBC3_RGBA_sRGB:
         return 4;
     case MTLPixelFormatRG32Uint:
     case MTLPixelFormatRG32Sint:
@@ -334,15 +382,11 @@ static size_t sc_pixel_bytes(MTLPixelFormat pf) {
     case MTLPixelFormatRGBA16Float:
     case MTLPixelFormatRGBA16Uint:
     case MTLPixelFormatRGBA16Sint:
-    case MTLPixelFormatBC7_RGBAUnorm:
-    case MTLPixelFormatBC7_RGBAUnorm_sRGB:
         return 8;
     case MTLPixelFormatRGBA32Uint:
     case MTLPixelFormatRGBA32Sint:
     case MTLPixelFormatRGBA32Float:
         return 16;
-    case MTLPixelFormatDepth32Float_Stencil8:
-        return 5;
     default:
         return 4;
     }
@@ -356,14 +400,24 @@ static long sc_host_texture_read(void *user, uint64_t serial, uint32_t level, ui
     id<MTLTexture> t = e->mtl;
     if (t.sampleCount > 1 || t.framebufferOnly) return -1;
     NSUInteger w = MAX(t.width >> level, 1), h = MAX(t.height >> level, 1);
-    size_t bpp = sc_pixel_bytes(t.pixelFormat);
-    size_t row = w * bpp;
-    if (row * h > capacity) return -1;
-    NSUInteger aligned = (row + 255) & ~(NSUInteger)255;
-    id<MTLBuffer> rb = [g_dev newBufferWithLength:aligned * h options:MTLResourceStorageModeShared];
+    NSUInteger bw = 1, bh = 1, bbs = 1;
+    int is_block = sc_block_layout(t.pixelFormat, &bw, &bh, &bbs);
+    NSUInteger row_blocks = is_block ? (w + bw - 1) / bw : w;
+    NSUInteger col_blocks = is_block ? (h + bh - 1) / bh : h;
+    size_t row = is_block ? (size_t)row_blocks * bbs : (size_t)w * sc_pixel_bytes(t.pixelFormat);
+    size_t image = row * (is_block ? col_blocks : h);
+    if (image > capacity) return -1;
+    /* Metal requires destinationBytesPerRow to be a multiple of the block row for compressed formats;
+       for linear formats keep the historical 256-byte alignment. */
+    NSUInteger aligned = is_block ? (NSUInteger)row : ((row + 255) & ~(NSUInteger)255);
+    if (aligned < row) aligned = (NSUInteger)row;
+    id<MTLBuffer> rb = [g_dev newBufferWithLength:aligned * (is_block ? col_blocks : h)
+                                          options:MTLResourceStorageModeShared];
     if (!rb) return -1;
     id<MTLCommandBuffer> cb = q_cb();
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    /* Depth+stencil targets are snapshotted as depth-only float32 (4 B/texel), matching the replayer's
+       depth32float_stencil8 upload path that only needs the depth plane for EQUAL tests. */
     MTLBlitOption opt = t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil
                                                                              : MTLBlitOptionNone;
     [blit copyFromTexture:t
@@ -374,15 +428,16 @@ static long sc_host_texture_read(void *user, uint64_t serial, uint32_t level, ui
                  toBuffer:rb
         destinationOffset:0
    destinationBytesPerRow:aligned
- destinationBytesPerImage:aligned * h
+ destinationBytesPerImage:aligned * (is_block ? col_blocks : h)
                   options:opt];
     [blit endEncoding];
     cb_commit(cb);
     cb_wait(cb);
     const uint8_t *src = (const uint8_t *)rb.contents;
     uint8_t *out = (uint8_t *)dst;
-    for (NSUInteger y = 0; y < h; y++) memcpy(out + y * row, src + y * aligned, row);
-    return (long)(row * h);
+    NSUInteger rows = is_block ? col_blocks : h;
+    for (NSUInteger y = 0; y < rows; y++) memcpy(out + y * row, src + y * aligned, row);
+    return (long)image;
 }
 
 static long sc_host_buffer_read(void *user, uint64_t address, uint64_t length, void *dst, size_t capacity) {
@@ -769,7 +824,8 @@ static void sc_fill_bindings(scenecap_binding *b, uint32_t *count) {
     for (uint32_t i = 0; i < 16 && S.vbuf[i].address; i++) {
         b[n].kind = SCENECAP_BIND_VERTEX_BUFFER;
         b[n].stage = SCENECAP_STAGE_VERTEX;
-        b[n].index = i;
+        /* Match bind_vertex_streams: stream i is Metal vertex buffer 16+i. Uniforms use 0..15. */
+        b[n].index = 16u + i;
         b[n].resource = S.vbuf[i].address;
         b[n].offset = 0;
         b[n].size = S.vbuf[i].size;
@@ -834,6 +890,11 @@ void scenecap_nvn_draw(const void *draw, const void *indexed_draw) {
     const p_draw *dw = (const p_draw *)draw;
     const p_draw_idx *di = (const p_draw_idx *)indexed_draw;
     if (!dw && !di) return;
+    /* A GPU-indirect consumer draw of the geometry-stage compaction carries the CPU-visible placeholder
+     * record: ibuf is never set and the real count lives behind the port-side compaction kernel, so the
+     * package cannot represent the draw (the replay used to hard-fail the whole pass on it). The original
+     * geometry-stage draw is recorded separately, which keeps the compacted geometry itself in the package. */
+    if (di && !di->ibuf) return;
     __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil;
     if (!pr) return;
     NvShader *vs = pr->sh[0], *fs = pr->sh[1];
@@ -897,10 +958,14 @@ void scenecap_nvn_draw(const void *draw, const void *indexed_draw) {
     d.vertex_start = dw ? (uint32_t)dw->first : 0;
     d.vertex_count = dw ? (uint32_t)dw->count : 0;
     d.index_type = di ? sc_index_type(di->itype) : SCENECAP_INDEX_NONE;
-    d.index_start = di ? (uint32_t)di->base_vertex : 0;
+    /* index_start is the first index in the buffer (byte offset / stride); base_vertex is applied by Metal
+       as a bias on every fetched index. Older packages wrongly stored base_vertex here — those draws with
+       a non-zero base vertex mis-addressed the index buffer on replay. */
+    d.index_start = 0;
     d.index_count = di ? (uint32_t)di->count : 0;
     d.index_buffer = di ? di->ibuf : 0;
     d.index_bytes = di ? (uint64_t)di->count * (di->itype == 1 ? 2u : di->itype == 0 ? 1u : 4u) : 0;
+    d.base_vertex = di && di->base_vertex > 0 ? (uint32_t)di->base_vertex : 0;
     d.instances = (dw ? dw->instances : di ? di->instances : 0);
     if (d.instances == 0) d.instances = 1;
     d.primitive = sc_primitive(dw ? (uint32_t)dw->prim : di ? (uint32_t)di->prim : 4);

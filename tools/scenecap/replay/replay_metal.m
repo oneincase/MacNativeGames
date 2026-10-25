@@ -38,7 +38,20 @@ static const ScFormatInfo kScFormats[] = {
     {"rg32float", MTLPixelFormatRG32Float, SC_PIXEL_KIND_NONE, 8, NO, NO, NO},
     {"rgb10a2unorm", MTLPixelFormatRGB10A2Unorm, SC_PIXEL_KIND_RGB10A2, 4, NO, NO, NO},
     {"bgr10a2unorm", MTLPixelFormatBGR10A2Unorm, SC_PIXEL_KIND_NONE, 4, NO, NO, NO},
-    {"bc1_rgba", MTLPixelFormatBC1_RGBA, SC_PIXEL_KIND_NONE, 1, NO, NO, NO},
+    {"bc1_rgba", MTLPixelFormatBC1_RGBA, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"bc1_rgba_srgb", MTLPixelFormatBC1_RGBA_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"bc3_rgba", MTLPixelFormatBC3_RGBA, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"bc3_rgba_srgb", MTLPixelFormatBC3_RGBA_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"bc7_rgbaunorm", MTLPixelFormatBC7_RGBAUnorm, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"bc7_rgbaunorm_srgb", MTLPixelFormatBC7_RGBAUnorm_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_4x4", MTLPixelFormatASTC_4x4_LDR, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_4x4_srgb", MTLPixelFormatASTC_4x4_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_5x5", MTLPixelFormatASTC_5x5_LDR, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_5x5_srgb", MTLPixelFormatASTC_5x5_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_6x6", MTLPixelFormatASTC_6x6_LDR, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_6x6_srgb", MTLPixelFormatASTC_6x6_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_8x8", MTLPixelFormatASTC_8x8_LDR, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
+    {"astc_8x8_srgb", MTLPixelFormatASTC_8x8_sRGB, SC_PIXEL_KIND_NONE, 0, NO, NO, NO},
     /* The capture layer writes "unknown" when it meets a MTLPixelFormat it has no name for. Replaying it as
      * rgba8unorm keeps the pipeline alive; the note printed on stderr tells the caller the contents are a guess. */
     {"unknown", MTLPixelFormatRGBA8Unorm, SC_PIXEL_KIND_NONE, 4, NO, NO, NO},
@@ -47,9 +60,31 @@ static const ScFormatInfo kScFormats[] = {
     {"depth16unorm", MTLPixelFormatDepth16Unorm, SC_PIXEL_KIND_UNORM16, 2, YES, NO, NO},
     {"depth32float", MTLPixelFormatDepth32Float, SC_PIXEL_KIND_R32FLOAT, 4, YES, NO, NO},
     {"depth24_stencil8", MTLPixelFormatDepth24Unorm_Stencil8, SC_PIXEL_KIND_NONE, 4, YES, YES, NO},
-    {"depth32float_stencil8", MTLPixelFormatDepth32Float_Stencil8, SC_PIXEL_KIND_FLOAT32, 8, YES, YES, NO},
+    /* Capture blits depth-only (4 B/texel) out of a depth+stencil target; see sc_host_texture_read. */
+    {"depth32float_stencil8", MTLPixelFormatDepth32Float_Stencil8, SC_PIXEL_KIND_FLOAT32, 4, YES, YES, NO},
     {"stencil8", MTLPixelFormatStencil8, SC_PIXEL_KIND_NONE, 1, NO, YES, NO},
 };
+
+/* Block footprint for BC/ASTC names. Returns YES and fills (bw,bh,bbs). */
+static BOOL ScBlockLayout(const char *name, unsigned *bw, unsigned *bh, unsigned *bbs) {
+    if (!name) return NO;
+    struct { const char *n; unsigned bw, bh, bbs; } table[] = {
+        {"bc1_rgba", 4, 4, 8}, {"bc1_rgba_srgb", 4, 4, 8},
+        {"bc3_rgba", 4, 4, 16}, {"bc3_rgba_srgb", 4, 4, 16},
+        {"bc7_rgbaunorm", 4, 4, 16}, {"bc7_rgbaunorm_srgb", 4, 4, 16},
+        {"astc_4x4", 4, 4, 16}, {"astc_4x4_srgb", 4, 4, 16},
+        {"astc_5x5", 5, 5, 16}, {"astc_5x5_srgb", 5, 5, 16},
+        {"astc_6x6", 6, 6, 16}, {"astc_6x6_srgb", 6, 6, 16},
+        {"astc_8x8", 8, 8, 16}, {"astc_8x8_srgb", 8, 8, 16},
+    };
+    for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
+        if (strcasecmp(table[i].n, name) == 0) {
+            *bw = table[i].bw; *bh = table[i].bh; *bbs = table[i].bbs;
+            return YES;
+        }
+    }
+    return NO;
+}
 
 static const ScFormatInfo *ScFormatNamed(NSString *name) {
     if (name.length == 0) return NULL;
@@ -250,12 +285,13 @@ static BOOL ScTextureLayoutBytes(ScResource *resource, const ScFormatInfo *forma
             if (w == 0) w = 1;
             if (h == 0) h = 1;
             if (d == 0) d = 1;
-            BOOL isBlock = format->name != NULL && strncmp(format->name, "bc1", 3) == 0;
+            unsigned bw = 0, bh = 0, bbs = 0;
+            BOOL isBlock = ScBlockLayout(format->name, &bw, &bh, &bbs);
             uint64_t extent = w * h;
             uint64_t image;
             if (isBlock) {
-                /* BC1: one 8-byte block per 4x4 texels, the last block padded even when the mip is smaller. */
-                image = ((w + 3) / 4) * ((h + 3) / 4) * 8;
+                /* One compressed block per bw×bh texels; the last block is padded when the mip is smaller. */
+                image = ((w + bw - 1) / bw) * ((h + bh - 1) / bh) * bbs;
             } else {
                 image = extent * format->bytesPerPixel;
             }
@@ -326,6 +362,15 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
                  hasDepth:(BOOL)hasDepth
                 drawCount:(NSUInteger *)drawCount
                     error:(NSError **)error;
+- (BOOL)bindArgumentBuffersForPipeline:(ScPipeline *)pipeline
+                                 table:(ScArgumentTable *)table
+                               encoder:(id<MTLRenderCommandEncoder>)encoder
+                                  draw:(ScDraw *)draw
+                                 error:(NSError **)error;
+- (nullable id<MTLBuffer>)zeroPadBuffer:(NSError **)error;
+- (nullable id<MTLBuffer>)supportBuffer:(NSError **)error;
+- (nullable id<MTLTexture>)dummyTexture2D:(NSError **)error;
+- (nullable id<MTLSamplerState>)dummySampler:(NSError **)error;
 @end
 
 @implementation ScRenderer
@@ -580,12 +625,13 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
             if (w == 0) w = 1;
             if (h == 0) h = 1;
             if (d == 0) d = 1;
-            BOOL isBlock = format->name != NULL && strncmp(format->name, "bc1", 3) == 0;
+            unsigned bw = 0, bh = 0, bbs = 0;
+            BOOL isBlock = ScBlockLayout(format->name, &bw, &bh, &bbs);
             NSUInteger rowBytes;
             NSUInteger imageBytes;
             if (isBlock) {
-                rowBytes = (NSUInteger)(((w + 3) / 4) * 8);
-                imageBytes = rowBytes * (NSUInteger)((h + 3) / 4);
+                rowBytes = (NSUInteger)(((w + bw - 1) / bw) * bbs);
+                imageBytes = rowBytes * (NSUInteger)((h + bh - 1) / bh);
             } else {
                 rowBytes = (NSUInteger)w * format->bytesPerPixel;
                 imageBytes = rowBytes * h;
@@ -800,6 +846,25 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     return YES;
 }
 
+/* Solid-colour fragment functions for SCENECAP_REPLAY_HILITE. colour attachment counts vary per pass, so
+ * hl1/hl2/hl3 come in six colours and the pipeline build picks both by attachment count and by the matched
+ * key's position in the env list (1st = magenta, 2nd = green, … like DM_NVN_HILITE). */
+- (nullable id<MTLLibrary>)hiliteLibrary:(NSError **)error {
+    static id<MTLLibrary> library;
+    if (library == nil) {
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                        "#define HUE(name, r, g, b) struct name##1 { float4 c0 [[color(0)]]; };"
+                        " struct name##2 { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; };"
+                        " struct name##3 { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; };"
+                        " fragment name##1 name##f1() { return {float4(r,g,b,1)}; }"
+                        " fragment name##2 name##f2() { return {float4(r,g,b,1), float4(r,g,b,1)}; }"
+                        " fragment name##3 name##f3() { return {float4(r,g,b,1), float4(r,g,b,1), float4(r,g,b,1)}; }\n"
+                        "HUE(hm, 1,0,1) HUE(hg, 0,1,0) HUE(hc, 0,1,1) HUE(hy, 1,1,0) HUE(hb, 0,0,1) HUE(hw, 1,1,1)\n";
+        library = [_device newLibraryWithSource:src options:nil error:error];
+    }
+    return library;
+}
+
 - (nullable id<MTLRenderPipelineState>)pipelineStateForPipeline:(ScPipeline *)pipeline
                                                             pass:(ScPass *)pass
                                                            error:(NSError **)error {
@@ -824,11 +889,13 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
 
     id<MTLFunction> vertexFunction = nil;
     id<MTLFunction> fragmentFunction = nil;
+    ScStage *fragmentStage = nil;
     for (ScStage *stage in pipeline.stages) {
         if (stage.kind == ScStageVertex && stage.mslBlobId.length > 0) {
             vertexFunction = [self functionForStage:stage ofPipeline:pipeline error:error];
             if (vertexFunction == nil) return nil;
         } else if (stage.kind == ScStageFragment && stage.mslBlobId.length > 0) {
+            fragmentStage = stage;
             fragmentFunction = [self functionForStage:stage ofPipeline:pipeline error:error];
             if (fragmentFunction == nil) return nil;
         }
@@ -836,6 +903,36 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     if (vertexFunction == nil) {
         if (error) *error = ScReplayError(@"pipeline \"%@\": no vertex stage with Metal source", pipeline.ident);
         return nil;
+    }
+    /* SCENECAP_REPLAY_HILITE=<fs key prefix>[,<prefix>…]: replace the fragment stage with a solid magenta
+     * function. The ch1 colour passes replay black because the captured lighting data itself is black, so
+     * per-key solid colour is the way to see WHICH shader owns the pixels (same trick as DM_NVN_HILITE). */
+    if (fragmentStage != nil) {
+        static char hkeys[16][24]; static int nhk = -1;
+        if (nhk < 0) {
+            nhk = 0;
+            for (const char *q = getenv("SCENECAP_REPLAY_HILITE"); q && *q && nhk < 16;
+                 q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) {
+                size_t n = strcspn(q, ",");
+                if (n > 23) n = 23;
+                memcpy(hkeys[nhk], q, n);
+                hkeys[nhk][n] = 0;
+                nhk++;
+            }
+        }
+        for (int i = 0; i < nhk; i++) {
+            if (!hkeys[i][0]) continue;
+            if ([fragmentStage.mslBlobId rangeOfString:@(hkeys[i])].location == NSNotFound) continue;
+            id<MTLLibrary> hl = [self hiliteLibrary:error];
+            if (hl == nil) break;
+            static const char *cols[6] = {"hm", "hg", "hc", "hy", "hb", "hw"};
+            const char *col = cols[i < 6 ? i : 0];
+            NSString *fname = [NSString stringWithFormat:@"%@@f%lu", @(col),
+                               (unsigned long)(colorCount >= 3 ? 3 : (colorCount == 2 ? 2 : 1))];
+            id<MTLFunction> fn = [hl newFunctionWithName:fname];
+            if (fn != nil) fragmentFunction = fn;
+            break;
+        }
     }
 
     MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
@@ -845,30 +942,22 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     descriptor.rasterSampleCount = 1;
     if (pipeline.vertexAttributes.count > 0) {
         /* Metal refuses a pipeline whose vertex function declares attributes but has no descriptor.
-           The capture keeps NVN stream indices verbatim (they start at 16 for the real game), while the
-           argument table binds vertex buffers at 0..N-1. Normalize the attribute/layout buffer index by
-           the minimum declared one so both sides refer to the same slots. */
-        NSUInteger attrBase = NSUIntegerMax;
-        for (ScVertexAttribute *attribute in pipeline.vertexAttributes) {
-            if (attribute.bufferIndex < attrBase) attrBase = attribute.bufferIndex;
-        }
-        if (attrBase == NSUIntegerMax) attrBase = 0;
+           The NVN→Metal port binds stream i at vertex buffer slot 16+i (see bind_vertex_streams), and the
+           capture records attribute buffer_index the same way. Uniform buffers occupy slots 0..15, so the
+           descriptor must keep the 16+ numbering — remapping down to 0 used to collide with uniforms and
+           wiped every world-shading draw (pass mean stayed 0 even with depth Always). */
         MTLVertexDescriptor *vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
+        NSMutableSet<NSNumber *> *usedBuffers = [NSMutableSet set];
         for (ScVertexAttribute *attribute in pipeline.vertexAttributes) {
-            NSUInteger slot = attribute.bufferIndex - attrBase;
+            NSUInteger slot = attribute.bufferIndex;
             if (attribute.location >= 31 || slot >= 31) continue;
             vertexDescriptor.attributes[attribute.location].format = (MTLVertexFormat)attribute.format;
             vertexDescriptor.attributes[attribute.location].offset = attribute.offset;
             vertexDescriptor.attributes[attribute.location].bufferIndex = slot;
-        }
-        NSMutableSet<NSNumber *> *usedBuffers = [NSMutableSet set];
-        for (ScVertexAttribute *attribute in pipeline.vertexAttributes) {
-            NSUInteger slot = attribute.bufferIndex - attrBase;
-            if (attribute.location < 31 && slot < 31) [usedBuffers addObject:@(slot)];
+            [usedBuffers addObject:@(slot)];
         }
         for (ScVertexLayout *layout in pipeline.vertexLayouts) {
-            if (layout.bufferIndex < attrBase) continue;
-            NSUInteger slot = layout.bufferIndex - attrBase;
+            NSUInteger slot = layout.bufferIndex;
             if (slot >= 31 || ![usedBuffers containsObject:@(slot)]) continue;
             vertexDescriptor.layouts[slot].stride = layout.stride;
             vertexDescriptor.layouts[slot].stepFunction = (MTLVertexStepFunction)layout.stepFunction;
@@ -1266,6 +1355,207 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
 
 /* Encodes every draw of one render pass.  Kept separate so the caller can always close the encoder, including on the
  * error path (letting a render encoder fall out of scope aborts the process inside Metal). */
+- (nullable id<MTLBuffer>)zeroPadBuffer:(NSError **)error {
+    static id<MTLBuffer> zero;
+    if (!zero) {
+        zero = [_device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+        if (!zero) {
+            if (error) *error = ScReplayError(@"cannot allocate the zero pad buffer for support/c1/drvcb slots");
+            return nil;
+        }
+        memset(zero.contents, 0, 65536);
+        zero.label = @"scenecap.zero";
+    }
+    return zero;
+}
+
+/* Ryujinx/Route-B support_buffer: render_scale[73] at byte 192 must be 1.0 or every shaded
+ * fragment is multiplied by 0 (the live port fills the same layout in support_buf()). */
+- (nullable id<MTLBuffer>)supportBuffer:(NSError **)error {
+    static id<MTLBuffer> support;
+    if (!support) {
+        support = [_device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+        if (!support) {
+            if (error) *error = ScReplayError(@"cannot allocate the support_buffer stand-in");
+            return nil;
+        }
+        memset(support.contents, 0, 65536);
+        float *scales = (float *)((uint8_t *)support.contents + 192);
+        for (int i = 0; i < 73; i++) scales[i * 4] = 1.0f; /* float4[73], shader reads .x */
+        support.label = @"scenecap.support";
+    }
+    return support;
+}
+
+- (nullable id<MTLTexture>)dummyTexture2D:(NSError **)error {
+    static id<MTLTexture> tex;
+    if (!tex) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                      width:1
+                                                                                     height:1
+                                                                                  mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        tex = [_device newTextureWithDescriptor:d];
+        if (!tex) {
+            if (error) *error = ScReplayError(@"cannot allocate the dummy 1x1 texture");
+            return nil;
+        }
+        uint8_t px[4] = {0, 0, 0, 255};
+        [tex replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:px bytesPerRow:4];
+        tex.label = @"scenecap.dummy-tex";
+    }
+    return tex;
+}
+
+- (nullable id<MTLSamplerState>)dummySampler:(NSError **)error {
+    static id<MTLSamplerState> samp;
+    if (!samp) {
+        MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+        d.minFilter = MTLSamplerMinMagFilterNearest;
+        d.magFilter = MTLSamplerMinMagFilterNearest;
+        samp = [_device newSamplerStateWithDescriptor:d];
+        if (!samp) {
+            if (error) *error = ScReplayError(@"cannot allocate the dummy sampler");
+            return nil;
+        }
+    }
+    return samp;
+}
+
+/* Build Metal argument buffers from the stage reflection (arg_id ← reg) and bind each at [[buffer(0)]].
+ * Mirrors the NVN→Metal encode_args path for the Route-B ABI the nier shaders use. */
+- (BOOL)bindArgumentBuffersForPipeline:(ScPipeline *)pipeline
+                                 table:(ScArgumentTable *)table
+                               encoder:(id<MTLRenderCommandEncoder>)encoder
+                                  draw:(ScDraw *)draw
+                                 error:(NSError **)error {
+    id<MTLBuffer> zero = [self zeroPadBuffer:error];
+    id<MTLBuffer> support = [self supportBuffer:error];
+    id<MTLTexture> dummyTex = [self dummyTexture2D:error];
+    id<MTLSamplerState> dummySamp = [self dummySampler:error];
+    if (!zero || !support || !dummyTex || !dummySamp) return NO;
+    for (ScStage *stage in pipeline.stages) {
+        if (stage.kind != ScStageVertex && stage.kind != ScStageFragment) continue;
+        if (stage.reflectionBlobId.length == 0 || stage.mslBlobId.length == 0) continue;
+        NSError *local = nil;
+        NSData *reflData = [_package payloadOfChunk:stage.reflectionBlobId error:&local];
+        if (!reflData) {
+            if (error) {
+                *error = ScReplayError(@"draw \"%@\": cannot load reflection \"%@\": %@", draw.ident,
+                                       stage.reflectionBlobId, local.localizedDescription ?: @"missing");
+            }
+            return NO;
+        }
+        NSDictionary *refl = [NSJSONSerialization JSONObjectWithData:reflData options:0 error:&local];
+        NSArray *bindings = [refl isKindOfClass:[NSDictionary class]] ? refl[@"bindings"] : nil;
+        if (![bindings isKindOfClass:[NSArray class]] || bindings.count == 0) continue;
+
+        id<MTLFunction> function = [self functionForStage:stage ofPipeline:pipeline error:error];
+        if (!function) return NO;
+        id<MTLArgumentEncoder> ae = [function newArgumentEncoderWithBufferIndex:0];
+        if (!ae) {
+            if (error) {
+                *error = ScReplayError(@"draw \"%@\": stage %@ has no argument encoder at buffer(0)", draw.ident,
+                                       stage.kindName);
+            }
+            return NO;
+        }
+        id<MTLBuffer> ab = [_device newBufferWithLength:ae.encodedLength options:MTLResourceStorageModeShared];
+        if (!ab) {
+            if (error) *error = ScReplayError(@"draw \"%@\": out of memory for the argument buffer", draw.ident);
+            return NO;
+        }
+        ab.label = [NSString stringWithFormat:@"%@.%@.ab", draw.ident, stage.kindName];
+        [ae setArgumentBuffer:ab offset:0];
+
+        NSInteger nvnStage = stage.kind == ScStageVertex ? 0 : 1;
+        for (NSDictionary *b in bindings) {
+            if (![b isKindOfClass:[NSDictionary class]]) continue;
+            NSNumber *argIdNum = b[@"arg_id"];
+            NSString *kind = b[@"kind"];
+            if (![argIdNum isKindOfClass:[NSNumber class]] || ![kind isKindOfClass:[NSString class]]) continue;
+            NSUInteger argId = argIdNum.unsignedIntegerValue;
+            NSNumber *regNum = b[@"reg"] ?: b[@"index"];
+            NSUInteger reg = [regNum isKindOfClass:[NSNumber class]] ? regNum.unsignedIntegerValue : NSUIntegerMax;
+
+            if ([kind isEqualToString:@"support"]) {
+                [ae setBuffer:support offset:0 atIndex:argId];
+                [encoder useResource:support usage:MTLResourceUsageRead
+                              stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            } else if ([kind isEqualToString:@"cbuf"] || [kind isEqualToString:@"sbuf"] ||
+                       [kind isEqualToString:@"sbufp"] || [kind isEqualToString:@"ubop"] ||
+                       [kind isEqualToString:@"c1"] || [kind isEqualToString:@"drvcb"] ||
+                       [kind isEqualToString:@"drv0"] || [kind isEqualToString:@"drv2"]) {
+                id<MTLBuffer> buf = zero;
+                NSUInteger off = 0;
+                if ([kind isEqualToString:@"cbuf"] || [kind isEqualToString:@"sbuf"] ||
+                    [kind isEqualToString:@"sbufp"] || [kind isEqualToString:@"ubop"]) {
+                    /* Storage buffers live in the manifest's storage_buffers[] (SSBOs), the rest in
+                     * uniform_buffers[]; Route-B device pointers may name either, so search both. */
+                    NSArray<ScBufferBinding *> *candidates = [kind isEqualToString:@"cbuf"] ||
+                                                             [kind isEqualToString:@"ubop"]
+                        ? table.uniformBuffers
+                        : [table.uniformBuffers arrayByAddingObjectsFromArray:table.storageBuffers ?: @[]];
+                    for (ScBufferBinding *ub in candidates) {
+                        if (ub.index != reg) continue;
+                        if (ub.stage && ub.stage.unsignedIntegerValue != (NSUInteger)nvnStage &&
+                            ![kind hasPrefix:@"sbuf"])
+                            continue;
+                        id<MTLBuffer> found = [self bufferForBinding:ub draw:draw purpose:@"argument buffer"
+                                                               error:error];
+                        if (!found) return NO;
+                        buf = found;
+                        off = (NSUInteger)ub.offset;
+                        break;
+                    }
+                }
+                [ae setBuffer:buf offset:off atIndex:argId];
+                [encoder useResource:buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            } else if ([kind isEqualToString:@"tex"] || [kind isEqualToString:@"img"] ||
+                       [kind isEqualToString:@"tbuf"]) {
+                id<MTLTexture> texture = dummyTex;
+                for (ScTextureBinding *tb in table.textures) {
+                    if (tb.index != reg) continue;
+                    if (tb.stage && tb.stage.unsignedIntegerValue != (NSUInteger)nvnStage) continue;
+                    ScResource *resource = [_scene resourceNamed:tb.textureId];
+                    if (!resource || !resource.isTexture) continue;
+                    id<MTLTexture> found = [self textureForResource:resource error:error];
+                    if (!found) return NO;
+                    texture = found;
+                    break;
+                }
+                [ae setTexture:texture atIndex:argId];
+                [encoder useResource:texture usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            } else if ([kind isEqualToString:@"samp"] || [kind isEqualToString:@"samp_tex"] ||
+                       [kind isEqualToString:@"sampt"]) {
+                id<MTLSamplerState> sampler = dummySamp;
+                for (ScSamplerBinding *sb in table.samplers) {
+                    if (sb.index != reg) continue;
+                    if (sb.stage && sb.stage.unsignedIntegerValue != (NSUInteger)nvnStage) continue;
+                    id<MTLSamplerState> found = [self samplerStateForBinding:sb error:error];
+                    if (!found) return NO;
+                    sampler = found;
+                    break;
+                }
+                [ae setSamplerState:sampler atIndex:argId];
+            } else {
+                /* Unknown kind: prefer a buffer pad so the slot is never left as an unbound resource ID. */
+                [ae setBuffer:zero offset:0 atIndex:argId];
+                [encoder useResource:zero usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            }
+        }
+
+        if (stage.kind == ScStageVertex) {
+            [encoder setVertexBuffer:ab offset:0 atIndex:0];
+        } else {
+            [encoder setFragmentBuffer:ab offset:0 atIndex:0];
+        }
+        [encoder useResource:ab usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    }
+    return YES;
+}
+
 - (BOOL)encodeDrawsOfPass:(ScPass *)pass
               intoEncoder:(id<MTLRenderCommandEncoder>)encoder
                  hasDepth:(BOOL)hasDepth
@@ -1345,66 +1635,57 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
         }
 
         ScArgumentTable *table = draw.argumentTable;
+        /* Route-B MSL takes uniforms/textures/samplers through spvDescriptorSet0 at [[buffer(0)]], with
+           [[id(arg_id)]] members. Vertex streams live at Metal slots 16+i (see bind_vertex_streams). Binding
+           the captured uniform_buffers as raw setVertexBuffer(reg) both clobbers buffer(0) and never builds
+           the argument buffer the shader reads — every world-shading draw then emits no coverage. */
+        BOOL needsArgumentBuffer = NO;
+        for (ScStage *stage in pipeline.stages) {
+            if (stage.reflectionBlobId.length == 0) continue;
+            NSError *reflError = nil;
+            NSData *reflData = [_package payloadOfChunk:stage.reflectionBlobId error:&reflError];
+            if (!reflData) continue;
+            NSDictionary *refl = [NSJSONSerialization JSONObjectWithData:reflData options:0 error:nil];
+            if ([refl[@"bindings"] isKindOfClass:[NSArray class]] && [refl[@"bindings"] count] > 0) {
+                needsArgumentBuffer = YES;
+                break;
+            }
+        }
         for (ScBufferBinding *binding in table.vertexBuffers) {
             id<MTLBuffer> buffer = [self bufferForBinding:binding draw:draw purpose:@"vertex buffer" error:error];
             if (buffer == nil) return NO;
-            [encoder setVertexBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
+            /* Raise stream slots to 16+i only for pipelines that fetch through [[stage_in]] (real captures record
+             * attribute buffer_index = 16+stream). Pipelines without a vertex attribute table read their vertex
+             * buffers via [[buffer(n)]] directly (the synthetic scene's does) and must keep the raw slot. */
+            NSUInteger slot = (pipeline.vertexAttributes.count > 0 && binding.index < 16) ? binding.index + 16u
+                                                                                          : binding.index;
+            [encoder setVertexBuffer:buffer offset:(NSUInteger)binding.offset atIndex:slot];
         }
-        for (ScBufferBinding *binding in table.uniformBuffers) {
-            id<MTLBuffer> buffer = [self bufferForBinding:binding draw:draw purpose:@"uniform buffer" error:error];
-            if (buffer == nil) return NO;
-            /* A uniform buffer belongs to the stage that bound it; when the capture recorded no stage, bind both. */
-            if (!binding.stage || binding.stage.unsignedIntValue != 1) {
-                [encoder setVertexBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
-            }
-            if (!binding.stage || binding.stage.unsignedIntValue != 0) {
-                [encoder setFragmentBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
-            }
-        }
-        for (ScBufferBinding *binding in table.fragmentBuffers) {
-            id<MTLBuffer> buffer = [self bufferForBinding:binding draw:draw purpose:@"fragment buffer" error:error];
-            if (buffer == nil) return NO;
-            [encoder setFragmentBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
-        }
-        for (ScTextureBinding *binding in table.textures) {
-            ScResource *resource = [_scene resourceNamed:binding.textureId];
-            if (resource == nil || !resource.isTexture) {
-                if (error) {
-                    *error = ScReplayError(@"draw \"%@\": texture slot %u names \"%@\", which is not a texture resource",
-                                           draw.ident, binding.index, binding.textureId);
-                }
+        if (needsArgumentBuffer) {
+            if (![self bindArgumentBuffersForPipeline:pipeline
+                                                table:table
+                                              encoder:encoder
+                                                 draw:draw
+                                                error:error]) {
                 return NO;
             }
-            NSError *textureError = nil;
-            id<MTLTexture> texture = [self textureForResource:resource error:&textureError];
-            if (texture == nil) {
-                if (error) {
-                    *error = ScReplayError(@"draw \"%@\": texture slot %u: %@", draw.ident, binding.index,
-                                           textureError.localizedDescription ?: @"cannot load the texture");
-                }
-                return NO;
-            }
-            if (!binding.stage || binding.stage.unsignedIntValue != 1) {
-                [encoder setVertexTexture:texture atIndex:binding.index];
-            }
-            if (!binding.stage || binding.stage.unsignedIntValue != 0) {
+        } else {
+            /* Attribute-only shaders: vertex streams already sit at 16+i. Do not also push the captured
+               uniform table into slots 0..15 — those shaders never read them, and on some packs the extra
+               binds interacted badly with the 16+ vertex layout (pass 12 went solid clear-blue). */
+            /* Shaders that declare their textures/samplers directly ([[texture(n)]] / [[sampler(n)]], like the
+               synthetic scene's) need them bound as plain slot binds; the argument-buffer path above covers the
+               Route-B ABI only, and without these the sample reads an unbound texture (rgba 0,0,0,0). */
+            for (ScTextureBinding *binding in table.textures) {
+                ScResource *resource = [_scene resourceNamed:binding.textureId];
+                if (resource == nil || !resource.isTexture) continue;
+                id<MTLTexture> texture = [self textureForResource:resource error:error];
+                if (texture == nil) return NO;
                 [encoder setFragmentTexture:texture atIndex:binding.index];
             }
-        }
-        for (ScSamplerBinding *binding in table.samplers) {
-            NSError *samplerError = nil;
-            id<MTLSamplerState> sampler = [self samplerStateForBinding:binding error:&samplerError];
-            if (sampler == nil) {
-                if (error) {
-                    *error = ScReplayError(@"draw \"%@\": %@", draw.ident,
-                                           samplerError.localizedDescription ?: @"cannot create the sampler");
-                }
-                return NO;
-            }
-            if (!binding.stage || binding.stage.unsignedIntValue != 1) {
-                [encoder setVertexSamplerState:sampler atIndex:binding.index];
-            }
-            if (!binding.stage || binding.stage.unsignedIntValue != 0) {
+            for (ScSamplerBinding *binding in table.samplers) {
+                id<MTLSamplerState> sampler = [self samplerStateForBinding:binding error:error];
+                if (sampler == nil) continue;
                 [encoder setFragmentSamplerState:sampler atIndex:binding.index];
             }
         }
@@ -1417,6 +1698,20 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
         if (draw.indexed) {
             ScIndexBuffer *index = draw.index;
             if (index.bufferId.length == 0) {
+                /* A GPU-indirect consumer draw of the geometry-stage compaction is captured with the
+                 * CPU-visible placeholder record: count < 3 and no index buffer (the real count and index
+                 * source live behind the compaction kernel, which is port-side and not in the package).
+                 * Fewer than 3 indices cannot form a triangle, so skipping is faithful; anything else
+                 * stays a hard error. */
+                if (index.count < 3) {
+                    static BOOL noted = NO;
+                    if (!noted) {
+                        noted = YES;
+                        fprintf(stderr, "[scenecap] note: skipping degenerate indirect draws without an index "
+                                        "buffer (geometry-stage consumers; first at %s)\n", draw.ident.UTF8String);
+                    }
+                    continue;
+                }
                 if (error) {
                     *error = ScReplayError(@"draw \"%@\": indexed draw has no index buffer (manifest needs "
                                            @"draw.index.buffer)",
@@ -1460,7 +1755,9 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
                                  indexType:indexType
                                indexBuffer:buffer
                          indexBufferOffset:(NSUInteger)byteOffset
-                             instanceCount:(NSUInteger)MAX(draw.instanceCount, 1u)];
+                             instanceCount:(NSUInteger)MAX(draw.instanceCount, 1u)
+                                baseVertex:(NSInteger)index.baseVertex
+                              baseInstance:0];
         } else {
             if (draw.vertexCount == 0) {
                 if (error) {
@@ -1517,7 +1814,133 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
 
 /* Execute one dispatch so the storage textures it writes are correct for the render passes that follow.
  * A dispatch has no colour attachment, so nothing is exported for it. */
+/* Route-B argument buffer for a compute kernel. The translated kernels take
+ * `constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]]` whose constant/device members are raw
+ * pointers; leaving buffer(0) unbound makes the first cp_cN / cp_sN dereference a wild read and the GPU hangs
+ * (observed as pass/12 "Caused GPU Hang" surfacing dispatch/2's fault). Mirrors
+ * bindArgumentBuffersForPipeline for the kernel stage. */
+- (BOOL)kernelUsesArgumentBuffer:(ScStage *)kernel ofPipeline:(ScPipeline *)pipeline {
+    if (kernel.reflectionBlobId.length == 0 || kernel.mslBlobId.length == 0) return NO;
+    NSError *local = nil;
+    NSData *reflData = [_package payloadOfChunk:kernel.reflectionBlobId error:&local];
+    if (!reflData) return NO;
+    NSDictionary *refl = [NSJSONSerialization JSONObjectWithData:reflData options:0 error:nil];
+    NSArray *bindings = [refl isKindOfClass:[NSDictionary class]] ? refl[@"bindings"] : nil;
+    return [bindings isKindOfClass:[NSArray class]] && bindings.count > 0;
+}
+
+- (BOOL)bindArgumentBuffersForKernel:(ScPipeline *)pipeline
+                               table:(ScArgumentTable *)table
+                             encoder:(id<MTLComputeCommandEncoder>)encoder
+                            dispatch:(ScDispatch *)dispatch
+                               error:(NSError **)error {
+    id<MTLBuffer> zero = [self zeroPadBuffer:error];
+    id<MTLBuffer> support = [self supportBuffer:error];
+    id<MTLTexture> dummyTex = [self dummyTexture2D:error];
+    id<MTLSamplerState> dummySamp = [self dummySampler:error];
+    if (!zero || !support || !dummyTex || !dummySamp) return NO;
+    for (ScStage *stage in pipeline.stages) {
+        if (stage.kind != ScStageKernel) continue;
+        if (stage.reflectionBlobId.length == 0 || stage.mslBlobId.length == 0) continue;
+        NSError *local = nil;
+        NSData *reflData = [_package payloadOfChunk:stage.reflectionBlobId error:&local];
+        if (!reflData) {
+            if (error) {
+                *error = ScReplayError(@"dispatch \"%@\": cannot load reflection \"%@\": %@", dispatch.ident,
+                                       stage.reflectionBlobId, local.localizedDescription ?: @"missing");
+            }
+            return NO;
+        }
+        NSDictionary *refl = [NSJSONSerialization JSONObjectWithData:reflData options:0 error:&local];
+        NSArray *bindings = [refl isKindOfClass:[NSDictionary class]] ? refl[@"bindings"] : nil;
+        if (![bindings isKindOfClass:[NSArray class]] || bindings.count == 0) continue;
+
+        id<MTLFunction> function = [self functionForStage:stage ofPipeline:pipeline error:error];
+        if (!function) return NO;
+        id<MTLArgumentEncoder> ae = [function newArgumentEncoderWithBufferIndex:0];
+        if (!ae) continue;   /* plain ABI kernel: the direct binds cover it */
+        id<MTLBuffer> ab = [_device newBufferWithLength:ae.encodedLength options:MTLResourceStorageModeShared];
+        if (!ab) {
+            if (error) *error = ScReplayError(@"dispatch \"%@\": out of memory for the argument buffer", dispatch.ident);
+            return NO;
+        }
+        ab.label = [NSString stringWithFormat:@"%@.kernel.ab", dispatch.ident];
+        [ae setArgumentBuffer:ab offset:0];
+
+        for (NSDictionary *b in bindings) {
+            if (![b isKindOfClass:[NSDictionary class]]) continue;
+            NSNumber *argIdNum = b[@"arg_id"];
+            NSString *kind = b[@"kind"];
+            if (![argIdNum isKindOfClass:[NSNumber class]] || ![kind isKindOfClass:[NSString class]]) continue;
+            NSUInteger argId = argIdNum.unsignedIntegerValue;
+            NSNumber *regNum = b[@"reg"] ?: b[@"index"];
+            NSUInteger reg = [regNum isKindOfClass:[NSNumber class]] ? regNum.unsignedIntegerValue : NSUIntegerMax;
+
+            if ([kind isEqualToString:@"support"]) {
+                [ae setBuffer:support offset:0 atIndex:argId];
+                [encoder useResource:support usage:MTLResourceUsageRead];
+            } else if ([kind isEqualToString:@"cbuf"] || [kind isEqualToString:@"sbuf"] ||
+                       [kind isEqualToString:@"sbufp"] || [kind isEqualToString:@"ubop"] ||
+                       [kind isEqualToString:@"c1"] || [kind isEqualToString:@"drvcb"] ||
+                       [kind isEqualToString:@"drv0"] || [kind isEqualToString:@"drv2"]) {
+                id<MTLBuffer> buf = zero;
+                NSUInteger off = 0;
+                NSArray<ScBufferBinding *> *candidates = [kind isEqualToString:@"cbuf"] ||
+                                                         [kind isEqualToString:@"ubop"]
+                    ? table.uniformBuffers
+                    : [table.uniformBuffers arrayByAddingObjectsFromArray:table.storageBuffers ?: @[]];
+                for (ScBufferBinding *ub in candidates) {
+                    if (ub.index != reg) continue;
+                    id<MTLBuffer> found = [self bufferForResource:
+                                                     [_scene resourceNamed:ub.resourceId] error:error];
+                    if (!found) return NO;
+                    buf = found;
+                    off = (NSUInteger)ub.offset;
+                    break;
+                }
+                [ae setBuffer:buf offset:off atIndex:argId];
+                [encoder useResource:buf usage:MTLResourceUsageRead];
+            } else if ([kind isEqualToString:@"tex"] || [kind isEqualToString:@"img"] ||
+                       [kind isEqualToString:@"tbuf"]) {
+                id<MTLTexture> texture = dummyTex;
+                for (ScTextureBinding *tb in table.textures) {
+                    if (tb.index != reg) continue;
+                    ScResource *resource = [_scene resourceNamed:tb.textureId];
+                    if (!resource || !resource.isTexture) continue;
+                    id<MTLTexture> found = [self textureForResource:resource error:error];
+                    if (!found) return NO;
+                    texture = found;
+                    break;
+                }
+                [ae setTexture:texture atIndex:argId];
+                [encoder useResource:texture usage:MTLResourceUsageRead];
+            } else if ([kind isEqualToString:@"samp"] || [kind isEqualToString:@"samp_tex"] ||
+                       [kind isEqualToString:@"sampt"]) {
+                id<MTLSamplerState> sampler = dummySamp;
+                for (ScSamplerBinding *sb in table.samplers) {
+                    if (sb.index != reg) continue;
+                    id<MTLSamplerState> found = [self samplerStateForBinding:sb error:error];
+                    if (!found) continue;
+                    sampler = found;
+                    break;
+                }
+                [ae setSamplerState:sampler atIndex:argId];
+            } else {
+                [ae setBuffer:zero offset:0 atIndex:argId];
+                [encoder useResource:zero usage:MTLResourceUsageRead];
+            }
+        }
+        [encoder setBuffer:ab offset:0 atIndex:0];
+        [encoder useResource:ab usage:MTLResourceUsageRead];
+        return YES;
+    }
+    return YES;
+}
+
 - (BOOL)dispatchPass:(ScDispatch *)dispatch error:(NSError **)error {
+    if (getenv("SCENECAP_REPLAY_SKIP_COMPUTE")) {   /* diagnostic: render-only replay */
+        return YES;
+    }
     ScPipeline *pipeline = [_scene pipelineNamed:dispatch.pipelineId];
     if (pipeline == nil) {
         if (error) *error = ScReplayError(@"dispatch \"%@\": unknown pipeline \"%@\"", dispatch.ident, dispatch.pipelineId);
@@ -1543,14 +1966,21 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     encoder.label = dispatch.ident;
     [encoder setComputePipelineState:state];
     ScArgumentTable *table = dispatch.argumentTable;
-    NSArray<NSArray<ScBufferBinding *> *> *bufferLists = @[table.vertexBuffers, table.uniformBuffers, table.fragmentBuffers];
-    for (NSArray<ScBufferBinding *> *list in bufferLists) {
-        for (ScBufferBinding *binding in list) {
-            ScResource *resource = [_scene resourceNamed:binding.resourceId];
-            if (resource == nil || resource.isTexture) continue;
-            id<MTLBuffer> buffer = [self bufferForResource:resource error:error];
-            if (buffer == nil) { [encoder endEncoding]; return NO; }
-            [encoder setBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
+    BOOL routeB = [self kernelUsesArgumentBuffer:kernel ofPipeline:pipeline];
+    if (routeB) {
+        if (![self bindArgumentBuffersForKernel:pipeline table:table encoder:encoder dispatch:dispatch error:error]) return NO;
+    } else {
+        NSArray<NSArray<ScBufferBinding *> *> *bufferLists = @[table.vertexBuffers, table.uniformBuffers,
+                                                               table.fragmentBuffers,
+                                                               table.storageBuffers ?: @[]];
+        for (NSArray<ScBufferBinding *> *list in bufferLists) {
+            for (ScBufferBinding *binding in list) {
+                ScResource *resource = [_scene resourceNamed:binding.resourceId];
+                if (resource == nil || resource.isTexture) continue;
+                id<MTLBuffer> buffer = [self bufferForResource:resource error:error];
+                if (buffer == nil) { [encoder endEncoding]; return NO; }
+                [encoder setBuffer:buffer offset:(NSUInteger)binding.offset atIndex:binding.index];
+            }
         }
     }
     for (ScTextureBinding *binding in table.textures) {
@@ -1567,8 +1997,26 @@ static NSArray<NSString *> *ScCandidateFunctionNames(ScStageKind kind) {
     }
     MTLSize groups = MTLSizeMake((NSUInteger)MAX(dispatch.grid.v[0], 1u), (NSUInteger)MAX(dispatch.grid.v[1], 1u),
                                  (NSUInteger)MAX(dispatch.grid.v[2], 1u));
-    /* The NVN threadgroup size is baked into the translated MSL; 64 matches every kernel observed so far. */
+    /* Threadgroup size: the NVN control section bakes one per kernel and the reflection records it as tg[];
+     * dispatching a different shape gives LocalInvocationID values the kernel never planned for (the ch1
+     * clear kernel works in 16x16 tiles). */
     MTLSize local = MTLSizeMake(64, 1, 1);
+    if (kernel.reflectionBlobId.length) {
+        NSError *reflError = nil;
+        NSData *reflData = [_package payloadOfChunk:kernel.reflectionBlobId error:&reflError];
+        NSDictionary *refl = reflData ? [NSJSONSerialization JSONObjectWithData:reflData options:0 error:nil] : nil;
+        NSArray *tg = [refl isKindOfClass:[NSDictionary class]] ? refl[@"tg"] : nil;
+        if ([tg isKindOfClass:[NSArray class]] && tg.count == 3) {
+            NSUInteger dims[3] = {1, 1, 1};
+            BOOL ok = YES;
+            for (int i = 0; i < 3; i++) {
+                NSNumber *n = tg[i];
+                if (![n isKindOfClass:[NSNumber class]] || n.unsignedIntegerValue == 0) { ok = NO; break; }
+                dims[i] = n.unsignedIntegerValue;
+            }
+            if (ok) local = MTLSizeMake(dims[0], dims[1], dims[2]);
+        }
+    }
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:local];
     [encoder endEncoding];
     [commandBuffer commit];

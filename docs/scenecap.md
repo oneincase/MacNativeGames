@@ -450,15 +450,21 @@ sleep 22 && printf 'scenecap /tmp/nier.nvs\n' >> /tmp/sc-in.txt
 - **单层快照**：捕获端每个纹理只取 `mip_range.first` / `layer_range.first` 那一层。cube 与带 mip 链的纹理
   因此短于逻辑布局（例如 64×64 cube 只存 1 面）。重放器对「短于布局」的快照打印
   `[scenecap] note: texture … zero-filling` 并按可用字节上传，其余置零；**内容不完整是可观察的**。
-- **depth32float_stencil8 的实际行宽**：本机 M5 上报的 GPU 行是 5 字节/像素（格式表按 8 字节记），
-  所以深度/模板目标总是短快照。渲染目标在 pass 开始会清屏，因此不影响这些 pass 的输出。
+- **depth32float_stencil8**：捕获用 `MTLBlitOptionDepthFromDepthStencil` 只读深度平面（4 B/texel）；重放按
+  同样的 4 B 布局上传。旧包若按 5/8 B 计价会触发 zero-fill note，不影响以 clear 开头的 pass。
 - **未命名像素格式**：捕获端把不认识的 `MTLPixelFormat` 记成 `"unknown"`，重放按 `rgba8unorm` 兜底并
-  在 stderr 打出同名 note。
-- **BC1（`bc1_rgba`）**：捕获端仍按 4 字节/像素记录（未做块布局计算），重放按 4×4 块布局读前 N 字节；
-  修正需要捕获端按块计算，见待办。
-- **顶点输入**：属性表来自 `vs->rf`，布局来自 `S.stream`。反射里没有顶点输入的 pipeline 会得到一个
-  空属性表（重放不设 `MTLVertexDescriptor`，若 MSL 声明了 `[[attribute]]` 则 Metal 拒绝该 pipeline）。
-- **同一帧的 compute 链**：compute 不重放，依赖它的后处理 pass 会读到未计算的内容。
+  在 stderr 打出同名 note。ASTC 4x4/5x5/6x6/8x8（及 sRGB）与 BC1/BC3/BC7 已有名字与块布局。
+- **BC/ASTC 块布局**：捕获与重放均按 `ceil(w/bw)*ceil(h/bh)*block_bytes` 计算；旧包里把 BC1 当成
+  4 B/像素的快照会偏长，重放只消费前 N 个块字节。
+- **顶点输入**：属性表来自 `vs->rf`，布局来自 `S.stream`，`buffer_index = 16+stream`（与实机
+  `bind_vertex_streams` 一致）。重放把参数表里的 stream 下标抬到 16+，避免与 `[[buffer(0)]]`
+  参数缓冲 / uniform 槽冲突。
+- **参数缓冲（Route B）**：重放按反射的 `arg_id←reg` 用 `MTLArgumentEncoder` 组装
+  `spvDescriptorSet0`，并 `useResource` 驻留；`support_buffer` 的 `render_scale` 填 1.0（与实机
+  `support_buf()` 一致）。缺反射的 stage 仍拒绝猜测。
+- **index.base_vertex**：与 `index.start`（索引起点）分开记录；旧包把 `base_vertex` 误写入
+  `index.start` 的，在 `base_vertex≠0` 时会错位。
+- **同一帧的 compute 链**：compute 现已重放；若 kernel 只写 SSBO，导出 PNG 与不执行时一致是预期。
 
 **验证窗口**：`SCENECAP_FIRST_FRAME` 默认 0（立即），`SCENECAP_FRAMES` 默认 1。要在特定画面抓，
 先用 `scenecap` 命令在目标时刻触发（本页命令示例即此方式），不要依赖启动即捕获。
@@ -527,3 +533,22 @@ make -C games/nier runtime WORK=/Volumes/bit2t/switch/totk/NIER_build -j8 SCENEC
 `scenecap_capture.c` 的 `sc_ready()` 不能在编码线程里启动捕获：它会被 `scenecap_nvn_pass_begin/draw/dispatch` 调用，而那些钩子跑在 Metal 编码线程上（`TOTK_RENDER_STREAM=1`），在里面做 host 读取会触发 `FATAL render stream: sync inside a streamed pass`。现在 `sc_ready()` 只查状态，启动统一由 `scenecap_nvn_frame`（游戏线程的 `mtl_set_frame`）负责。
 
 另一个坑：`#if SCENECAP_HOOKS` 包裹 `nvn_mtl.m` 的钩子时 `#endif` 后面不能跟代码（`#endif enc_r_end(g_enc);` 这种写法会静默改变语义），必须让每个 `#endif` 独占一行。
+
+### 8.2 GS 消费端与多阶段修复（2026-10-25）
+
+抓「世界着色」类 pass 前先确认游戏侧的 GS 重放开着（nier：`NIER_GS_COMPACT` 缺省开）。本轮在工具侧修了四处，全部由真实包暴露：
+
+| 缺陷 | 表现 | 修复 |
+| --- | --- | --- |
+| compute 派发不绑 Route-B 参数缓冲 | 内核解引用 `spvDescriptorSet0` 里的裸指针 → GPU hang（下一个 render pass 报 "Caused GPU Hang"） | dispatch 路径复用渲染端的参数编码器逻辑 |
+| compute 线程组硬编码 64×1×1 | 内核按 16×16 分块时 `LocalInvocationID` 形状错 | 从反射 `tg[]` 读取，缺省回退 64 |
+| `storage_buffers[]` 不解析 | SSBO 绑定（含人物 VS 的光照表）静默变零填充 | 模型加 `storageBuffers`，Route-B 匹配同时搜 uniform+storage |
+| 退化间接记录（count<3 无索引缓冲） | 整个 pass 因「缺索引缓冲」硬失败 | 捕获端不再记录 `ibuf==0` 的间接记录；重放端跳过并告警一次 |
+
+新增分析工具：`tools/scenecap/compare/scenecap_passmap.py <pkg> [--pass pass/26] [--min-vc 1000]`，
+一条命令打印 `pass → FS(vs)×draw` 全表，定位「哪个 pass 在画什么」不用再手写脚本。
+
+诊断开关（重放器）：`SCENECAP_REPLAY_SKIP_COMPUTE=1` 只跑渲染；`SCENECAP_REPLAY_HILITE=<fs8>[,<fs8>…]`
+把命中的片元换成实心色（第 1 键品红、第 2 键绿……与实机 `DM_NVN_HILITE` 同序），用于在光照塌缩导致
+整 pass 全黑时辨认「哪个 shader 拥有这些像素」。游戏侧同类开关：`NIER_LOG_DROPIND`（被丢的零计数间接
+draw 的 FS 键）、`NIER_LOG_MDROP`（多笔间接计数丢弃）、`NIER_LOG_GSCONS`（GS 消费端解析路径）。

@@ -352,6 +352,7 @@ typedef struct {
     int32_t pipe;
     uint32_t vertex_start, vertex_count;
     uint32_t index_type, index_start, index_count;
+    uint32_t base_vertex;
     int32_t index_res;
     uint32_t instances, primitive;
     uint32_t bind_first, bind_count;
@@ -732,6 +733,7 @@ void scenecap_draw(scenecap_capture *c, const scenecap_draw_desc *draw) {
     rec->index_type = draw->index_type;
     rec->index_start = draw->index_start;
     rec->index_count = draw->index_count;
+    rec->base_vertex = draw->base_vertex;
     rec->index_res = draw->index_buffer && draw->index_bytes ? intern_buffer(c, draw->index_buffer, draw->index_bytes) : -1;
     mark_usage(c, rec->index_res, SC_USE_INDEX);
     rec->instances = draw->instances ? draw->instances : 1;
@@ -1190,6 +1192,7 @@ static int build_manifest(scenecap_capture *c, text_buf *tb) {
             tb_addf(tb, ",\"index\":{\"type\":\"%s\",\"start\":%u,\"count\":%u",
                     index_name((int)d->index_type), d->index_start, d->index_count ? d->index_count : d->vertex_count);
             if (d->index_res >= 0) { tb_puts(tb, ",\"buffer\":"); tb_json_string(tb, c->res[d->index_res].id); }
+            if (d->base_vertex) tb_addf(tb, ",\"base_vertex\":%u", d->base_vertex);
             tb_puts(tb, "}");
         }
         tb_addf(tb, ",\"instances\":%u,\"primitive_type\":\"%s\"", d->instances, prim_name((int)d->primitive));
@@ -1265,10 +1268,8 @@ static int fetch_shaders(scenecap_capture *c) {
     return 1;
 }
 
-/* Bytes per texel for the formats the offline replayer understands.  The texture_read callback must hand back
- * exactly width*height*bytes texels, and the replayer checks that size, so a depth32float texel is four bytes
- * (not eight) and rgba32float is sixteen.  Unknown formats keep the conservative four-byte guess; MSAA is read as
- * eight because the capture layer does not resolve samples. */
+/* Linear bytes-per-texel for formats the offline replayer understands. Block formats return 0 here and are
+ * sized by texture_snapshot_bytes() instead. depth32float_stencil8 is snapshotted as depth-only float32 (4 B). */
 static uint32_t texture_bytes_per_texel(const char *format, uint32_t sample_count) {
     static const struct {
         const char *name;
@@ -1278,11 +1279,56 @@ static uint32_t texture_bytes_per_texel(const char *format, uint32_t sample_coun
         {"bgra8unorm", 4},        {"bgra8unorm_srgb", 4},  {"rgba8snorm", 4},        {"r32float", 4},
         {"rgba16unorm", 8},       {"rgba16float", 8},      {"rg16float", 4},         {"rg32float", 8},
         {"rgba32float", 16},      {"rgb10a2unorm", 4},     {"bgr10a2unorm", 4},      {"depth16unorm", 2},
-        {"depth32float", 4},      {"depth24_stencil8", 4}, {"depth32float_stencil8", 8}, {"stencil8", 1},
+        {"depth32float", 4},      {"depth24_stencil8", 4}, {"depth32float_stencil8", 4}, {"stencil8", 1},
+        {"rg11b10float", 4},      {"r16float", 2},
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++)
         if (format && strcmp(format, table[i].name) == 0) return table[i].bytes;
     return sample_count > 1 ? 8 : 4;
+}
+
+/* Returns 1 and fills (bw,bh,bbs) for BC/ASTC names the host may emit; 0 otherwise. */
+static int texture_block_layout(const char *format, uint32_t *bw, uint32_t *bh, uint32_t *bbs) {
+    static const struct {
+        const char *name;
+        uint32_t bw, bh, bbs;
+    } table[] = {
+        {"bc1_rgba", 4, 4, 8},      {"bc1_rgba_srgb", 4, 4, 8},
+        {"bc2_rgba", 4, 4, 16},     {"bc2_rgba_srgb", 4, 4, 16},
+        {"bc3_rgba", 4, 4, 16},     {"bc3_rgba_srgb", 4, 4, 16},
+        {"bc4_runorm", 4, 4, 8},    {"bc5_rgunorm", 4, 4, 16},
+        {"bc7_rgbaunorm", 4, 4, 16},{"bc7_rgbaunorm_srgb", 4, 4, 16},
+        {"astc_4x4", 4, 4, 16},     {"astc_4x4_srgb", 4, 4, 16},
+        {"astc_5x5", 5, 5, 16},     {"astc_5x5_srgb", 5, 5, 16},
+        {"astc_6x6", 6, 6, 16},     {"astc_6x6_srgb", 6, 6, 16},
+        {"astc_8x8", 8, 8, 16},     {"astc_8x8_srgb", 8, 8, 16},
+        {"astc_10x10", 10, 10, 16}, {"astc_10x10_srgb", 10, 10, 16},
+        {"astc_12x12", 12, 12, 16}, {"astc_12x12_srgb", 12, 12, 16},
+    };
+    for (size_t i = 0; i < sizeof table / sizeof table[0]; i++)
+        if (format && strcmp(format, table[i].name) == 0) {
+            *bw = table[i].bw;
+            *bh = table[i].bh;
+            *bbs = table[i].bbs;
+            return 1;
+        }
+    return 0;
+}
+
+static uint64_t texture_snapshot_bytes(const scenecap_texture_info *info, uint32_t width, uint32_t height) {
+    uint32_t bw, bh, bbs;
+    if (texture_block_layout(info->pixel_format, &bw, &bh, &bbs)) {
+        uint64_t rows = ((uint64_t)width + bw - 1) / bw;
+        uint64_t cols = ((uint64_t)height + bh - 1) / bh;
+        uint64_t need = rows * cols * bbs;
+        if (info->texture_type == 2) need *= info->depth ? info->depth : 1;
+        return need;
+    }
+    uint32_t bpp = texture_bytes_per_texel(info->pixel_format, info->sample_count);
+    if (info->sample_count > 1) bpp = 8;
+    uint64_t need = (uint64_t)width * height * bpp;
+    if (info->texture_type == 2) need *= info->depth ? info->depth : 1;
+    return need;
 }
 
 static void fetch_textures(scenecap_capture *c) {
@@ -1299,10 +1345,7 @@ static void fetch_textures(scenecap_capture *c) {
         uint32_t height = r->info.height >> (r->level < 32 ? r->level : 31);
         if (!width) width = 1;
         if (!height) height = 1;
-        uint32_t bpp = texture_bytes_per_texel(r->info.pixel_format, r->info.sample_count);
-        if (r->info.sample_count > 1) bpp = 8;
-        uint64_t need = (uint64_t)width * height * bpp;
-        if (r->info.texture_type == 2) need *= r->info.depth ? r->info.depth : 1;
+        uint64_t need = texture_snapshot_bytes(&r->info, width, height);
         if (need > limit || c->total_bytes + need > total) {
             r->skipped = 1;
             c->dropped_resources++;
@@ -1579,6 +1622,16 @@ int scenecap_options_from_env(scenecap_options *options) {
             options->frame_count = count > 0 ? (uint32_t)count : 1;
         }
     }
+    /* Documented alongside SCENECAP_FRAMES: defer the window without encoding it as first:count. */
+    const char *first = getenv("SCENECAP_FIRST_FRAME");
+    if (first && first[0]) {
+        long long value = strtoll(first, NULL, 0);
+        if (value > 0) options->first_frame = (uint64_t)value;
+    }
+    /* An env-only start (SCENECAP=1 without SCENECAP_FRAMES) used to leave frame_count at 0, which
+       made the window [first, first) -- the recorder armed and finished in the same frame boundary,
+       writing an empty package before the caller's `scenecap <path>` command could re-arm it. */
+    if (!options->frame_count) options->frame_count = 1;
     const char *budget = getenv("SCENECAP_MAX_BYTES");
     if (budget && budget[0]) {
         long long value = strtoll(budget, NULL, 0);

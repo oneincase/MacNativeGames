@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 /* Bumped whenever scenecap_state / scenecap_pipeline / scenecap_draw change; the glue compiles against this. */
-#define SCENECAP_CAPTURE_API 1
+#define SCENECAP_CAPTURE_API 2
 
 typedef enum {
     SCENECAP_PASS_RENDER = 0,
@@ -244,10 +244,11 @@ typedef struct {
     uint32_t vertex_start;
     uint32_t vertex_count;
     uint32_t index_type; /* scenecap_index_type */
-    uint32_t index_start;
+    uint32_t index_start; /* first index into the index buffer (not base_vertex) */
     uint32_t index_count;
     uint64_t index_buffer; /* guest address of the index data; 0 when the draw is non-indexed */
     uint64_t index_bytes;
+    uint32_t base_vertex; /* added to every fetched index; 0 when unused */
     uint32_t instances;
     uint32_t primitive; /* scenecap_primitive */
     const scenecap_binding *bindings;

@@ -260,8 +260,10 @@ typedef NS_OPTIONS(NSUInteger, ScResourceUsage) {
 @property (nonatomic, copy) NSArray<ScBufferBinding *> *vertexBuffers;
 @property (nonatomic, copy) NSArray<ScBufferBinding *> *uniformBuffers;
 @property (nonatomic, copy) NSArray<ScBufferBinding *> *fragmentBuffers;
+@property (nonatomic, copy) NSArray<ScBufferBinding *> *storageBuffers;   /* SSBOs; the manifest's storage_buffers[] */
 @property (nonatomic, copy) NSArray<ScTextureBinding *> *textures;
 @property (nonatomic, copy) NSArray<ScSamplerBinding *> *samplers;
+- (NSArray<ScBufferBinding *> *)allBuffers;   /* every buffer binding in the table, any kind */
 @end
 
 @interface ScIndexBuffer : NSObject
@@ -269,6 +271,7 @@ typedef NS_OPTIONS(NSUInteger, ScResourceUsage) {
 @property (nonatomic) uint64_t start;
 @property (nonatomic) uint64_t count;
 @property (nonatomic) uint64_t offset;
+@property (nonatomic) uint64_t baseVertex; /* added to every fetched index; 0 when unused */
 @property (nonatomic, copy, nullable) NSString *bufferId;
 @end
 
