@@ -105,7 +105,11 @@ SPIRV_CROSS = ('https://github.com/KhronosGroup/SPIRV-Cross.git', 'aa217aeb6c9f0
 SPIRV_CROSS_SOURCES = ('main.cpp', 'spirv_cfg.cpp', 'spirv_cpp.cpp', 'spirv_cross.cpp', 'spirv_cross_parsed_ir.cpp',
                        'spirv_cross_util.cpp', 'spirv_glsl.cpp', 'spirv_hlsl.cpp', 'spirv_msl.cpp', 'spirv_parser.cpp',
                        'spirv_reflect.cpp')
-SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-Wno-deprecated-declarations')
+# The app and every program it ships must start on macOS 26. clang defaults the minimum system version to the SDK's
+# (27.0 on a macOS 27 Mac), which made Launch Services refuse to start the app on macOS 26; all clang calls below pin it.
+MACOS_MIN = '26.0'
+SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-mmacosx-version-min=' + MACOS_MIN,
+                     '-Wno-deprecated-declarations')
 # Homebrew first; then the folder of the running interpreter (the Python uv selected, or an activated virtual environment),
 # last so that a system Python's /usr/bin never shadows the Homebrew tools for the build's subprocesses.
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', str(Path(sys.executable).parent)]
@@ -1103,7 +1107,8 @@ def build_spirv_cross(tree, logs):
             logs / 'spirv-cross' / (name + '.log'), quiet=False)
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
         list(pool.map(compile_one, SPIRV_CROSS_SOURCES))
-    run(['xcrun', 'clang++', '-arch', 'arm64', *[objs / (n + '.o') for n in SPIRV_CROSS_SOURCES], '-o', out / 'spirv-cross'],
+    run(['xcrun', 'clang++', '-arch', 'arm64', '-mmacosx-version-min=' + MACOS_MIN,
+         *[objs / (n + '.o') for n in SPIRV_CROSS_SOURCES], '-o', out / 'spirv-cross'],
         logs / 'spirv-cross' / 'link.log', quiet=False)
 
 
@@ -1282,7 +1287,8 @@ def build_launcher(tree, version, logs, env):
 
 def build_warm_tool(tree, logs, env):
     """build/warm-metal-cache: used only while packaging (step_warm_metal); not part of the app."""
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', 'tools/warm_metal_cache.m', '-framework', 'Metal',
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', '-mmacosx-version-min=' + MACOS_MIN,
+         'tools/warm_metal_cache.m', '-framework', 'Metal',
          '-framework', 'Foundation', '-o', 'build/warm-metal-cache'], logs / 'warm-metal-cache-build.log', cwd=tree, env=env)
 
 
@@ -1884,7 +1890,7 @@ def step_app(tree, out, logs, *, version="v0", game='totk', game_data='app', gam
         place_data_bundle(data_bundle(tree, version, logs, bundle_id=bundle_id), tmp, res, version)
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=executable, CFBundleIdentifier=bundle_id, CFBundleName=app_name,
                 CFBundleDisplayName=app_name, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
-                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
+                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion=MACOS_MIN, NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True,
                 CFBundleLocalizations=list(GAME_LANGUAGES) + (['pt-BR'] if version in ('v143', 'botw190') else []))

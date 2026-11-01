@@ -5,6 +5,10 @@ NATIVE_OPT ?= -O2
 # The game binaries' own bundle id (runtime/game_info.plist, in __TEXT,__info_plist): Metal's archive builder then works
 # in a cache folder of theirs, never in the one shared by programs without an id, also when a binary runs outside the app
 # (the build's pipeline-archive mode). Only that folder is cleaned (totk_pipeline_archive_folders.h).
+# The app must start on macOS 26. clang defaults the minimum system version to the SDK's (27.0 on a 27 Mac), which makes
+# Launch Services refuse to start the app on macOS 26; the environment variable reaches every clang call below.
+MACOS_MIN ?= 26.0
+export MACOSX_DEPLOYMENT_TARGET := $(MACOS_MIN)
 GAME_INFO := -Wl,-sectcreate,__TEXT,__info_plist,runtime/game_info.plist
 GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include
 
