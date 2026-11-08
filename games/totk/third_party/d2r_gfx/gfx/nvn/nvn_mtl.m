@@ -6483,7 +6483,13 @@ static NvShader *shader_load(NSString *pc, int stage) {
                     if (raw && (lib = shader_lib_prebuilt(raw))) atomic_fetch_add(&g_rt_prebuilt, 1);
 #endif
                     NSString *src = raw && !lib ? [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding] : nil;
-                    if (src) { lib = totk_msl_library(src, &e); atomic_fetch_add(&g_rt_compiled, 1); } }
+                    if (src) { lib = totk_msl_library(src, &e); atomic_fetch_add(&g_rt_compiled, 1);
+                        /* 这份源码就是 shader_lib_prebuilt 哈希的那份（base-instance / NDSR 修补之后）：记进缓存的 variants/，
+                           脚本一编，下次启动直接加载库，不再在提交线程现编。开发树每次启动重编 103 个 / 971 ms 的成因。
+                           This is the very source shader_lib_prebuilt hashes (after the base-instance / NDSR fixes): record it
+                           in the cache's variants/ so scripts/precompile_shader_libs.py can build the library that the next
+                           start loads, instead of compiling 103 of them on the submit thread every start (971 ms). */
+                        if (lib) variant_record(raw); } }
     } else lib = lib_from_file(lp, &e);
     if (rt) { uint64_t pre = atomic_load(&g_rt_prebuilt), com = atomic_load(&g_rt_compiled);
               if ((pre + com) % 200 == 1) MLOG("着色器库：预编译加载 %llu 个，现编 %llu 个", (unsigned long long)pre, (unsigned long long)com); }
@@ -6595,14 +6601,17 @@ static int rt_range_pr_ro(NvProg *p) {
 }
 /* Libraries compiled by the background translation (async shaders), until shader_get takes them on the submit thread. */
 static NSMutableDictionary<NSString *, NvShader *> *g_async_libs;
+static _Atomic uint64_t g_async_pub, g_async_hit, g_async_sync;   // libraries published by a worker / taken by a draw / compiled on the draw
 static os_unfair_lock g_async_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint64_t g_async_ready_n, g_async_ready_fail;
 static void async_ready(NSString *variant, int stage) {   // a translator worker (totk_rt_set_ready_hook)
     NSString *pc = [variant stringByAppendingString:@"_b"];
+    atomic_fetch_add(&g_async_ready_n, 1);
     NvShader *sh = shader_load(pc, stage);   // safe on several threads at once (the warm-up loads with it)
-    if (!sh) return;   // shader_get loads it again on the submit thread and reports the failure there
+    if (!sh) { atomic_fetch_add(&g_async_ready_fail, 1); static int said; if (!said++) MLOG("[async] 后台编译着色器库失败 %s（阶段 %d），绘制时会在提交线程再编一次", pc.UTF8String, stage); return; }   // shader_get loads it again on the submit thread and reports the failure there
     os_unfair_lock_lock(&g_async_lock);
     if (!g_async_libs) g_async_libs = [NSMutableDictionary dictionary];
-    g_async_libs[pc] = sh;
+    g_async_libs[pc] = sh; atomic_fetch_add(&g_async_pub, 1);
     os_unfair_lock_unlock(&g_async_lock);
 }
 static NvShader *async_take(NSString *pc) {
@@ -6724,9 +6733,9 @@ static NvShader *shader_get(NSString *pc, int stage) {
     if (!g_shcache) g_shcache = [NSMutableDictionary dictionary];
     NvShader *o = g_shcache[pc];
     if (o) return o;
-    uint64_t bt = bp_now(); o = async_take(pc); int taken = o != nil;   // compiled in the background (logged with its translation)
+    uint64_t bt = bp_now(); o = async_take(pc); int taken = o != nil; if (taken) atomic_fetch_add(&g_async_hit, 1);   // compiled in the background (logged with its translation)
     int predicted = !o && (o = plib_take(pc, 1)) != nil;   // compiled for prediction, waited for here while it compiled
-    if (!o) o = shader_load(pc, stage);
+    if (!o) { atomic_fetch_add(&g_async_sync, 1); o = shader_load(pc, stage); }
     if (!o) { if (survey_shader_log()) MLOG("[survey-shader] frame %llu Metal library FAILED stage %d %s after %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6); return nil; }
     g_shcache[pc] = o;
     pso_record("S\t%s\t%d\n", pc.UTF8String, stage);
@@ -18123,11 +18132,16 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
+        uint64_t dn0 = 0, dn1 = 0, dn2 = 0, dnh = 0; void totk_rt_defer_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+        totk_rt_defer_stats(&dn0, &dn1, &dn2, &dnh);
         MLOG("[bootprof] t=%.3f s 出图第 %llu 次：metallib 载入 %llu 个 / %.1f ms；管线创建 %llu 个 / %.1f ms（均在提交线程同步）；预热领用 着色器 %llu / 渲染管线 %llu / 计算管线 %llu；"
-             "贴图上传 %.1f MB / %llu 张首传 + %llu 次重传 / %.1f ms；首帧出图 t=%.3f s", (bp_now() - g_bp_t0) / 1e9, g_present_n,
+             "贴图上传 %.1f MB / %llu 张首传 + %llu 次重传 / %.1f ms；异步库 发布 %llu / 被取用 %llu / 提交线程现编 %llu；后台试编 %llu 次其中失败 %llu；翻译 may_defer 内联 %llu / 后台 %llu / 紧急 %llu（无钩子 %llu）；首帧出图 t=%.3f s", (bp_now() - g_bp_t0) / 1e9, g_present_n,
              g_bp_lib_n, g_bp_lib_ns / 1e6, g_bp_pso_n, g_bp_pso_ns / 1e6, g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps,
              g_bp_up_bytes / 1048576.0, g_pkg_uploads, g_pkg_reuploads,
-             g_up_total_ns / 1e6, g_bp_first_present / 1e9);
+             g_up_total_ns / 1e6, (unsigned long long)atomic_load(&g_async_pub), (unsigned long long)atomic_load(&g_async_hit),
+             (unsigned long long)atomic_load(&g_async_sync),
+             (unsigned long long)atomic_load(&g_async_ready_n), (unsigned long long)atomic_load(&g_async_ready_fail),
+             (unsigned long long)dn0, (unsigned long long)dn1, (unsigned long long)dn2, (unsigned long long)dnh, g_bp_first_present / 1e9);
     }
     PD("X ser=%llu%s", t->serial, interp >= 0 ? " (MetalFX interpolated frame before it)" : "");
     int ring = interp < 0 ? t_pn_ring : -1;   // TOTK_PRESENT_RING: the copy made at present time

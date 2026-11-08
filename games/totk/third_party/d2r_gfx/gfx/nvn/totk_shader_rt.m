@@ -611,6 +611,7 @@ static _Atomic int g_rt_urgent_busy;   // urgent jobs queued or running: the bac
 enum { RT_JOB_QUEUED, RT_JOB_RUNNING, RT_JOB_TAKEN };
 static NSMutableDictionary<NSString *, NSMutableArray *> *g_rt_pending;   // shader -> its job: @[@RT_JOB_*, request, @stage, @existed, code] (g_rt_lock)
 static _Atomic uint64_t g_rt_urgent_n, g_rt_urgent_ns;
+static _Atomic uint64_t g_rt_defer_n[3], g_rt_nohook;   // calls by may_defer (0 inline, 1 background, 2 urgent) / jobs finished before the ready hook was set
 static pthread_cond_t g_rt_done = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_rt_gen;
 static void (*g_rt_ready_hook)(NSString *variant, int stage);
@@ -622,6 +623,7 @@ static void rt_job_run(NSString *shader, NSMutableArray *job, rt_svc *svc, uint6
     if (![code writeToFile:rq[@"code"] atomically:YES]) die("write shader code %s", [rq[@"code"] UTF8String]);
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     NSDictionary *refl = translate(svc, rq, started);
+    if (refl && !g_rt_ready_hook) atomic_fetch_add(&g_rt_nohook, 1);
     if (refl && g_rt_ready_hook) g_rt_ready_hook(rq[@"variant"], stage);   // the Metal library too, off the submit thread
     pthread_mutex_lock(&g_rt_lock);
     if (refl) variant_record(shader, rq, refl, existed, started, queued);
@@ -679,6 +681,7 @@ static void urgent_translate(NSString *shader, NSMutableArray *job) {
 int totk_rt_pending(void) { pthread_mutex_lock(&g_rt_lock); int n = (int)g_rt_pending.count; pthread_mutex_unlock(&g_rt_lock); return n; }
 int totk_rt_pending_of(NSString *shader) { pthread_mutex_lock(&g_rt_lock); int n = g_rt_pending[shader] != nil; pthread_mutex_unlock(&g_rt_lock); return n; }
 void totk_rt_urgent_stats(uint64_t *n, uint64_t *ns) { *n = atomic_load(&g_rt_urgent_n); *ns = atomic_load(&g_rt_urgent_ns); }
+void totk_rt_defer_stats(uint64_t *inline_n, uint64_t *bg_n, uint64_t *urgent_n, uint64_t *nohook) { *inline_n = atomic_load(&g_rt_defer_n[0]); *bg_n = atomic_load(&g_rt_defer_n[1]); *urgent_n = atomic_load(&g_rt_defer_n[2]); *nohook = atomic_load(&g_rt_nohook); }
 
 /* What the submit thread spends on translation itself (may_defer 0): waiting for a job already running
    elsewhere, and translating on the spot. Per-frame differences go to the frame TSV (hle_nvn.c @xl_wait_ms / @xl_sync_ms). */
@@ -689,6 +692,7 @@ void totk_rt_submit_stats(uint64_t *wait_n, uint64_t *wait_ns, uint64_t *sync_n,
 
 NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local, int may_defer) {
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (may_defer >= 0 && may_defer <= 2) atomic_fetch_add(&g_rt_defer_n[may_defer], 1);
     pthread_mutex_lock(&g_rt_lock);
     // Called for the game's actual shader bytes, including when a prepared
     // variant already exists. Old cache files alone never become observed keys.
