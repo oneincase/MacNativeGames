@@ -235,6 +235,22 @@ Added for it (general where possible, each with its reason in the code):
 
 **Ocarina of Time, 2026-11-07: packaged as a Mac app by build_app.py** (`build_app.py <dump folder>`, base/ alone, no update; games/oot/README.md). Its own translator (games/oot/prebuilt), system fonts optional, its ZBIC modules read with the separate zbic package (GPLv2, installed for this game's build only), its data files' Zstandard dictionaries read by ns2_shader_corpus.py: 42,302 shaders prepared.
 
+**Ocarina of Time, 2026-11-08: the pale haze was the upscaler bypass; the diagnostics' task/mesh red line lied.**
+- The bypass skipped agl's eight enhancement layers and replaced the last kernel (`agl_ndsr_vr_light`, keys `5a7d69b0` /
+  `fa3033d0`) with a plain copy, so its light and tone step went too. Kokiri Forest, the same save, measured from the frame
+  (title bar and the stats panel cropped out): mean luminance 0.641, saturation 0.133, contrast 0.120 bypassed, against
+  0.421 / 0.255 / 0.159 with the whole network. The last kernel's MSL has one input texture and one output image — the pair
+  the copy reads and writes — so it does not consume the layers' output. `TOTK_NDSR_BYPASS` now has three modes: `final`
+  (default) skips the layers and runs that kernel as translated (0.423 / 0.256 / 0.164), `0` the whole network, `1` the old
+  copy. Title: 52 to 58 fps against the network's 17.5; Kokiri Forest: 27 to 35 fps and GPU 29 to 31 ms, the same as the
+  old copy (the bottleneck there is elsewhere); no red line and no shader failure appeared in either run. Skill entry C36.
+- The 21 red lines a run printed about NVN2 task / mesh shaders "reading driver segment positions the replay layer does not
+  fill (c0+0x670 / 0x770 / 0x780)" were **false**: `drv_fillable`'s switch covers stages 0, 1 and 5 only, so stages 3 and 4
+  fell through to `default: return 0`, while `driver_bank_fill` has been writing both tables all along (`nxnative
+  dmsh_abi.h`). `TOTK_BIND_TRACE` showed the bindings: the task shader's `sbuf0=0x7305a70f00+0x3a100` with real data. Fixed
+  by adding `case 3: 0x670..0x770` and `case 4: 0x770..0x870` (0x780 is the mesh table's slot 1). A new stage's fill needs
+  its fillability predicate in the same change, or the next debugger follows a red line that means nothing. Skill C34 变体.
+
 **Pokopia, 2026-11-04: packaged as a Mac app by build_app.py, its shaders prepared at packaging.**
 - `build_app.py <dump folder> --shared-fonts <folder>`: a folder as the game argument is a Switch 2 dump (base/,
   updates/<version>/ with exefs/ and romfs/); the title ID in its main.npdm picks the game (NS2 table: Pokopia

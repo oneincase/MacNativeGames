@@ -6169,7 +6169,8 @@ void mtl_variant_stats(uint64_t *n, uint64_t *ns, uint64_t *pre, uint64_t *bg, u
    shader that reads c0 was given the all-zero segment: compute shaders saw 0 thread groups (the occlusion-culling kernel
    ce4993a0 then put all its cells into the first row and left the other 17 rows 0 -- every occlusion query failed and NPCs
    vanished), vertex shaders a point-size limit of 0, and both 0 for the base addresses they add offsets to. Words the replay
-   fills (encode_args): c0 storage-buffer table at 0x110 (vertex) / 0x310 (compute) / 0x510 (fragment), 16 bytes per slot
+   fills (encode_args): c0 storage-buffer table at 0x110 (vertex) / 0x310 (compute) / 0x510 (fragment) / 0x670 (NVN2 task)
+   / 0x770 (NVN2 mesh), 16 bytes per slot
    {address, size}; compute thread-group counts {x, y, z} at 0x200 and uniform-buffer table at 0x210; vertex point-size
    limit at 0x610; c2 texture / sampler handle tables. Anything else reads 0 and is reported. */
 static int drv_fillable(int stage, int bank, unsigned off) {
@@ -6182,6 +6183,12 @@ static int drv_fillable(int stage, int bank, unsigned off) {
 #endif
     case 1: return off >= 0x510 && off < 0x610;
 #ifdef GAME_NS2
+    /* NVN2 task / mesh: the storage-buffer table driver_bank_fill writes at 0x670 / 0x770 (nxnative dmsh_abi.h
+       DMSH_C0_SSBO_TS / _MS, 16 slots of 16 bytes). Without these the scan called every NVN2 task and mesh shader's table
+       read unfillable and logged a red line about reading 0, while the replay was filling the table: Ocarina of Time's
+       Foliage / Model mesh shaders (0x770, and 0x780 for slot 1) were reported on every run for nothing. */
+    case 3: return off >= 0x670 && off < 0x770;
+    case 4: return off >= 0x770 && off < 0x870;
     case 5: return off < 0x10 || (off >= 0x200 && off < 0x410);   /* NVN2: the workgroup counts at c0 + 4 */
 #else
     case 5: return off >= 0x200 && off < 0x410;
@@ -6298,8 +6305,33 @@ static NSData *msl_base_instance_fix(NSData *raw) {
 /* Fallback for agl's eight enhancement layers. Native HMMA lowering now
    preserves the movie through its final upscale; the full enhancement network is still
    expensive here (~45 ms GPU). Keep the existing default until that cost is addressed.
-   TOTK_NDSR_BYPASS=0 runs the full original network through native Metal matrices. */
-static int ndsr_bypass(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_NDSR_BYPASS"); v = !(e && !strcmp(e, "0")); } return v; }
+   TOTK_NDSR_BYPASS=0 runs the full original network through native Metal matrices;
+   =1 the old copy bypass; unset / final keeps only the last kernel's light / tone step (ndsr_keep_final). */
+enum { NDSR_FULL = 0, NDSR_COPY = 1, NDSR_FINAL = 2 };
+static int ndsr_mode(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_NDSR_BYPASS");
+        v = !e || !*e || !strcasecmp(e, "final") || !strcasecmp(e, "light") ? NDSR_FINAL   // default: the light step, no layers
+          : !strcmp(e, "0") || !strcasecmp(e, "off") ? NDSR_FULL
+          : NDSR_COPY;
+    }
+    return v;
+}
+static int ndsr_bypass(void) {
+    static int once;
+    int m = ndsr_mode();
+    if (!once++) MLOG("[oot] agl NDSR: %s (TOTK_NDSR_BYPASS: 0 full network, 1 copy, final/unset the light step alone)",
+                      m == NDSR_FULL ? "the full enhancement network" : m == NDSR_FINAL ? "the last kernel alone (light / tone)" : "eight layers skipped, last kernel copies");
+    return m != NDSR_FULL;
+}
+/* TOTK_NDSR_BYPASS=final (the default): skip the eight layers but run the last kernel (agl_ndsr_vr_light) as translated.
+   Its MSL reads one input texture and writes one image -- the same pair the copy bypass uses -- so the layers' output is not
+   what it consumes. The copy made the picture bright and desaturated: Kokiri Forest measured from the frames mean luminance
+   0.641 against 0.421 with the network, saturation 0.133 against 0.255, contrast 0.120 against 0.159; final measures 0.424 /
+   0.259 / 0.165, within 1 %, and costs nothing over the copy in the forest (30 fps both, GPU 29-31 ms) while the title runs
+   58 fps against the network's 17.5. =0 runs the whole network, =1 the old copy. */
+static int ndsr_keep_final(void) { return ndsr_mode() == NDSR_FINAL; }
 static const char *const g_ndsr_layers[] = { "ba079f68", "a8b4fb48", "e2eebd7b", "e6be82d8", "9442573e", "0a56002c", "d15370a3", "7f7ff0f3" };
 static const char *const g_ndsr_final = "5a7d69b0";
 static int ndsr_layer(const char *key) {
@@ -6308,7 +6340,7 @@ static int ndsr_layer(const char *key) {
     return 0;
 }
 static NSData *ndsr_final_fix(NSData *raw, NSString *pc) {
-    if (!raw || !ndsr_bypass() || !([pc hasPrefix:@(g_ndsr_final)] || [pc hasPrefix:@"fa3033d0"])) return raw;   // fa3033d0: the gameplay form of the last kernel (1536x864 scene -> 2048x1152 target)
+    if (!raw || !ndsr_bypass() || ndsr_keep_final() || !([pc hasPrefix:@(g_ndsr_final)] || [pc hasPrefix:@"fa3033d0"])) return raw;   // fa3033d0: the gameplay form of the last kernel (1536x864 scene -> 2048x1152 target)
     NSString *src = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
     NSRegularExpression *rt = [NSRegularExpression regularExpressionWithPattern:@"texture2d<float> (cp_t_\\w+) \\[\\[id" options:0 error:nil],
                         *ri = [NSRegularExpression regularExpressionWithPattern:@"texture2d<float, access::write> (cp_i_\\w+) \\[\\[id" options:0 error:nil];

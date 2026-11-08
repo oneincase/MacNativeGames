@@ -8,8 +8,14 @@ Known problems:
 
 - Memory: a loaded save plays, but this is not settled. A 3 minute session peaked at 11.7 GB of system wired memory, against the 12.3 GB limit (`wired_guard_check`, exit 87), and no longer session has been tried. The raw pool table also overflows by a few entries (a red line in the log; addresses in those pools are not reached).
 - Frame rate, on one 16 GB Mac, single runs: 60 fps held at the spawn point in Link's house and in the forest view after leaving it, about 53 fps facing the house's door, about 55 fps on the deck outside (frame p50 17.4 to 17.8 ms, p95 about 21.7 ms). The rest of the world has not been measured. GPU 15 to 18 ms in the heavier views. Spikes of 40 to 50 ms with low GPU time remain in some views (CPU side, not explained). Pool tables are still walked whole 3 times a frame (5 ms or so).
-- The picture has a pale haze; the cause is not confirmed.
-- agl's upscaler network is bypassed (a plain copy, `TOTK_NDSR_BYPASS=0` runs it), so the picture is softer than the console's.
+- The picture's pale haze: **fixed 2026-11-08; it was the upscaler bypass.** The bypass skipped agl's eight enhancement
+  layers and also replaced the last kernel (`agl_ndsr_vr_light`) with a plain copy, which dropped that kernel's light and
+  tone step: in Kokiri Forest a frame measured mean luminance 0.641, saturation 0.133 and contrast 0.120, against 0.421 /
+  0.255 / 0.159 with the whole network. The last kernel's MSL reads one texture and writes one image (the pair the copy
+  used), so it does not consume the layers' output: the default now skips the layers and runs that kernel as translated
+  (0.423 / 0.256 / 0.164, within 1 % of the network), for 52 to 58 fps at the title against the network's 17.5 and no cost
+  over the old copy in the forest (27 to 35 fps, GPU 29 to 31 ms). `TOTK_NDSR_BYPASS=0` runs the whole network, `=1` the
+  old copy. The picture is softer than the console's only in what the eight layers added.
 - Draws of shaders that read an image or buffer texture handle from memory are skipped.
 
 Memory and frame rate, what changed (`nvn_mtl.m`):
