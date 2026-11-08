@@ -78,6 +78,43 @@ static void patch_oot_frame_step(Module *m) {
     __builtin___clear_cache((char *)m->base + SITE, (char *)m->base + stub + sizeof code);
     fprintf(stderr, "[totk] game time follows real time: the step at main+%#x is the measured frame time, speed %.2f (TOTK_GAME_SPEED; TOTK_REALTIME=0: as shipped)\n", (unsigned)SITE, oot_scale);
 }
+/* TOTK_SIZE_PROBE=1（诊断，为输出尺寸补丁）: the game's output size is set by main+0x11e7b64 `ldp w3, w4, [x19, #0xb4]`
+   followed by nvnWindowSetCrop(main+0x11e7b70) — 2048x1152, which appears nowhere in the module as data and is not a
+   movz pair, so it is computed somewhere and stored in that object. This stub runs at the ldp, keeps x19 (the object) and
+   the two words it loaded in host memory, and does the ldp itself; hle_nvn.c then prints the object and its fields at the
+   next crop. Diagnostic only: TOTK_SIZE_PROBE unset leaves the game untouched. */
+uint64_t oot_size_probe_obj, oot_size_probe_w, oot_size_probe_h;
+int oot_size_probe_on;
+static void patch_oot_size_probe(Module *m) {
+    if (!getenv("TOTK_SIZE_PROBE")) return;
+    enum { SITE = 0x11e7b64, BACK = 0x11e7b68 };
+    uint32_t word; memcpy(&word, m->base + SITE, 4);
+    if (word != 0x29569263u) runtime_fail("Ocarina of Time output size: the ldp at main+0x11e7b64 differs from the verified build");
+    const uint64_t stub = (((m->text_end + 15) & ~15ULL) + 128) & ~15ULL;   /* past the frame-step stub */
+    const uint64_t a = (uint64_t)(uintptr_t)&oot_size_probe_obj, aw = (uint64_t)(uintptr_t)&oot_size_probe_w;
+    const uint32_t code[] = {
+        0xd2800010u | (uint32_t)((a & 0xffff) << 5),            /* movz x16, &object */
+        0xf2a00010u | (uint32_t)(((a >> 16) & 0xffff) << 5),
+        0xf2c00010u | (uint32_t)(((a >> 32) & 0xffff) << 5),
+        0xf2e00010u | (uint32_t)(((a >> 48) & 0xffff) << 5),
+        0xf9000213u,                                            /* str x19, [x16] */
+        0xd2800011u | (uint32_t)((aw & 0xffff) << 5),           /* movz x17, &w */
+        0xf2a00011u | (uint32_t)(((aw >> 16) & 0xffff) << 5),
+        0xf2c00011u | (uint32_t)(((aw >> 32) & 0xffff) << 5),
+        0xf2e00011u | (uint32_t)(((aw >> 48) & 0xffff) << 5),
+        0x29569263u,                                            /* ldp w3, w4, [x19, #0xb4]   (the original) */
+        0x29011203u | (uint32_t)(0),                            /* stp w3, w4, [x16, #8] */
+        0x14000000u | (((uint32_t)(((int64_t)BACK - (int64_t)(stub + 44)) >> 2)) & 0x3ffffffu),   /* back */
+    };
+    if (stub + sizeof code > ((m->text_end + 0xfff) & ~0xfffULL)) runtime_fail("Ocarina of Time output size: no room after the code");
+    for (size_t i = 0; i < sizeof code; i++) if (m->base[stub + i]) runtime_fail("Ocarina of Time output size: padding not empty");
+    memcpy(m->base + stub, code, sizeof code);
+    uint32_t jump = 0x14000000u | (((uint32_t)(((int64_t)stub - (int64_t)SITE) >> 2)) & 0x3ffffffu);
+    memcpy(m->base + SITE, &jump, 4);
+    __builtin___clear_cache((char *)m->base + SITE, (char *)m->base + stub + sizeof code);
+    oot_size_probe_on = 1;
+    fprintf(stderr, "[totk] output size probe: main+%#x now records the object and the size it loads (TOTK_SIZE_PROBE)\n", (unsigned)SITE);
+}
 #else
 /* No frame-step patch: these are what the frontend and the frame lock call. */
 void runtime_frame_step_pin(double ms) { (void)ms; }
@@ -421,6 +458,7 @@ void runtime_game_patches(Module *m) {
     patch_pokopia_display(m);
 #elif defined(GAME_OOT)
     patch_oot_frame_step(m);
+    patch_oot_size_probe(m);
 #endif
     const char *a = getenv("TOTK_EXCL_ACQUIRE");
     if (TARGET_OS_IPHONE || getenv("TOTK_EXPORT_IOS") || !a || strcmp(a, "0")) {
