@@ -9784,7 +9784,15 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         NSMutableArray<NSString *> *cache_files = [files mutableCopy];
         NSMutableSet<NSString *> *known_files = [NSMutableSet setWithArray:files];
         NSSet<NSString *> *late_scope = g_warm_scope ? [g_warm_scope setByAddingObjectsFromSet:totk_rt_observed_shader_keys()] : nil;
-        NSArray<NSString *> *latest = g_par_valid || g_par_fill_lists ? @[] : totk_rt_list();   // with a pipeline archive the rest is made when first drawn
+        /* 这一段只做「着色器库」的补充预热（kind 0），不碰管线：有管线存档时管线仍按需做（`par` 那边），但库要在这里装好。
+           一个库第一次用到时约 12 ms（预编译的 .metallib 也一样），OoT 一次运行里 103 个落在进世界后的几帧上，最长一帧
+           1 s 里有 1.2 s 的库装载；放在读取画面里做，玩家看不见。TOTK_WARM_LIBS=0 恢复旧行为（有存档时跳过）。
+           This pass warms shader libraries only (kind 0), never pipelines: with a pipeline archive the pipelines are still
+           made when first drawn (the par path), but the libraries are loaded here. A library costs about 12 ms the first
+           time it is needed, prebuilt or not, and Ocarina of Time met 103 of them in the frames after a world load (1.2 s,
+           in a frame that took 1 s); doing it behind the loading screen hides that. TOTK_WARM_LIBS=0 restores the old
+           behaviour (skipped when an archive is present). */
+        NSArray<NSString *> *latest = g_par_fill_lists ? @[] : totk_rt_list();
         for (NSString *file in latest) if ([file hasSuffix:@"_b.metal"] && ![known_files containsObject:file]) {
             if (!totk_shader_scope_contains(late_scope, [file stringByDeletingPathExtension])) continue;
             // The native service publishes reflection last. A newly written
