@@ -194,6 +194,42 @@ static void patch_oot_size_targets2(Module *m) {
     __builtin___clear_cache((char *)m->base + SITE, (char *)m->base + stub + sizeof code);
     fprintf(stderr, "[totk] output size targets 2: main+%#x (TOTK_SIZE_TARGETS)\n", (unsigned)SITE);
 }
+/* The resize path (main+0x488f64): a desired size at [x19+4] / [x19+8] is written into [x20+0xb4] / [x20+0xb8] when it is
+   larger than what that object holds. This is the write whose shape matches the display object we probed, so it overrides the
+   size there too, again only when the incoming height is 1152. */
+static void patch_oot_size_targets3(Module *m) {
+    if (!getenv("TOTK_SIZE_TARGETS")) return;
+    enum { SITE = 0x488f64, BACK = 0x488f70 };
+    const uint32_t want[3] = {0xb900b688u, 0xb9400a68u, 0xb900ba88u};   /* str w8,[x20,#0xb4]; ldr w8,[x19,#8]; str w8,[x20,#0xb8] */
+    uint32_t have[3]; memcpy(have, m->base + SITE, sizeof have);
+    if (memcmp(have, want, sizeof want)) runtime_fail("Ocarina of Time output size: the resize at main+0x488f64 differs from the verified build");
+    const uint64_t stub = (((m->text_end + 15) & ~15ULL) + 512) & ~15ULL;
+    const uint32_t code[] = {
+        0xb900b688u,                                            /* str  w8, [x20, #0xb4] */
+        0xb9400a68u,                                            /* ldr  w8, [x19, #8] */
+        0xb900ba88u,                                            /* str  w8, [x20, #0xb8] */
+        0x52809011u,                                            /* movz w17, #0x480 = 1152 */
+        0x6b11011fu,                                            /* cmp  w8, w17 */
+        0x54000000u,                                            /* b.ne back */
+        0x5280f011u,                                            /* movz w17, #0x780 = 1920 */
+        0xb900b691u,                                            /* str  w17, [x20, #0xb4] */
+        0x52808711u,                                            /* movz w17, #0x438 = 1080 */
+        0xb900ba91u,                                            /* str  w17, [x20, #0xb8] */
+        0x14000000u,                                            /* b    back */
+    };
+    const uint32_t words = (uint32_t)(sizeof code / sizeof code[0]);
+    uint32_t bne = 0x54000001u | (((uint32_t)((int64_t)(4 * (words - 5))) & 0x7ffffu) << 5);
+    memcpy((void *)(code + 5), &bne, 4);
+    uint32_t back = 0x14000000u | (((uint32_t)(((int64_t)BACK - (int64_t)(stub + 4 * (words - 1))) >> 2)) & 0x3ffffffu);
+    memcpy((void *)(code + words - 1), &back, 4);
+    if (stub + sizeof code > ((m->text_end + 0xfff) & ~0xfffULL)) runtime_fail("Ocarina of Time output size: no room for the resize stub");
+    for (size_t i = 0; i < sizeof code; i++) if (m->base[stub + i]) runtime_fail("Ocarina of Time output size: padding not empty (resize)");
+    memcpy(m->base + stub, code, sizeof code);
+    uint32_t jump = 0x14000000u | (((uint32_t)(((int64_t)stub - (int64_t)SITE) >> 2)) & 0x3ffffffu);
+    memcpy(m->base + SITE, &jump, 4);
+    __builtin___clear_cache((char *)m->base + SITE, (char *)m->base + stub + sizeof code);
+    fprintf(stderr, "[totk] output size targets 3: main+%#x (TOTK_SIZE_TARGETS)\n", (unsigned)SITE);
+}
 #else
 /* No frame-step patch: these are what the frontend and the frame lock call. */
 void runtime_frame_step_pin(double ms) { (void)ms; }
@@ -540,6 +576,7 @@ void runtime_game_patches(Module *m) {
     patch_oot_size_probe(m);
     patch_oot_size_targets(m);
     patch_oot_size_targets2(m);
+    patch_oot_size_targets3(m);
 #endif
     const char *a = getenv("TOTK_EXCL_ACQUIRE");
     if (TARGET_OS_IPHONE || getenv("TOTK_EXPORT_IOS") || !a || strcmp(a, "0")) {

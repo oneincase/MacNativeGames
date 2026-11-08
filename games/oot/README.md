@@ -18,6 +18,20 @@ Known problems:
   old copy. The picture is softer than the console's only in what the eight layers added.
 - Draws of shaders that read an image or buffer texture handle from memory are skipped.
 
+Output size (open): the game picks 2048x1152 itself (scene 1536x864, NDSR to 2048x1152), and the port has no switch for it -
+`runtime_output_modes()` returns 0 for this game, unlike Bananza and Pokopia. What a patch would have to change, measured
+with `TOTK_SIZE_PROBE`, `TOTK_SIZE_FORCE` and `TOTK_SIZE_TARGETS` (runtime/game_patches_ns2.c):
+- the size the window crop reads is the heap object's +0xb4 (width) and +0xb8 (height), read at main+0x11e7b64 and handed to
+  nvnWindowSetCrop at main+0x11e7b70 through the chain main+0x1203200 <- main+0xf28d04 <- main+0x9467d4 <- main+0x346c75c;
+- forcing 1920x1080 there (TOTK_SIZE_FORCE) moves the crop and the output/upscale targets, but not the scene's render
+  targets, which are created earlier: the passes stay 1536x864, so no GPU time is saved;
+- three code paths that write the fields - the object copies at main+0x1fca4c4 and main+0x179e514 and the "take the larger"
+  resize at main+0x488f64 - are not what builds the display object: overriding them (TOTK_SIZE_TARGETS) changes other
+  objects (1920x1080 appears in the frame) but the crop stays 2048x1152;
+- the module holds no copy of 2048x1152 (no 32/16-bit pair, no float pair, no movz #0x800 / #0x480 pair within 24
+  instructions) and the preset list 1280x720 .. 3840x2160 at main+0x3f59550 has no adrp reference, so the value is computed;
+  2048x1152 is 1920x1080 x 16/15, which is where to look next.
+
 Memory and frame rate, what changed (`nvn_mtl.m`):
 
 - Only pools the driver gave an address in go into the raw pool table (`mtl_pool_addressed`, after seedds/nxnative, MIT). A texture upload from any other pool borrows a temporary zero-copy buffer (`up_temp_src`); a pool under 64 MB borrowed more than 8 times stays resident instead. `TOTK_POOL_ADDR_ONLY=0` restores the old behaviour.
