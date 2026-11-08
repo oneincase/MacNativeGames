@@ -15,6 +15,10 @@ typedef struct {
 #define PSO_VBORDER 16u
 // bit 5 (TOTK, PR #1129): HDR / EDR on for this draw; the fragment function is the shader's HDR twin (NvShader hdr_fn).
 #define PSO_HDR 32u
+/* A host-generated full-viewport vertex function (Labo's lens-free compositor).
+ * Separate cache identity from the original vertex-input pipeline. */
+#define PSO_HOST_RECT 64u
+#define PSO_HOST_OUTPUT 128u   /* Plain native SBS output; no Labo lens fragment. */
 
 typedef struct {
     uint8_t kind, fbmask;

@@ -28,7 +28,7 @@ typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;   
 
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
 // game_mem/host/span: TOTK host-owned VM storage for physical/virtual pools (totk_vpool.c); host is NULL for game-backed pools.
-typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; } pool_t; FITS(pool_t, NVNmemoryPool);
+typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; uint32_t address_used, mapped, direct_alias; } pool_t;   /* address_used / mapped / direct_alias: totk_vpool.c (NS2: a virtual pool that becomes its contiguous physical backing) */ FITS(pool_t, NVNmemoryPool);
 
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
@@ -120,8 +120,9 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_PUSH_CONST, OP_FENCE_SYNC,
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_PUSH_CONST, OP_FENCE_SYNC, OP_MESH_TASKS,
     OP_EYE,   // zeldaVR stereo B2: the ops up to the next OP_EYE are for these eyes (p_eye; the replay of each eye skips the others')
+    OP_CLEAR_BUF,   // NVN2 nvnCommandBufferClearBuffer (p_clear_buf)
     OP_COUNT_
 };
 typedef struct { uint32_t mask, pad; } p_eye;   // OP_EYE: 1 left, 2 right, 3 both (what every recording is outside such marks)
@@ -134,8 +135,8 @@ typedef struct { int32_t index, mask; float rgba[4]; } p_clear_color;
 #define NVN_PUSH_BANK 24
 #define NVN_PUSH_SIZE 0x100
 typedef struct { uint16_t compute, offset; uint32_t size; uint8_t data[]; } p_push_const;
+typedef struct { uint32_t first, count; uint64_t ind; } p_mesh_tasks;   /* NVN2 nvnCommandBufferDrawMeshTasks (first task group, group count) */
 typedef struct { void *sync; } p_fence_sync;   // nvnCommandBufferFenceSync: the sync object, fenced at the submit (hle_nvn.c fence_syncs)
-#ifdef GAME_BOTW
 /* The same texture level / layer attached at more than one colour slot: only the first slot is attached (botw.md; the
    finding and fix come from nxnative, MIT, github.com/seedds/nxnative, rt_dup_slot). Breath of the Wild's G-buffer passes
    attach the albedo and another buffer twice each (c1 = c2, c3 = c4) with channel write masks 0 on the second ones. The
@@ -143,26 +144,36 @@ typedef struct { void *sync; } p_fence_sync;   // nvnCommandBufferFenceSync: the
    its own tile memory, stored back whole at the end of the pass, so the copy stored later (loaded, never written)
    overwrote the other's writes in a different order per tile: the albedo kept scattered squares. Returns the earlier slot
    holding the same image, or -1. Slots are compared by serial: records hold copies of the texture objects.
-   The macros below are the call sites in nvn_mtl.m: they sit at the end of existing lines and expand to nothing for TOTK,
-   so TOTK's code and line numbers (res_add_at) stay as they were. */
+   TotK also binds duplicate colour storage (observed 320x180 RGBA8 during startup).
+   Different mip levels and array/cube slices remain distinct attachments. */
+/* Same physical uncompressed storage/layout, even through different live
+   NVN descriptors. This is the identity used by storage-shared Metal images. */
+static inline int rt_storage_same(const tex_t *a,const tex_t *b){
+    if(a->serial&&a->serial==b->serial)return 1;
+    if(!a->mem||a->mem!=b->mem||!a->L.size||a->L.size!=b->L.size)return 0;
+    if(a->d.width!=b->d.width||a->d.height!=b->d.height||a->d.depth!=b->d.depth||a->d.levels!=b->d.levels||a->d.target!=b->d.target||a->d.samples!=b->d.samples)return 0;
+    int aw=1,ah=1,bw=1,bh=1,ab=nvn_fmt_bpb(a->d.format,&aw,&ah),bb=nvn_fmt_bpb(b->d.format,&bw,&bh);
+    return ab>0&&ab==bb&&aw==1&&ah==1&&bw==1&&bh==1;
+}
 static inline int rt_dup_of(const p_set_rt *r, int i) {
     if (!r->color[i]) return -1;
     int lv = r->has_cview[i] && r->cview[i].set_levels ? r->cview[i].base_level : 0, ly = r->has_cview[i] && r->cview[i].set_layers ? r->cview[i].min_layer : 0;
     for (int j = 0; j < i; j++) {
-        if (!r->color[j] || r->color[j]->serial != r->color[i]->serial) continue;
+        if (!r->color[j] || !rt_storage_same(r->color[j],r->color[i])) continue;
         int lj = r->has_cview[j] && r->cview[j].set_levels ? r->cview[j].base_level : 0, yj = r->has_cview[j] && r->cview[j].set_layers ? r->cview[j].min_layer : 0;
         if (lj == lv && yj == ly) return j;
     }
     return -1;
 }
 /* a clear of a slot left unattached goes to the slot holding the same image */
-#define BOTW_RT_DUP_CLEARS() { for (int i_ = 1; i_ < R.rt.n && i_ < 8; i_++) { int j_ = rt_dup_of(&R.rt, i_); \
+#define NVN_RT_DUP_CLEARS() { for (int i_ = 1; i_ < R.rt.n && i_ < 8; i_++) { int j_ = rt_dup_of(&R.rt, i_); \
         if (j_ >= 0 && R.clear_c[i_]) { if (!R.clear_c[j_]) { R.clear_c[j_] = 1; R.cc[j_] = R.cc[i_]; } R.clear_c[i_] = 0; } } }
-#define BOTW_RT_DUP_SKIP(i) if (rt_dup_of(&R.rt, i) >= 0) { static int said_; if (!said_++) MLOG("[botw] colour slot %d holds the same image as an earlier slot (serial %llu): left unattached (rt_dup_of)", i, (unsigned long long)R.rt.color[i]->serial); continue; }
+#define NVN_RT_DUP_SKIP(i) if (rt_dup_of(&R.rt, i) >= 0) { static int said_; if (!said_++) MLOG("[nvn] colour slot %d holds the same image as an earlier slot (serial %llu): left unattached (rt_dup_of)", i, (unsigned long long)R.rt.color[i]->serial); continue; }
 /* prediction: the slot is left unattached when the pass begins */
-#define BOTW_RT_DUP_PREDICT(r, cf) { for (int i_ = 1; i_ < (r)->n && i_ < 8; i_++) if (rt_dup_of(r, i_) >= 0) (cf)[i_] = 0; }
+#define NVN_RT_DUP_PREDICT(r, cf) { for (int i_ = 1; i_ < (r)->n && i_ < 8; i_++) if (rt_dup_of(r, i_) >= 0) (cf)[i_] = 0; }
 /* a clear of a slot left unattached: clear the slot holding the same image */
-#define BOTW_RT_DUP_CLEAR_TO_FIRST(c) p_clear_color botw_to_first_; { int f_ = rt_dup_of(&R.rt, (c)->index); if (f_ >= 0) { botw_to_first_ = *(c); botw_to_first_.index = f_; (c) = &botw_to_first_; } }
+#define NVN_RT_DUP_CLEAR_TO_FIRST(c) p_clear_color nvn_to_first_; { int f_ = rt_dup_of(&R.rt, (c)->index); if (f_ >= 0) { nvn_to_first_ = *(c); nvn_to_first_.index = f_; (c) = &nvn_to_first_; } }
+#ifdef GAME_BOTW
 /* "ashot <path>" requests (end of nvn_mtl.m), taken at the game's present call with the screenshot queue lock held */
 void botw_ashot_poll(const void *t, long cur);
 #define BOTW_ASHOT_POLL(t, cur) botw_ashot_poll((t), (cur));
@@ -328,10 +339,6 @@ int totk_wb_fence_on(void);
 #define BOTW_LATE_FILTER(list, nl)
 #define BOTW_LATE_DROP(lo, hi)
 #define UNCAPPED_INTERVAL_FROM_ENV(e) e && atoi(e)
-#define BOTW_RT_DUP_CLEARS()
-#define BOTW_RT_DUP_SKIP(i)
-#define BOTW_RT_DUP_PREDICT(r, cf)
-#define BOTW_RT_DUP_CLEAR_TO_FIRST(c)
 #define BOTW_ASHOT_POLL(t, cur)
 #define BOTW_REUP_TRACKED(pk, t)
 #define BOTW_PKG_FIELDS
@@ -376,7 +383,8 @@ typedef struct { int32_t face, value_mask, mask, ref, which; } p_stencil;  // wh
 typedef struct { float factor, units, clamp; } p_poly_offset;
 typedef struct { int32_t prim, first, count, base_instance, instances, pad_; uint64_t ind; } p_draw;   // TOTK: instances 0 = one instance (DrawArrays); ind: NVN address of the {count, instances, first, base instance} record of an indirect draw (0 = direct)
 typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instances; uint64_t ibuf, ind; } p_draw_idx;   // ind: NVN address of the {count, instances, first index, base vertex, base instance} record of an indirect draw (0 = direct)
-typedef struct { int32_t x, y, z; uint64_t caller; } p_dispatch;   // caller：游戏调用点返回地址（定位派发者） | caller: return address of the game call site (to locate the dispatcher)
+typedef struct { uint64_t addr, size; uint32_t value, pad; } p_clear_buf;
+typedef struct { int32_t x, y, z; uint64_t caller; uint64_t ind; } p_dispatch;   // caller：游戏调用点返回地址（定位派发者） | caller: return address of the game call site (to locate the dispatcher)
 typedef struct { const dpool_t *pool; } p_set_pool;
 typedef struct { uint64_t src; const tex_t *tex; view_t view; uint8_t has_view; NVNcopyRegion r; int32_t flags; } p_copy_b2t;
 typedef struct { const tex_t *src, *dst; view_t sv, dv; uint8_t has_sv, has_dv; NVNcopyRegion sr, dr; int32_t flags; } p_copy_t2t;   // T2B 复用：src 存目标缓冲地址 | Reused for T2B: src stores the destination buffer address
