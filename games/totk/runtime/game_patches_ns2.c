@@ -91,21 +91,26 @@ static void patch_oot_size_probe(Module *m) {
     uint32_t word; memcpy(&word, m->base + SITE, 4);
     if (word != 0x29569263u) runtime_fail("Ocarina of Time output size: the ldp at main+0x11e7b64 differs from the verified build");
     const uint64_t stub = (((m->text_end + 15) & ~15ULL) + 128) & ~15ULL;   /* past the frame-step stub */
-    const uint64_t a = (uint64_t)(uintptr_t)&oot_size_probe_obj, aw = (uint64_t)(uintptr_t)&oot_size_probe_w;
+    const uint64_t a = (uint64_t)(uintptr_t)&oot_size_probe_obj;
+    const int force = getenv("TOTK_SIZE_FORCE") != NULL;   /* also write 1920x1080 into the object (an experiment) */
+    const uint32_t nop = 0xd503201fu;                       /* nop */
     const uint32_t code[] = {
         0xd2800010u | (uint32_t)((a & 0xffff) << 5),            /* movz x16, &object */
         0xf2a00010u | (uint32_t)(((a >> 16) & 0xffff) << 5),
         0xf2c00010u | (uint32_t)(((a >> 32) & 0xffff) << 5),
         0xf2e00010u | (uint32_t)(((a >> 48) & 0xffff) << 5),
-        0xf9000213u,                                            /* str x19, [x16] */
-        0xd2800011u | (uint32_t)((aw & 0xffff) << 5),           /* movz x17, &w */
-        0xf2a00011u | (uint32_t)(((aw >> 16) & 0xffff) << 5),
-        0xf2c00011u | (uint32_t)(((aw >> 32) & 0xffff) << 5),
-        0xf2e00011u | (uint32_t)(((aw >> 48) & 0xffff) << 5),
-        0x29569263u,                                            /* ldp w3, w4, [x19, #0xb4]   (the original) */
-        0x29011203u | (uint32_t)(0),                            /* stp w3, w4, [x16, #8] */
-        0x14000000u | (((uint32_t)(((int64_t)BACK - (int64_t)(stub + 44)) >> 2)) & 0x3ffffffu),   /* back */
+        0xf9000213u,                                            /* str x19, [x16]          record the object */
+        force ? 0x5280f011u : nop,                              /* movz w17, #0x780 = 1920 */
+        force ? 0xb900b671u : nop,                              /* str w17, [x19, #0xb4]   the size the game will use */
+        force ? 0x52808711u : nop,                              /* movz w17, #0x438 = 1080 */
+        force ? 0xb900ba71u : nop,                              /* str w17, [x19, #0xb8] */
+        0x29569263u,                                            /* ldp w3, w4, [x19, #0xb4]   (the original, reading our values) */
+        0x29011203u,                                            /* stp w3, w4, [x16, #8]   record what the ldp saw */
+        0x14000000u,                                            /* b back (offset filled below) */
     };
+    const uint32_t words = (uint32_t)(sizeof code / sizeof code[0]);
+    uint32_t branch = 0x14000000u | (((uint32_t)(((int64_t)BACK - (int64_t)(stub + 4 * (words - 1))) >> 2)) & 0x3ffffffu);
+    memcpy((void *)(code + words - 1), &branch, 4);
     if (stub + sizeof code > ((m->text_end + 0xfff) & ~0xfffULL)) runtime_fail("Ocarina of Time output size: no room after the code");
     for (size_t i = 0; i < sizeof code; i++) if (m->base[stub + i]) runtime_fail("Ocarina of Time output size: padding not empty");
     memcpy(m->base + stub, code, sizeof code);
