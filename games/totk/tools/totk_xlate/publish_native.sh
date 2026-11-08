@@ -32,7 +32,8 @@ if [[ -z $SPIRV_CROSS_SRC ]]; then
 fi
 [[ $(git -C "$SRC" rev-parse HEAD) == $COMMIT ]] || { echo "$SRC is not SPIRV-Cross $COMMIT"; exit 1; }
 SOURCES=(${(f)"$(python3 -c "import ast,re,sys; t=open(sys.argv[1]).read(); print(chr(10).join(s for s in ast.literal_eval(re.search(r'^SPIRV_CROSS_SOURCES = (\(.*?\))$', t, re.M|re.S).group(1)) if s != 'main.cpp'))" "$REPO/build_app.py")"})
-FLAGS=(${(f)"$(python3 -c "import ast,re,sys; t=open(sys.argv[1]).read(); print(chr(10).join(ast.literal_eval(re.search(r'^SPIRV_CROSS_FLAGS = (\(.*?\))$', t, re.M).group(1))))" "$REPO/build_app.py")"})
+# SPIRV_CROSS_FLAGS is a tuple that refers to MACOS_MIN (build_app.py 9d12d2ac made it multi-line), so it is evaluated rather than literal_eval'd
+FLAGS=(${(f)"$(python3 -c "import ast,sys; m=ast.parse(open(sys.argv[1]).read()); a={n.targets[0].id: n.value for n in m.body if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)}; ns={'MACOS_MIN': ast.literal_eval(a['MACOS_MIN'])}; print(chr(10).join(eval(compile(ast.Expression(a['SPIRV_CROSS_FLAGS']),'<f>','eval'),{},ns)))" "$REPO/build_app.py")"})
 FLAGS+=(-mmacosx-version-min=12.0)   # as the NativeAOT link of the service (otherwise every object warns and may need a newer macOS)
 mkdir -p "$WORK/spvc"
 for f in "${SOURCES[@]}"; do xcrun clang++ "${FLAGS[@]}" -c "$SRC/$f" -o "$WORK/spvc/${f%.cpp}.o" & done
