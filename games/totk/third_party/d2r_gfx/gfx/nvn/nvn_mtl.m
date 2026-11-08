@@ -828,6 +828,8 @@ static struct { uintptr_t lo, hi; } *g_addr; static int g_naddr, g_addr_cap;   /
 static uint64_t g_up_temp_n, g_up_temp_bytes, g_up_temp_refused;
 static int addr_first(uintptr_t lo) { int a = 0, b = g_naddr; while (a < b) { int m = (a + b) / 2; if (g_addr[m].hi <= lo) a = m + 1; else b = m; } return a; }   // the first range that ends after lo
 static int addr_meets(uintptr_t lo, uintptr_t hi) { int i = addr_first(lo); return i < g_naddr && g_addr[i].lo < hi; }
+static unsigned pool_resident_mb(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_POOL_RESIDENT_MB"); v = e && *e ? atoi(e) : 64; if (v < 1) v = 1; if (v != 64) MLOG("upload temp buffers: a pool under %d MB borrowed past the limit becomes resident (TOTK_POOL_RESIDENT_MB)", v); } return (unsigned)v; }
+static int pool_borrow_n(void) { static int v = -2; if (v < 0) { const char *e = getenv("TOTK_POOL_BORROW_N"); v = e && *e ? atoi(e) : 8; if (v >= 0) { if (v != 8) MLOG("upload temp buffers: a pool is borrowed %d times before it becomes resident (TOTK_POOL_BORROW_N)", v); } else v = 8; } return v; }
 static int pool_addr_only(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_POOL_ADDR_ONLY"); v = !(e && !strcmp(e, "0")); MLOG("raw pool table: %s", v ? "only pools an address was given out in" : "every pool (TOTK_POOL_ADDR_ONLY=0)"); } return v; }
 void mtl_pool_addressed(const void *mem, uint64_t size) {
     uintptr_t lo = (uintptr_t)mem, hi = lo + size;
@@ -1539,23 +1541,34 @@ static int mesh_inpass_on(void) { static int v = -1; if (v < 0) { const char *e 
 #endif
     if (v) MLOG("[mesh] task and mesh draws stay in the open pass; the replay thread encodes the passes (TOTK_MESH_INPASS=0: a pass of its own for each)"); } return v; }
 #include "nvn_render_stream.h"
+/* DM_NVN_PASSGPU: the per-pass timestamps a render / compute encoder writes (pg_ts_* and their wrappers are defined
+   with the counter heap further down, after the argument encoder). A no-op unless a pass was reserved. */
+static inline void pg_r_start(id e);
+static inline void pg_r_end(id e);
+static inline void pg_c_end(id e);
+/* One reserved pass: what it is and where its two timestamps go (the record of DM_NVN_PASSGPU, defined here because a
+   chunk's commit hands its passes to a feedback handler above the counter heap). */
+typedef struct { uint64_t frame, pass; int idx, kind, w, h, draws, slot; uint32_t cfmt0, dfmt; char load[12]; uint8_t ended; } pg_pass;
+static void pg_chunk(int *n, pg_pass **ps, id<MTL4CounterHeap> *heap, uint32_t *used);
+static void pg_say(id<MTL4CounterHeap> heap, uint32_t used, pg_pass *ps, int n);
 static inline id<MTL4RenderCommandEncoder> enc_r_open(MTL4RenderPassDescriptor *d, int start) {
-    if (!g_mesh_active && !mesh_inpass_on() && rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, start, (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
+    if (!g_mesh_active && !mesh_inpass_on() && rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, start, (uint64_t)bar_vis()); es_begin(e); pg_r_start(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
     rs_sync();   // a pass encoded by A itself (stream off, or a diagnostic frame): B must have finished the previous pass on this command buffer
     pt_mark(g_cb, 'R', d); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; es_begin(e);
     { int m = start;
       if (m == 2) { [e barrierAfterQueueStages:MTLStageBlit | MTLStageDispatch beforeStages:MTLStageVertex | MTLStageFragment visibilityOptions:bar_vis()];
                     [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:bar_vis()]; }
       else if (m) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
-    [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; return e; }
+    [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; pg_r_start(e); return e; }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { blit_close(); return enc_r_open(d, bar_start_mode()); }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) {   // the draw passes (rp_begin_ex); see barrier_game
     int skip = g_last_end_relaxed && !g_blit && !g_game_barrier && barrier_game();
     g_game_barrier = 0; blit_close(); if (skip) g_bar_skip++; else g_bar_full++;
     return enc_r_open(d, skip ? 0 : bar_start_mode());
 }
-static inline void enc_r_end(id e) { g_last_end_relaxed = 0; if (rs_using(e)) rs_pass_end(e, bar_end_mode(), (uint64_t)MTL4VisibilityOptionDevice); else m4_end_render_m(e, bar_end_mode()); }
+static inline void enc_r_end(id e) { pg_r_end(e); g_last_end_relaxed = 0; if (rs_using(e)) rs_pass_end(e, bar_end_mode(), (uint64_t)MTL4VisibilityOptionDevice); else m4_end_render_m(e, bar_end_mode()); }
 static inline void enc_r_end_pass(id e) {
+    pg_r_end(e);   // DM_NVN_PASSGPU: the draw passes end here, not through enc_r_end (barrier_game)
     if (!barrier_game()) { enc_r_end(e); return; }
     if (rs_using(e)) rs_pass_end(e, 3, (uint64_t)MTL4VisibilityOptionDevice); else m4_end_render_m(e, 3);
     g_last_end_relaxed = 1;
@@ -1612,7 +1625,7 @@ static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimiti
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
 static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; [e setArgumentTable:g_ct]; return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
-static inline void enc_c_end(id e) { m4_end(e); }
+static inline void enc_c_end(id e) { pg_c_end(e); m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
 static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; [g_ct setAddress:gpu atIndex:i]; }
 static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
@@ -2478,6 +2491,9 @@ static void mtl_sub_split(void) {
     fc3 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t gpu_f = atomic_load(&g_cur_frame), fence_next = g_fence + 1; gpu_tag_begin(gpu_f);
     TotkCommitOptions *o = [TotkCommitOptions new];
+    { int pgn; pg_pass *pgps; id<MTL4CounterHeap> pgheap; uint32_t pgused;
+      pg_chunk(&pgn, &pgps, &pgheap, &pgused);   // DM_NVN_PASSGPU: this chunk's passes, resolved in its own feedback
+      if (pgn) [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; pg_say(pgheap, pgused, pgps, pgn); }]; }
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         gpu_tag_done(gpu_f, f.GPUStartTime, f.GPUEndTime);
         if (f.error) { atomic_store(&g_last_commit_error, 1); static int n; if (n++ < 8) MLOG("【红】分段命令缓冲错误 fence=%llu：%s", (unsigned long long)fence_next, f.error.description.UTF8String); }
@@ -4050,8 +4066,12 @@ static id<MTLBuffer> up_temp_src(uint64_t addr, uint64_t len, uint64_t *off) {
     pthread_mutex_lock(&g_mu);
     pidx_ent *p = pool_query((uintptr_t)addr, len);
     int in = p && !p->res && !addr_meets(p->lo, p->hi);
-    /* A small pool the game keeps rewriting: a buffer and a residency update per re-upload cost more than keeping it wired */
-    if (in && p->hi - p->lo < (64u << 20) && ++p->borrows > 8) { pool_res(p); in = 0; }
+    /* A small pool the game keeps rewriting: a buffer and a residency update per re-upload cost more than keeping it wired.
+       TOTK_POOL_RESIDENT_MB / TOTK_POOL_BORROW_N tune the two numbers (64 MB, 8 borrows): a world that streams textures
+       through pools of its own borrows them hundreds of times, and every borrow reads the bytes again — Kokiri Forest read
+       1.36 GB through them in one run, in bursts that cost the frame 300 to 1100 ms. */
+    unsigned rmb = pool_resident_mb(); int rn = pool_borrow_n();
+    if (in && p->hi - p->lo < ((uint64_t)rmb << 20) && ++p->borrows > rn) { pool_res(p); in = 0; }
     pthread_mutex_unlock(&g_mu);
     if (!in) return nil;
     uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)addr & ~(pg - 1), b = ((uintptr_t)addr + len + pg - 1) & ~(pg - 1);
@@ -4811,36 +4831,66 @@ static void pass_dims(MTL4RenderPassDescriptor *pd, NSUInteger nc, NSUInteger *w
 // Each line: frame idx kind gpu_ms inc_ms w h fmt0 dfmt load draws t0_ns t1_ns (kind: R render / C compute; load: L load / C clear for each color attachment + depth)
 // On TBDR passes overlap in the pipeline (the later pass's vertex stage is earlier than the end of the earlier pass's fragment stage): gpu_ms = this pass's start-to-end span (including queueing) and cannot be summed;
 // attribution uses the timeline increment inc_ms = t1 − max(t0, latest t1 of the passes completed so far); the sum of the increments of all passes = total time the GPU is busy (command buffers complete in submission order)
-typedef struct { uint64_t frame, pass; int idx, kind, w, h, draws, slot; uint32_t cfmt0, dfmt; char load[12]; } pg_pass;   // pass：全局通道号（同 DM_NVN_PASSDUMP 各行的通道号，供两份记录对接） | pass: global pass number (same as the pass number in the DM_NVN_PASSDUMP lines, for joining the two records)
+/* pg_pass: see the forward declaration above (a chunk's commit uses it). */
 #define PG_SLOTS 4096   // 计数采样缓冲上限 32768 字节 = 4096 个时间戳（本机报错实测） | Counter sample buffer limit 32768 bytes = 4096 timestamps (measured from the error on this machine)
 #define PG_RING 8
 static int g_pg = -1; static FILE *g_pg_f;
-static id<MTLCounterSampleBuffer> g_pg_buf[PG_RING]; static int g_pg_b; static uint32_t g_pg_used;
-static pg_pass *g_pg_pass; static int g_pg_np, g_pg_cap, g_pg_open = -1;
+/* On macOS 27.2 / Apple M5 the timestamps this collects come back coarse: a frame's passes add up to about 0.5 ms while
+   the command buffers' GPU span is 28 ms, which is what a minimal program sees when Metal groups the samples at encoder
+   boundaries (the same program with one dispatch per encoder reports real spans). The table is therefore good for ranking
+   passes (draws, size, attachment loads) and not for absolute GPU milliseconds; DM_NVN_PASSGPU's original absolute use
+   needs a machine or OS whose stage-boundary counters are precise.
+   The timestamps go into an MTL4CounterHeap: the encoders this replay creates are Metal 4 ones (g_cb is an
+   MTL4CommandBuffer), whose pass descriptors carry no sample-buffer attachments -- the MTL3 MTLCounterSampleBuffer path that
+   used to be here attached nothing and then resolved a heap the GPU never wrote, which faulted inside AGXMetalG17G about
+   frame 630 (SIGSEGV, macOS 27.2; the file stayed empty). Metal 4 writes them from the encoder itself
+   (writeTimestampWithGranularity:...). */
+static id<MTL4CounterHeap> g_pg_heap[PG_RING]; static int g_pg_b; static uint32_t g_pg_used;
+static pg_pass *g_pg_pass; static int g_pg_np, g_pg_cap, g_pg_open = -1, g_pg_open_c = -1;
 static uint64_t g_pg_frame = ~0ull; static int g_pg_idx;
 static pthread_mutex_t g_pg_mu = PTHREAD_MUTEX_INITIALIZER;
 static inline void args_dirty_all(void);
 typedef struct { double sum, last; uint64_t n; pg_pass meta; } pg_stat;
 static pg_stat g_pg_st[256]; static uint64_t g_pg_rep_frame;
+static _Atomic uint64_t g_pg_ok, g_pg_zero;
+static int g_pg_resolved;
+static _Atomic uint64_t g_pg_wr_ok, g_pg_wr_no;   // timestamps written / encoders that take none   // 已交给 feedback 的通道数 | passes already handed to a feedback handler   // passes with both timestamps / passes whose timestamps read 0 (an encoder that takes none)
+/* Bisection of the macOS 27.2 crash (DM_NVN_PASSGPU faulting in AGXMetalG17G): DM_NVN_PASSGPU_NO_WRITE=1 reserves the
+   passes and writes no timestamp, DM_NVN_PASSGPU_NO_RESOLVE=1 never resolves the heap. */
+static inline int pg_env_flag(const char *name) { static int v_write = -1, v_res = -1; if (!strcmp(name, "DM_NVN_PASSGPU_NO_WRITE")) { if (v_write < 0) v_write = getenv(name) != NULL; return v_write; } if (v_res < 0) v_res = getenv(name) != NULL; return v_res; }
+static inline void pg_ts_r(id e, NSUInteger slot, MTLRenderStages stage) {
+    if (slot >= PG_SLOTS || !e || pg_env_flag("DM_NVN_PASSGPU_NO_WRITE")) return;
+    if ([e respondsToSelector:@selector(writeTimestampWithGranularity:afterStage:intoHeap:atIndex:)]) {
+        [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise afterStage:stage intoHeap:g_pg_heap[g_pg_b] atIndex:slot];
+        g_pg_wr_ok++;
+    } else g_pg_wr_no++;
+}
+static inline void pg_ts_c(id e, NSUInteger slot) {
+    if (slot >= PG_SLOTS || !e || pg_env_flag("DM_NVN_PASSGPU_NO_WRITE")) return;
+    if ([e respondsToSelector:@selector(writeTimestampWithGranularity:intoHeap:atIndex:)]) {
+        [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityPrecise intoHeap:g_pg_heap[g_pg_b] atIndex:slot];
+        g_pg_wr_ok++;
+    } else g_pg_wr_no++;
+}
 static int pg_on(void) {
     if (g_pg >= 0) return g_pg;
     const char *e = getenv("DM_NVN_PASSGPU"); g_pg = 0;
     if (!e) return 0;
-    if (![g_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { MLOG("【红】DM_NVN_PASSGPU：本设备不支持阶段边界计数采样"); return 0; }
-    id<MTLCounterSet> ts = nil; for (id<MTLCounterSet> c in g_dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
-    if (!ts) { MLOG("【红】DM_NVN_PASSGPU：没有时间戳计数器集"); return 0; }
-    MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
-    d.counterSet = ts; d.storageMode = MTLStorageModeShared; d.sampleCount = PG_SLOTS;
-    for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_buf[i] = [g_dev newCounterSampleBufferWithDescriptor:d error:&er]; if (!g_pg_buf[i]) { MLOG("【红】计数采样缓冲建不出：%s", er.localizedDescription.UTF8String); return 0; } }
+    MTL4CounterHeapDescriptor *d = [MTL4CounterHeapDescriptor new];
+    d.type = MTL4CounterHeapTypeTimestamp; d.count = PG_SLOTS;
+    for (int i = 0; i < PG_RING; i++) { NSError *er = nil; g_pg_heap[i] = [g_dev newCounterHeapWithDescriptor:d error:&er];
+        if (!g_pg_heap[i]) { MLOG("【红】DM_NVN_PASSGPU：计数堆建不出：%s", er ? er.localizedDescription.UTF8String : "no error"); return 0; } }
     if (!(g_pg_f = fopen(e, "w"))) { MLOG("【红】DM_NVN_PASSGPU 打不开 %s", e); return 0; }
-    fprintf(g_pg_f, "frame\tidx\tkind\tgpu_ms\tinc_ms\tw\th\tfmt0\tdfmt\tload\tdraws\tt0_ns\tt1_ns\tpass\n");
-    MLOG("[passgpu] 逐通道 GPU 计时 → %s", e);
+    fprintf(g_pg_f, "frame\tidx\tkind\tgpu_ms\tinc_ms\tw\th\tfmt0\tdfmt\tload\tdraws\tt0_ns\tt1_ns\tpass\n"); fflush(g_pg_f);
+    MLOG("[passgpu] 逐通道 GPU 计时（MTL4CounterHeap + 编码器写时间戳）→ %s", e);
     return g_pg = 1;
 }
-static void pg_sub_begin(uint64_t fence) {   // 本次提交用环里第 fence % PG_RING 块；先等 PG_RING 次之前用它的提交完成 | This submission uses block fence % PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
+static void pg_sub_begin(uint64_t fence) {   // 本次提交用环里第 fence % PG_RING 块；先等 PG_RING 次之前用它的提交完成 | This submission uses block fence PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
     if (!pg_on()) return;
     if (fence > PG_RING) mtl_wait(fence - PG_RING, UINT64_MAX);
-    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
+    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_resolved = 0; g_pg_open = -1; g_pg_open_c = -1;
+    /* The heap of this ring slot is invalidated in pg_say after its data was read: invalidating here would wipe the entries
+       of a submission whose feedback handler has not run yet (the wait covers the GPU's completion, not the handler). */
 }
 static pg_pass *pg_new(int kind, int nslot) {
     if (!pg_on() || g_pg_used + nslot > PG_SLOTS) return NULL;
@@ -4852,13 +4902,10 @@ static pg_pass *pg_new(int kind, int nslot) {
     return p;
 }
 static void pg_render(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
-    (void)pd; (void)nc;
-    return;
-#if 0
-    pg_pass *p = pg_new(0, 4); if (!p) return;
-    MTLRenderPassSampleBufferAttachmentDescriptor *a = pd.sampleBufferAttachments[0];
-    a.sampleBuffer = g_pg_buf[g_pg_b];
-    a.startOfVertexSampleIndex = p->slot; a.endOfVertexSampleIndex = p->slot + 1; a.startOfFragmentSampleIndex = p->slot + 2; a.endOfFragmentSampleIndex = p->slot + 3;
+    /* Reserves the two timestamps of a render pass (start before the first draw, end before the encoder ends) and records
+       what the pass is. The writes happen in pg_r_start / pg_r_end, on the Metal 4 encoder itself. */
+    pg_pass *p = pg_new(0, 2); if (!p) return;
+    p->draws = -(int)g_stat_draw;
     id<MTLTexture> t0 = nil; int k = 0;
     for (NSUInteger i = 0; i < nc && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
         if (!t0) t0 = t; if (k < 10) p->load[k++] = pd.colorAttachments[i].loadAction == MTLLoadActionClear ? 'C' : 'L'; }
@@ -4868,35 +4915,45 @@ static void pg_render(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
     NSUInteger pw, ph; pass_dims(pd, nc, &pw, &ph);
     p->w = (int)pw; p->h = (int)ph; p->cfmt0 = t0 && t0 != dt ? (uint32_t)t0.pixelFormat : 0;
     g_pg_open = g_pg_np - 1;
-#endif
+}
+/* The encoder a render pass was opened on: start of the pass (before its first draw) and end (after its last, before the
+   encoder ends). Both no-ops unless pg_render reserved a pass, so any other render encoder is left alone. */
+static inline void pg_r_start(id e) { if (g_pg_open >= 0 && g_pg_open < g_pg_np) pg_ts_r(e, g_pg_pass[g_pg_open].slot, MTLRenderStageVertex); }
+static inline void pg_r_end(id e) {
+    if (g_pg_open < 0 || g_pg_open >= g_pg_np || g_pg_pass[g_pg_open].ended) return;
+    g_pg_pass[g_pg_open].ended = 1;
+    pg_ts_r(e, g_pg_pass[g_pg_open].slot + 1, MTLRenderStageFragment);
 }
 static id<MTLComputeCommandEncoder> pg_compute(void) {
     pg_pass *p = pg_new(1, 2);
     ser_gate();
-    if (!p) { args_dirty_all(); return enc_c_begin(NULL); }
-    MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
-    cd.sampleBufferAttachments[0].sampleBuffer = g_pg_buf[g_pg_b];
-    cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = p->slot; cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = p->slot + 1;
-    p->draws = 0;
     args_dirty_all();
-    return enc_c_begin(cd);
+    id<MTLComputeCommandEncoder> e = enc_c_begin(NULL);
+    if (!p) return e;
+    p->draws = 0;
+    g_pg_open_c = g_pg_np - 1;
+    pg_ts_c(e, p->slot);
+    return e;
 }
+static inline void pg_c_end(id e) { if (g_pg_open_c >= 0 && g_pg_open_c < g_pg_np) { pg_ts_c(e, g_pg_pass[g_pg_open_c].slot + 1); g_pg_open_c = -1; } }
 static void pg_end_render(void) { if (g_pg_open >= 0) { g_pg_pass[g_pg_open].draws += (int)g_stat_draw; g_pg_open = -1; } }
-static void pg_commit(id<MTLCommandBuffer> cb) {   // 把本次提交的通道表交给完成回调解析 | Hand this submission's pass table to the completion callback for resolving
-    if (!g_pg || !g_pg_np) return;
-    int n = g_pg_np; pg_pass *ps = malloc(n * sizeof *ps); memcpy(ps, g_pg_pass, n * sizeof *ps);
-    id<MTLCounterSampleBuffer> buf = g_pg_buf[g_pg_b]; uint32_t used = g_pg_used;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        (void)c;
-        NSData *d = [buf resolveCounterRange:NSMakeRange(0, used)];
-        const MTLCounterResultTimestamp *ts = d.bytes;
+/* 解析一段通道表：MTL4 的提交完成时没有 addCompletedHandler，只有 commit 的 feedback handler（GPU 工作已完成），
+   所以解析在这里同步做完；调用方把 heap / used / 通道表按 encode 时的值捕获后在 feedback 里调用。
+   Resolving one chunk: an MTL4 commit has no addCompletedHandler, only the commit's feedback handler (the GPU work is done),
+   so the resolve happens right there; the caller captures heap / used / the pass table as they were at encode time. */
+static void pg_say(id<MTL4CounterHeap> heap, uint32_t used, pg_pass *ps, int n) {
+    {
+        NSData *d = pg_env_flag("DM_NVN_PASSGPU_NO_RESOLVE") ? nil : [heap resolveCounterRange:NSMakeRange(0, used)];
+        const MTL4TimestampHeapEntry *ts = d.bytes;
         pthread_mutex_lock(&g_pg_mu);
         for (int i = 0; d && i < n; i++) {
             pg_pass *p = &ps[i]; uint64_t a, b;
-            #define OK(x) ((x) != MTLCounterErrorValue && (x) != 0)
-            if (p->kind == 0) { a = OK(ts[p->slot].timestamp) ? ts[p->slot].timestamp : ts[p->slot + 2].timestamp; b = OK(ts[p->slot + 3].timestamp) ? ts[p->slot + 3].timestamp : ts[p->slot + 1].timestamp; }
-            else { a = ts[p->slot].timestamp; b = ts[p->slot + 1].timestamp; }
-            if (!OK(a) || !OK(b) || b < a) continue;
+            /* Two timestamps per pass now: the start written before its first work and the end before its encoder ends.
+               A pass whose start or end was not written (an encoder that does not take timestamps) resolves to 0 and is
+               skipped, so a missing hook shortens the table instead of inventing a duration. */
+            #define OK(x) ((x) != 0)
+            a = ts[p->slot].timestamp; b = ts[p->slot + 1].timestamp;
+            if (!OK(a) || !OK(b) || b < a) { g_pg_zero++; continue; }
             #undef OK
             static uint64_t prev_end;   // 此前已完成通道的最晚结束时刻（完成回调按提交序串行） | Latest end time of the passes completed so far (completion callbacks are serialized in submission order)
             double ms = (b - a) / 1e6;   // 时间戳与 CPU 同为 ns（本机 sampleTimestamps 实测 1:1） | Timestamps are in ns, same as the CPU (measured 1:1 via sampleTimestamps on this machine)
@@ -4904,6 +4961,7 @@ static void pg_commit(id<MTLCommandBuffer> cb) {   // 把本次提交的通道�
             if (b > prev_end) prev_end = b;
             fprintf(g_pg_f, "%llu\t%d\t%c\t%.4f\t%.4f\t%d\t%d\t%u\t%u\t%s\t%d\t%llu\t%llu\t%llu\n", (unsigned long long)p->frame, p->idx, p->kind ? 'C' : 'R', ms, inc,
                     p->w, p->h, p->cfmt0, p->dfmt, p->load, p->draws, (unsigned long long)a, (unsigned long long)b, (unsigned long long)p->pass);
+            g_pg_ok++;
             if (p->idx < 256 && p->frame > 300) { pg_stat *st = &g_pg_st[p->idx]; st->sum += inc; st->n++; st->last = inc; st->meta = *p; }
             if (p->frame >= g_pg_rep_frame + 300 && p->frame > 300) {   // 每 300 帧报一次前五（第 300 帧起累计） | Report the top five every 300 frames (accumulated from frame 300)
                 g_pg_rep_frame = p->frame; double tot = 0; int top[5] = {-1, -1, -1, -1, -1};
@@ -4916,9 +4974,23 @@ static void pg_commit(id<MTLCommandBuffer> cb) {   // 把本次提交的通道�
                 fflush(g_pg_f);
             }
         }
+        static uint64_t said; if (g_pg_ok + g_pg_zero > said + 2000) { said = g_pg_ok + g_pg_zero;
+            MLOG("[passgpu] %llu 个通道有时间戳，%llu 个读到 0；写入 %llu 次，编码器不收 %llu 次", (unsigned long long)g_pg_ok, (unsigned long long)g_pg_zero,
+                 (unsigned long long)g_pg_wr_ok, (unsigned long long)g_pg_wr_no); }
         pthread_mutex_unlock(&g_pg_mu);
         free(ps);
-    }];
+        [heap invalidateCounterRange:NSMakeRange(0, used > PG_SLOTS ? PG_SLOTS : used)];
+    }
+}
+/* 一次提交（可能分几段 chunk）里自上次解析以来新增的通道：交给这段的 feedback handler | The passes a submission added since
+   the last resolve: handed to this chunk's feedback handler */
+static void pg_chunk(int *n_out, pg_pass **ps_out, id<MTL4CounterHeap> *heap_out, uint32_t *used_out) {
+    *n_out = 0; *ps_out = NULL; *heap_out = nil; *used_out = 0;
+    if (!g_pg || g_pg_np <= g_pg_resolved) return;
+    int n = g_pg_np - g_pg_resolved;
+    pg_pass *ps = malloc(n * sizeof *ps); memcpy(ps, g_pg_pass + g_pg_resolved, n * sizeof *ps);
+    *n_out = n; *ps_out = ps; *heap_out = g_pg_heap[g_pg_b]; *used_out = g_pg_used;
+    g_pg_resolved = g_pg_np;
 }
 void ts_after(void);
 // ---------- 写回前瞻：通道结束时按同一次提交的后续命令判各附件写回是否多余 ----------
@@ -5273,7 +5345,7 @@ static void nt_watch_after_pass(void) {
         pthread_mutex_lock(&mu); fprintf(f, "%ld\t%llu\t%llu\t%p\t%u\t%.4f\t%s\n", fr, (unsigned long long)pass, (unsigned long long)wser, wobj, nf, fin ? sum / fin : 0, targets.UTF8String); fflush(f); pthread_mutex_unlock(&mu); }];
 }
 void pg_sub_begin_ext(uint64_t fence) { pg_sub_begin(fence); }
-void pg_commit_ext(id<MTLCommandBuffer> cb) { pg_commit(cb); }
+void pg_commit_ext(void) { }   // MTL4: a chunk's passes go out with that chunk's feedback handler (pg_chunk), see chunk_commit
 /* Format views share storage, but sRGB writes still require a distinct Metal view. The absence of a
    PixelFormatView usage requirement for linear/sRGB pairs does not mean their formats are interchangeable. */
 static MTLPixelFormat attachment_format(const tex_t *t, const view_t *v, int has_v, MTLPixelFormat base) {
@@ -16032,8 +16104,8 @@ static void bright_lut(NvShader *cs) {
    encoder already kept open across copies, closed wherever another encoder starts or the command buffer is committed; a
    dispatch now uses it too. Ordering stays as before: between two commands of the encoder a barrier orders blit and dispatch
    stages with device visibility (blit()), as the end / start barriers of two encoders did. The argument table is set again
-   for every dispatch (copies use none, other code may set its own). Off with DM_NVN_PASSGPU (one timing slot per encoder)
-   and with TOTK_DISPATCH_REUSE=0. */
+   for every dispatch (copies use none, other code may set its own). Off with TOTK_DISPATCH_REUSE=0, which is also where
+   DM_NVN_PASSGPU used to send it (that path aborts, see the note at its use). */
 static int disp_reuse_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISPATCH_REUSE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_DISPATCH_REUSE=0：每次派发单开计算编码器（旧行为）"); } return v; }
 static uint64_t g_disp_n, g_disp_shared;
 static int g_disp_probe_nobar;   // probe-gpu-dispatch-chain negative control: no barrier between the commands of the shared encoder
@@ -16148,7 +16220,11 @@ static void dispatch(const p_dispatch *dp) {
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
     rp_end();
-    int reuse = disp_reuse_on() && !pg_on();
+    /* DM_NVN_PASSGPU no longer forces the per-dispatch encoder (2026-11-08): that legacy path leaves a command encoder open
+       and the next texture upgrade aborts in blit_kind ("Command buffer already has an open command encoder", reproduced
+       with TOTK_DISPATCH_REUSE=0 alone), and it is not needed for per-pass timings. With reuse on, a run of dispatches is
+       one encoder and is timed as one pass; compute passes are 6 % of the GPU intervals. */
+    int reuse = disp_reuse_on();
     /* TOTK_DISP_PREARGS (default on): when this dispatch opens the compute encoder after a streamed render pass, disp_enc
        first waits for the encode stage to finish that pass (rs_sync, ~5% of the replay in the world). The dispatch's
        arguments only go to g_ct, the compute argument table that only this thread writes and that each dispatch snapshots,
