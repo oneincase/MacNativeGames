@@ -10360,13 +10360,16 @@ static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy
 /* Global memory reached through an address the shader loaded from memory (NVN2; reflection kinds GMEM / GMEML; the translator's
    GlobalToStorage.TryGenerateRawStorageOp in patch 0006, after seedds/nxnative, MIT). The shader binary-searches this table for
    the pool holding the address and goes through a pointer moved by that pool's delta (its Metal GPU address minus its guest
-   address); an address in no pool is dropped. Layout: 4096 entries of 32 bytes {start, end (exclusive), delta, 0}, sorted by
+   address); an address in no pool is dropped. Layout: 8192 entries of 32 bytes {start, end (exclusive), delta, 0}, sorted by
    start, entry 0 empty (0, 0), unused entries starting at ~0; pools as disjoint ranges (a pool overlapping an earlier one keeps
    only its part past that one's end: every pool wraps the guest's own pages, so any pool holding an address gives its GPU
    address). Every pool goes into the residency set, since the shader may reach any of them. Rebuilt when the pools change
-   (g_pool_gen); the replaced table is released once the GPU is done with it. */
+   (g_pool_gen); the replaced table is released once the GPU is done with it. 8192 as nxnative's table (patches/0013): the
+   forest reaches about 3,600 ranges in two minutes and went past the 4,095 of the old table in the longer sessions, where
+   the pools that no longer fit were dropped and their addresses read 0. GMEM_MAP_ENTRIES must match the translator's
+   GmemMapLog2, which generates the search. */
 static uint64_t g_geo_bind[5];   // GPU addresses of the geometry helper buffers bound while a geometry draw encodes (NVN_RB_GEO reg)
-#define GMEM_MAP_ENTRIES 4096
+#define GMEM_MAP_ENTRIES 8192
 #define GMEM_MAP_ENTRY 32
 static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen;
 static uint64_t gmem_map_gpu(void) {

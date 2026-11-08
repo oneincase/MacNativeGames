@@ -1,0 +1,24 @@
+The raw pool table holds 1 << 13 entries instead of 1 << 12, as seedds/nxnative's host table does: Ocarina of Time reaches
+about 3,600 ranges in a couple of minutes of play and went past the 4,095 the old table held in the longer sessions, where
+the host dropped the pools that no longer fit and logged them (their addresses then read 0 through the raw path). The host
+fills the table once per pool generation, so twice the memory (256 KiB) and one more step for a search that only runs when
+the last-entry word misses cost nothing measurable. The host's GMEM_MAP_ENTRIES must change with it (nvn_mtl.m gmem_map_gpu),
+and the cache name with the translation.
+
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs	2026-11-09 04:17:58
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs	2026-11-09 05:01:47
+@@ -883,9 +883,12 @@
+ 
+         // nxnative: the memory pool table the host binds for raw global memory (dmsh_abi.h DMSH_GMEM_MAP_*): a storage buffer reserved under this sentinel constant buffer
+         // slot, which no constant buffer of the game has (dmsh_build.py turns it into DMSH_KIND_GMEM_MAP). 1 << GmemMapLog2 entries of GmemMapEntryWords words each,
+-        // {start lo, start hi, end lo, end hi, delta lo, delta hi, 0, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0
++        // {start lo, start hi, end lo, end hi, delta lo, delta hi, 0, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0.
++        // 1 << 13, as nxnative's table: Ocarina of Time reaches 3,600 ranges in a couple of minutes of play and went past 4,095 in the
++        // longer sessions (the host logged the pools it dropped), and the host fills the table once per pool generation, so the four
++        // times the memory and one more step for a search that now only runs when the last-entry word misses cost nothing
+         public const int GmemMapCbSlot = 0xff;
+-        private const int GmemMapLog2 = 12;
++        private const int GmemMapLog2 = 13;
+         private const int GmemMapEntryWords = 8;
+ 
+         // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,

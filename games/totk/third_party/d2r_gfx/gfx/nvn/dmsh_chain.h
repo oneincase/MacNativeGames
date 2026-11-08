@@ -1,2 +1,2 @@
 // Separate experimental TOTK cache identity; D2R shader caches are rejected.
-#define DMSH_CHAIN "totk-native-v10-unverified"
+#define DMSH_CHAIN "totk-native-v11-unverified"
