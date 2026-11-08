@@ -17,6 +17,14 @@ gets slower or hotter affects the arms alike:
 usage: ab_translator.py --a build/xlate-ab/new/totk_xlate --b build/xlate-ab/old/totk_xlate \\
            --runs 3 --seconds 30 [--warmup 25] [--skip-warmup|--skip-perf] [--label-prefix ldg128]
 
+To measure one change of the translator (or of the host's pool table it reads) rather than two builds, give both arms the
+same binary and a cache pair that differs only in the variants the change reached:
+
+  scripts/diag/cache_compare.py --a <cache of the new build> --b <cache of the reference build> \\
+      --write-baseline analysis/ab/translator/cache-baseline --chain <chain>
+  ab_translator.py --a build/shader-service/totk_xlate --b build/shader-service/totk_xlate \\
+      --cache-a <cache of the new build> --cache-b analysis/ab/translator/cache-baseline --runs 3 ...
+
 The binary at build/shader-service/totk_xlate when the run starts is put back when it ends (its copy is kept as
 build/shader-service/totk_xlate.ab-orig), so install the build the tree should keep before starting.
 """
@@ -37,6 +45,8 @@ OUT = ROOT / 'analysis/ab/translator'
 
 
 def install(binary: Path, saved: Path):
+    if binary.resolve() == SLOT.resolve():   # an A/B of two caches with one binary: the slot already holds it
+        return
     if not saved.exists():
         shutil.copy2(SLOT, saved)
     shutil.copy2(binary, SLOT)
