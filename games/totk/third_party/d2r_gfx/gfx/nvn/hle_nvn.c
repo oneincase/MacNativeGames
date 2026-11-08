@@ -165,6 +165,15 @@ NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
     dev_t_ *o = (dev_t_ *)d; memset(o, 0, sizeof *o);
     o->magic = MAGIC('D', 'E', 'V', 0); o->flags = ((const dev_builder_t *)b)->flags;
     OLOG("DeviceInitialize %p flags=%#x", (void *)d, o->flags);
+    /* TOTK_SIZE_EARLY=1 (diagnostic, output-size patch): the display object the crop reads sits at heap + 0x4136040 in every
+       run of this build (heap base 0x7030000000; the object's +0xb4/+0xb8 hold 2048/1152). Arm the write watch here, before
+       the game creates its render targets, so the store that put 2048x1152 there is caught with its pc and lr. */
+    if (getenv("TOTK_SIZE_EARLY")) { extern uint64_t runtime_heap_base(void); extern void runtime_watch_set(uintptr_t, size_t);
+        uint64_t hb = runtime_heap_base();
+        if (hb) { LOG("[size-early] heap %#llx, watching the display size at %#llx", (unsigned long long)hb,
+                      (unsigned long long)(hb + 0x4136040 + 0xb4)); runtime_watch_set((uintptr_t)(hb + 0x4136040 + 0xb4), 8);
+            extern void runtime_watch_tick(uint64_t); runtime_watch_tick(0);   /* protect the page now, not at the next frame */ }
+        else LOG("[size-early] heap base not set yet"); }
     return 1;
 }
 NVN(nvnDeviceFinalize, void, NVNdevice *d) { ((dev_t_ *)d)->magic = 0; }
