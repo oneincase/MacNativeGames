@@ -41,6 +41,39 @@ extern char **environ;
 static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *g_variants;
 static NSMutableSet<NSString *> *g_msl_checked;
+/* 每个变体的 Metal 源要读一遍才能确认不是缺失/截断/译坏（variant_lookup）。这份结论原来只在内存里，于是每次启动都把
+   画到的变体源再读一遍：缓存 1,766 个 _b.metal、约 60 MB，读文件落在「第一次遇到该变体」的那些帧上——一次进世界时
+   回放线程 6.6% 的样本在 NSData 读文件里。通过的「名字 尺寸」写进 <缓存>/msl-checked.txt，下次启动不再读；尺寸对不上
+   说明这个文件被重新写过，才再读一遍重判。
+   A variant's Metal source is read once to make sure it is not missing, cut short or un-compilable (variant_lookup). The
+   verdict lived in memory only, so every start read every drawn variant's source again: 1,766 _b.metal files, about 60 MB,
+   in the frames that first meet a variant (6.6 % of the replay thread's samples during a world load). The names and sizes
+   that passed go to <cache>/msl-checked.txt, so the next start reads none of them; a name whose size differs was written
+   again and is read and judged again. */
+static NSMutableDictionary<NSString *, NSNumber *> *g_msl_sizes;
+static NSString *g_msl_checked_path;
+static void msl_checked_init(void) {
+    if (g_msl_checked) return;
+    g_msl_checked = [NSMutableSet set]; g_msl_sizes = [NSMutableDictionary dictionary];
+    g_msl_checked_path = [totk_rt_dir() stringByAppendingString:@"/msl-checked.txt"];
+    NSString *txt = [NSString stringWithContentsOfFile:g_msl_checked_path encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> *f = [line componentsSeparatedByString:@" "];
+        if (f.count != 2 || !f[0].length) continue;
+        unsigned long long size = strtoull(f[1].UTF8String, NULL, 10);
+        NSDictionary *a = [NSFileManager.defaultManager attributesOfItemAtPath:totk_rt_file([f[0] stringByAppendingString:@"_b.metal"]) error:nil];
+        if (a && [a[NSFileSize] unsignedLongLongValue] == size) { [g_msl_checked addObject:f[0]]; g_msl_sizes[f[0]] = @(size); }
+    }
+    if (g_msl_checked.count) LOG("[shader] %lu 个变体的 Metal 源在上次的运行里已校验（%s），不再读文件",
+                                 (unsigned long)g_msl_checked.count, g_msl_checked_path.UTF8String);
+}
+static void msl_checked_note(NSString *name) {   // 校验通过：记住名字与尺寸，下次启动直接信它 | passed: remember the name and size for the next start
+    NSDictionary *a = [NSFileManager.defaultManager attributesOfItemAtPath:totk_rt_file([name stringByAppendingString:@"_b.metal"]) error:nil];
+    unsigned long long size = a ? [a[NSFileSize] unsignedLongLongValue] : 0;
+    [g_msl_checked addObject:name]; g_msl_sizes[name] = @(size);
+    FILE *f = fopen(g_msl_checked_path.UTF8String, "a");
+    if (f) { fprintf(f, "%s %llu\n", name.UTF8String, size); fclose(f); }
+}
 typedef struct { FILE *in, *out; } rt_svc;   // one translator service process
 /* The iPhone / iPad build that links the translator (TOTK_DEVICE_XLATE, build_ipa.py: games/totk/prebuilt/ios-arm64/
    libtotk_xlate.a, the Mac's totk_xlate service as a NativeAOT static library, LibExports.cs): no process can be started
@@ -351,7 +384,7 @@ static NSString *variant_lookup(NSString *shader, NSDictionary *answers) {
         NSDictionary *v = vs[i];
         if (!totk_deps_match(v[@"deps"], answers)) continue;   // totk_shader_contrib.h: the contribution file's pruning picks so too
         NSString *found = v[@"variant"];
-        if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
+        msl_checked_init();
         BOOL checked = [g_msl_checked containsObject:found];
         NSString *msl = checked ? nil :
             [NSString stringWithContentsOfFile:totk_rt_file([found stringByAppendingString:@"_b.metal"])
@@ -363,7 +396,7 @@ static NSString *variant_lookup(NSString *shader, NSDictionary *answers) {
                 seed_mark_broken([found stringByAppendingString:@"_b.metal"]); seed_mark_broken([found stringByAppendingString:@"_b.json"]); }
             return nil;
         }
-        [g_msl_checked addObject:found];
+        if (!checked) msl_checked_note(found);
         return found;
     }
     return nil;
@@ -527,8 +560,8 @@ static void variant_record(NSString *shader, NSDictionary *rq, NSDictionary *ref
     NSString *variant = rq[@"variant"];
     NSMutableArray *vs = variants_of(shader);
     [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
-    if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
-    [g_msl_checked addObject:variant];
+    msl_checked_init();
+    msl_checked_note(variant);   // just translated and checked: remember it for the next start
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
     g_translated++;
     if (!existed) { atomic_fetch_add(&g_new_variants, 1); atomic_store(&g_new_variant_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }   // discovered, translated, in the cache
