@@ -3656,6 +3656,13 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (hidden) strlcat(b, "；接读取画面，不可见", sizeof b);
+              /* 提交阶段的逐帧分解（nvn_mtl.m 的 g_fc_frame_ring）：长帧里提交+出图远大于 GPU + 上传 + 编译时，这几段说明时间去了哪
+                 Per-frame breakdown of the submit phases (g_fc_frame_ring in nvn_mtl.m): when 提交+出图 far exceeds GPU + uploads
+                 + compiles in a long frame, these say where the time went */
+              { uint64_t ph[8]; int have; extern int mtl_fc_frame(uint64_t, uint64_t *); have = mtl_fc_frame(r->f, ph);
+                if (have) { char d[400]; snprintf(d, sizeof d, "；阶段 ms：开始 %.2f / 首段回放 %.2f / 等编码线程 %.2f / 上传冲刷 %.2f / 驻留提交 %.2f / 提交 %.2f / 全部 %llu 段共 %.2f（平均 %.2f）",
+                                                  ph[0] / 1e6, ph[1] / 1e6, ph[2] / 1e6, ph[3] / 1e6, ph[4] / 1e6, ph[5] / 1e6,
+                                                  (unsigned long long)ph[7], ph[6] / 1e6, ph[7] ? ph[6] / 1e6 / (double)ph[7] : 0.0); strlcat(b, d, sizeof b); } }
               if (lf_detail()) { char d[384]; snprintf(d, sizeof d, "；绘制 %u 次、渲染通道 %u 个、新建贴图视图 %u 个；当场编译补丁变体 %u 个共 %.1f ms，读预编的补丁变体 %u 个，后台编补丁变体 %u 个，边框补丁没好先用原管线画 %u 次", r->draws, r->passes, r->views, r->variants, r->variant_ms, r->variants_pre, r->variants_bg, r->plain_draws); strlcat(b, d, sizeof b); }
               dm_longframe_note(b); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }

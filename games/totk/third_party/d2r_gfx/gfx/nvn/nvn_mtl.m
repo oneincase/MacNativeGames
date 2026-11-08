@@ -1082,6 +1082,8 @@ static uint64_t g_usnap_t[3];   // TOTK (2026-10-16): where the snapshot's time 
 // TOTK (2026-10-16): what the GPU waits for at the start of a submission, per phase: [0] mtl_sub_begin, [1] replay up to the
 // first chunk split, [2] rs_sync, [3] up_flush, [4] res_commit, [5] end + commit of the first chunk; logged with the snapshot stats
 static uint64_t g_fc_t[6], g_fc_n, g_fc_begin0, g_fc_snap_end, g_exp_skip_fs_n;
+static void fc_frame_add(int i, uint64_t v);   // per-frame copy of the phases (the ring is defined with g_cur_frame)
+
 static int usnap_on(void) {
     int v = atomic_load(&g_usnap_on);
     if (v < 0) { const char *e = getenv("TOTK_UBO_SNAPSHOT"); v = !(e && !strcmp(e, "0")); atomic_store(&g_usnap_on, v); fprintf(stderr, "[dm] [nvn-mtl] uniform 内容按提交时刻快照：%s\n", v ? "开" : "关（读实时内存，旧行为）"); }
@@ -1363,7 +1365,7 @@ void mtl_sub_begin(void) {
     g_vis = g_vis_ring[pick].buf;
     void pg_sub_begin_ext(uint64_t fence); pg_sub_begin_ext(g_fence + 1);
     void arena_begin(void); arena_begin();
-    g_fc_t[0] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_fc_begin0;
+    { uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_fc_begin0; g_fc_t[0] += d; fc_frame_add(0, d); }
 }
 
 static void rp_end(void);
@@ -1441,6 +1443,23 @@ static inline void m4_end_render_m(id<MTL4RenderCommandEncoder> e, int m) {   //
 typedef struct { char kind; uint32_t w, h, fmt, nc, nload, nstore, depth; uint64_t draw0; char key[12]; } pt_ent;
 #define PT_MAX 2048
 static _Atomic uint64_t g_cur_frame; static uint64_t g_stat_draw;   // tentative declarations, defined further down
+/* 逐帧分段计时（长帧归因用）：与 g_fc_t 同样的六段，但按帧号留在环里——长帧行要等 GPU 时间（晚 8 帧）才打，
+   所以不能读「当前帧」的累计值。mtl_fc_frame(帧号) 取不到就返回 0。
+   Per-frame phase timers (for attributing a hitch): the same six phases as g_fc_t, kept per frame in a ring - the
+   long-frame line prints 8 frames late (GPU time), so it cannot read the current frame's accumulators. */
+enum { FC_RING = 16 };
+static struct { uint64_t frame; uint64_t t[8]; } g_fc_frame_ring[FC_RING];   // [6] all chunks' commit time, [7] chunk count
+static void fc_frame_add(int i, uint64_t v) {
+    uint64_t f = atomic_load(&g_cur_frame); unsigned k = (unsigned)(f % FC_RING);
+    if (g_fc_frame_ring[k].frame != f) { g_fc_frame_ring[k].frame = f; memset(g_fc_frame_ring[k].t, 0, sizeof g_fc_frame_ring[k].t); }
+    g_fc_frame_ring[k].t[i] += v;
+}
+int mtl_fc_frame(uint64_t frame, uint64_t *out) {   // 1: out filled with the eight phases of that frame (ns; [6] every chunk's commit, [7] chunks) | 1: out holds that frame's eight entries in ns
+    unsigned k = (unsigned)(frame % FC_RING);
+    if (g_fc_frame_ring[k].frame != frame) return 0;
+    memcpy(out, g_fc_frame_ring[k].t, sizeof g_fc_frame_ring[k].t);
+    return 1;
+}
 static _Atomic uint64_t g_stat_views;   // texture views made for texture ids (mtl_view_stats; the long-frame log's detail)
 static id<MTL4CounterHeap> g_pt_heap; static pt_ent *g_pt; static int g_pt_n, g_pt_key_pending;
 static long g_pt_f0 = -2, g_pt_f1, g_pt_stride = 1;
@@ -2507,8 +2526,11 @@ static void mtl_sub_split(void) {
     g_cb = next;
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
     g_sub_chunks++; g_chunk_commits++; g_chunk_mark = g_stat_draw;
+    { uint64_t fc4b = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); fc_frame_add(6, fc4b > fc0 ? fc4b - fc0 : 0); fc_frame_add(7, 1); }   // every chunk, not only the first
     if (fc_first) { uint64_t fc4 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), wait = fc1 - fc0;   // [2] the wait, [3] up_flush, [4] res_commit, [5] the rest
-        g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += wait; g_fc_t[3] += fc2 - (early ? fc0 : fc1); g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3 - (early ? wait : 0); g_fc_n++; }
+        g_fc_t[1] += fc0 - g_fc_snap_end; g_fc_t[2] += wait; g_fc_t[3] += fc2 - (early ? fc0 : fc1); g_fc_t[4] += fc3 - fc2; g_fc_t[5] += fc4 - fc3 - (early ? wait : 0); g_fc_n++;
+        fc_frame_add(1, fc0 - g_fc_snap_end); fc_frame_add(2, wait); fc_frame_add(3, fc2 - (early ? fc0 : fc1));
+        fc_frame_add(4, fc3 - fc2); fc_frame_add(5, fc4 - fc3 - (early ? wait : 0)); }
 }
 // Called where a new encoder is about to be opened and none is open.
 static void chunk_maybe_split(void) {
