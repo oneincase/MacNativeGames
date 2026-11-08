@@ -9816,7 +9816,13 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
             NSData *jd = [NSData dataWithContentsOfFile:jp];
             NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
             NSString *stage = j[@"stage"];
-            int st = [stage isEqual:@"vs"] ? 0 : [stage isEqual:@"ps"] ? 1 : [stage isEqual:@"cs"] ? 5 : -1;
+            /* NVN2 的 task / mesh（Switch 2 的着色器，OoT 缓存里 5 + 53 个）以前都落进 -1，被当成「失败」跳过：它们
+               在进世界后由绘制现加载。阶段号与 shader_load / 绘制路径一致（3 = task，4 = mesh）。
+               NVN2 task / mesh stages (5 + 53 of Ocarina of Time's cache) used to fall through to -1 and be counted as
+               failures, so play loaded their libraries at the first draw; the numbers match shader_load and the draw path
+               (3 = task, 4 = mesh). */
+            int st = [stage isEqual:@"vs"] ? 0 : [stage isEqual:@"ps"] ? 1 : [stage isEqual:@"cs"] ? 5
+                   : [stage isEqual:@"ts"] ? 3 : [stage isEqual:@"ms"] ? 4 : -1;
             if (st < 0 || ![j[@"chain"] isEqual:@DMSH_CHAIN]) { failed++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
             [lkeys addObject:key]; [lstages addObject:@(st)];
         }
