@@ -120,6 +120,8 @@ static int guarded_memcmp(const void *a, const void *b, size_t n, int *differ, c
 
 static void warm_start(void);
 static void warm_claim(void);
+/* 有管线存档时是否也把缓存里的着色器库预热（缺省是；TOTK_WARM_LIBS=0 恢复「有存档就只预热清单」的旧行为，用于 A/B）。 */
+static int warm_libs(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WARM_LIBS"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("预热：有管线存档时不再预热缓存里的着色器库（TOTK_WARM_LIBS=0）"); } return v; }
 int mtl_warm_wait(int timeout_ms);
 extern void runtime_warm_progress(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) __attribute__((weak_import));
 extern void runtime_warm_done(void) __attribute__((weak_import));
@@ -9792,7 +9794,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
            time it is needed, prebuilt or not, and Ocarina of Time met 103 of them in the frames after a world load (1.2 s,
            in a frame that took 1 s); doing it behind the loading screen hides that. TOTK_WARM_LIBS=0 restores the old
            behaviour (skipped when an archive is present). */
-        NSArray<NSString *> *latest = g_par_fill_lists ? @[] : totk_rt_list();
+        NSArray<NSString *> *latest = g_par_fill_lists || (g_par_valid && !warm_libs()) ? @[] : totk_rt_list();
         for (NSString *file in latest) if ([file hasSuffix:@"_b.metal"] && ![known_files containsObject:file]) {
             if (!totk_shader_scope_contains(late_scope, [file stringByDeletingPathExtension])) continue;
             // The native service publishes reflection last. A newly written
