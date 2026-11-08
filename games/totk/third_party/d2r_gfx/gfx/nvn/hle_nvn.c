@@ -2940,7 +2940,15 @@ void nvn_set_framewait(int on) {
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; if (!g_game_sys) find_game_sys(); }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
-    if (memcmp(o->crop, v, sizeof v)) { LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh); if (getenv("TOTK_SIZE_CHAIN")) guest_chain("window crop"); }
+    if (memcmp(o->crop, v, sizeof v)) { LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh); if (getenv("TOTK_SIZE_CHAIN")) guest_chain("window crop");
+        /* TOTK_SIZE_OBJ (diagnostic, for an output-size patch): scan for the size the game just set around the window
+           object, so its own storage can be found and watched (who writes it). */
+        if (getenv("TOTK_SIZE_OBJ")) { const uint8_t *base = (const uint8_t *)w - 0x800; char line[700]; size_t n = 0;
+            for (int i = 0; i <= 0x1000 - 4; i += 4) { int32_t v; memcpy(&v, base + i, 4);
+                if (v == ww || v == hh) n += snprintf(line + n, sizeof line - n, " %+d:%d", i - 0x800, v);
+                if (n > sizeof line - 32) break; }
+            LOG("[size-obj] window %p, crop %dx%d; %s", (void *)w, ww, hh, n ? line : "(no match within +-0x800)"); }
+    }
     memcpy(o->crop, v, sizeof v);
 }
 static void trow(uint64_t f, const char *name, double v);
