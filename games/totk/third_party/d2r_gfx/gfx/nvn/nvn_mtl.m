@@ -4565,8 +4565,9 @@ static void *tex_mtl_p(const tex_t *ct) {
             { static long on = -1; static uint64_t seen[64]; static uint32_t cnt[64]; static int ns;   // TOTK_REUP_LOG=<from frame> (diagnostic): which textures the pool's changes re-upload
               if (on < 0) { const char *e = getenv("TOTK_REUP_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }
               if (on > 0 && (long)atomic_load(&g_cur_frame) >= on) { int k = 0; while (k < ns && seen[k] != t->serial) k++; if (k == ns && ns < 64) { seen[ns] = t->serial; cnt[ns++] = 0; }
-                  if (k < 64 && (cnt[k]++ % 100) == 0) MLOG("[reup] f%llu ser=%llu %ux%u fmt=%#x lv%u mem=%p size=%#llx owned=%d hashed=%d (%u times)", (unsigned long long)atomic_load(&g_cur_frame),
-                      (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (void *)t->mem, (unsigned long long)t->L.size, pk->owned, pk->hashed, cnt[k]); } }
+                  if (k < 64 && (cnt[k]++ % 100) == 0) MLOG("[reup] f%llu ser=%llu %ux%u fmt=%#x lv%u mem=%p size=%#llx owned=%d hashed=%d linear=%d pitch=%u (%u times)", (unsigned long long)atomic_load(&g_cur_frame),
+                      (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (void *)t->mem, (unsigned long long)t->L.size, pk->owned, pk->hashed,
+                      nvn_tex_is_linear(&t->d) ? 1 : 0, (unsigned)nvn_tex_linear_stride(&t->d), cnt[k]); } }
             uint64_t st; BOTW_PKG_WB_TAKE() reup_key nk; g_mip_nodrop = pk->owned; g_mip_keep = pk->keep_full; id<MTLTexture> nt = pkg_upload(t, &st, &nk, pk); g_mip_nodrop = 0; g_mip_keep = 0;   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; reup_retire(old, &pk->key); pk->key = nk; if (pk->hashed) pk->chash = h; ser_bump(t->serial); pk->stamp = st; pk->seen = st; BOTW_PKG_WB_SET(pk) g_pkg_reuploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); BOTW_REUP_TRACKED(pk, t) }
             else { free(pk->edge); pk->edge = NULL; }   // TOTK (#90): the bytes kept belong to the upload that failed
