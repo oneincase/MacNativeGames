@@ -6,12 +6,17 @@ Works on a 16 GB Apple silicon Mac: title and menu text, a new game, the opening
 
 Known problems:
 
-- Memory: a loaded save plays, but this is not settled. The performance profile (the default) reached a plateau of
-  about 10.9 GB resident / 9.2 GB allocated to the GPU in Kokiri Forest, from frame 2400 through 18900 of a 5 minute
-  session (wired peak 10,139 MB against the 12.3 GB limit, `wired_guard_check`, exit 87); no longer session has been
-  tried, and no other area. Asset texture copies hold 908 MB of it and the shared-storage textures reclaim idle entries
-  (1976 of 2800 at the end of that session). The raw pool table also overflows by a few entries (a red line in the log;
-  addresses in those pools are not reached).
+- Memory: **no leak in Kokiri Forest; the height of the sawtooth is the item, and the port's own copies were the part
+  that could move.** Two 20 minute sessions (performance profile, autoload, idle): resident memory rose with the world
+  then sawtoothed between about 9.4 and 12.1 GB (12,061 MB peak) while the wired memory the guard watches peaked at
+  10,265 MB against the 12,288 MB limit (`wired_guard_check`, exit 87), and pools stayed at 2,874-3,031 of 16,384. 1,014
+  MB of it were asset texture copies, all of them used within 90 submissions, so an eviction sweep found nothing idle to
+  drop - until a budget was set: `TOTK_TEX_EVICT_MB` at 640 MB evicted 626 copies (442 MB) in one sweep, no copy was
+  asked for again afterwards, and the wired peak fell to 9,656 MB. The budget is now the default for this game
+  (`TOTK_TEX_EVICT=0` turns it off, `TOTK_TEX_EVICT_MB` changes it). Not measured: another area, a longer session than 20
+  minutes, and a session that walks far enough to ask for an evicted copy again (the re-upload path exists and is used on
+  the iPhone). The raw pool table also overflows by a few entries (a red line in the log; addresses in those pools are not
+  reached).
 - Frame rate: the performance profile is the default now, and held 57-60 fps through that 5 minute Kokiri Forest session
   (game time 1.000). Docked, on one 16 GB Mac, single runs: 60 fps held at the spawn point in Link's house and in the
   forest view after leaving it, about 53 fps facing the house's door, about 55 fps on the deck outside (frame p50 17.4 to
