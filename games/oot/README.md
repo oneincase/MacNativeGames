@@ -6,8 +6,19 @@ Works on a 16 GB Apple silicon Mac: title and menu text, a new game, the opening
 
 Known problems:
 
-- Memory: a loaded save plays, but this is not settled. A 3 minute session peaked at 11.7 GB of system wired memory, against the 12.3 GB limit (`wired_guard_check`, exit 87), and no longer session has been tried. The raw pool table also overflows by a few entries (a red line in the log; addresses in those pools are not reached).
-- Frame rate, on one 16 GB Mac, single runs: 60 fps held at the spawn point in Link's house and in the forest view after leaving it, about 53 fps facing the house's door, about 55 fps on the deck outside (frame p50 17.4 to 17.8 ms, p95 about 21.7 ms). The rest of the world has not been measured. GPU 15 to 18 ms in the heavier views. Spikes of 40 to 50 ms with low GPU time remain in some views (CPU side, not explained). Pool tables are still walked whole 3 times a frame (5 ms or so).
+- Memory: a loaded save plays, but this is not settled. The performance profile (the default) reached a plateau of
+  about 10.9 GB resident / 9.2 GB allocated to the GPU in Kokiri Forest, from frame 2400 through 18900 of a 5 minute
+  session (wired peak 10,139 MB against the 12.3 GB limit, `wired_guard_check`, exit 87); no longer session has been
+  tried, and no other area. Asset texture copies hold 908 MB of it and the shared-storage textures reclaim idle entries
+  (1976 of 2800 at the end of that session). The raw pool table also overflows by a few entries (a red line in the log;
+  addresses in those pools are not reached).
+- Frame rate: the performance profile is the default now, and held 57-60 fps through that 5 minute Kokiri Forest session
+  (game time 1.000). Docked, on one 16 GB Mac, single runs: 60 fps held at the spawn point in Link's house and in the
+  forest view after leaving it, about 53 fps facing the house's door, about 55 fps on the deck outside (frame p50 17.4 to
+  17.8 ms, p95 about 21.7 ms). The rest of the world has not been measured in either profile. GPU 15 to 18 ms in the
+  heavier docked views, about 16 ms in the performance profile. Spikes of 40 to 50 ms with low GPU time remain in some
+  views (CPU side: the virtual cores' waits, measured 2026-11-09; the frame stays GPU bound otherwise). Pool tables are
+  walked whole 3 times a frame (2 to 2.5 ms).
 - The picture's pale haze: **fixed 2026-11-08; it was the upscaler bypass.** The bypass skipped agl's eight enhancement
   layers and also replaced the last kernel (`agl_ndsr_vr_light`) with a plain copy, which dropped that kernel's light and
   tone step: in Kokiri Forest a frame measured mean luminance 0.641, saturation 0.133 and contrast 0.120, against 0.421 /
