@@ -22,18 +22,20 @@ Known problems:
 
 ## Performance profile (2026-11-09)
 
-The settings panel's display page has a row, "performance profile (from the next launch)": quality is the game's own
-docked configuration, performance reports the Switch handheld mode (`nn::oe` OperationMode 0, PerformanceMode Normal) so
-the game uses the configuration Nintendo made for the handheld's lower clock. The game then renders a 1440x810 scene into
-a 1920x1080 output with 1000x1000 shadows, instead of 1536x864 into 2048x1152 with 1600x1600 shadows.
+The settings panel's display page has a row, "performance profile (from the next launch)": performance reports the Switch
+handheld mode (`nn::oe` OperationMode 0, PerformanceMode Normal) so the game uses the configuration Nintendo made for the
+handheld's lower clock, and quality is the game's own docked configuration. The game then renders a 1440x810 scene into a
+1920x1080 output with 1000x1000 shadows, instead of 1536x864 into 2048x1152 with 1600x1600 shadows. **Performance is this
+game's default** (user, 2026-11-09): it held 60 fps through a 5 minute session where docked gave 39-47.
 
 At the Kokiri Forest spawn (same save, autoload, warm cache, one 25 s window each, 20 s of play before it): frame p50
 25.3 ms docked against 17.3 (TOTK_OPERATION_MODE) and 18.3 (saved choice) ms, 39.1 against 54.6 and 52.5 fps, 1 % low 30.1
-against 38.9 and 27.4, p99 31.8 against 24.3 and 29.6. The picture and the HUD were checked in a screenshot (the panel
-shows the row, the HUD's output size reads 1920x1080), and walking with the keyboard still moves Link. The choice is
-saved in `graphics-profile.txt` next to `controls.txt` and read at start, so it is the next launch's; `TOTK_OPERATION_MODE`
-decides first, and a run without a settings folder (development) is docked. The panel's resolution row now says "the game's
-own (2048x1152)" instead of "1080p", which was wrong for this game.
+against 38.9 and 27.4, p99 31.8 against 24.3 and 29.6. The game time stayed with real time (1.000) and the session logged
+57-60 fps. The picture and the HUD were checked in a screenshot (the panel shows the row, the HUD's output size reads
+1920x1080), and walking with the keyboard still moves Link. The choice is saved in `graphics-profile.txt` next to
+`controls.txt` and read at start, so it is the next launch's; `TOTK_OPERATION_MODE` decides first, and
+`graphics-profile.txt` holding "docked" gives the quality profile. The panel's resolution row says "the game's own
+(2048x1152)" instead of "1080p", which was wrong for this game.
 
 The game has these two profiles and no other: a window of another size does not change its render sizes (a 1280x720 window
 still rendered 1536x864 and 2048x1152, measured the same day), so a window size is not a performance switch; it only makes

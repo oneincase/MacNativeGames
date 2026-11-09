@@ -344,11 +344,19 @@ __attribute__((weak)) int runtime_setting_word(const char *name, char *word, siz
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
    docked (1, Boost 1): the game then uses its own handheld settings (1440x810 scene, 1920x1080 output, 1000x1000 shadows),
    which Nintendo made for half the docked GPU clock. Without the variable a saved settings-panel choice decides
-   (graphics-profile.txt, "handheld" or "docked"), then docked. Read once; any other value of the variable stops the start. */
-static int handheld_mode(void) {static int v=-1;if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");int h=0;const char *from="docked (default)";
+   (graphics-profile.txt, "handheld" or "docked"). This game's default is the handheld profile: at the Kokiri Forest spawn
+   it holds 60 fps where docked gives 39-47 (games/oot/README.md, 2026-11-09). Read once; any other value of the variable
+   stops the start. */
+static int handheld_mode(void) {static int v=-1;if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");
+#if defined(GAME_OOT)
+ int h=1;const char *from="this game's default (handheld)";
+#else
+ int h=0;const char *from="docked (default)";
+#endif
  if(e&&*e){if(!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");from="TOTK_OPERATION_MODE";}
- else{char word[32];if(runtime_setting_word("graphics-profile.txt",word,sizeof word)&&!strncmp(word,"handheld",8)){h=1;from="the settings panel's performance profile";}
-  else from="the settings panel's quality profile";}
+ else{char word[32];if(runtime_setting_word("graphics-profile.txt",word,sizeof word)){
+   if(!strncmp(word,"handheld",8)){h=1;from="the settings panel's performance profile";}
+   else if(!strncmp(word,"docked",6)){h=0;from="the settings panel's quality profile";}}}
  fprintf(stderr,"[totk] operation mode reported to the game: %s (from %s)\n",h?"handheld (performance normal)":"docked (performance boost)",from);v=h;}return v;}
 int runtime_handheld_mode(void){return handheld_mode();}   /* runtime/input.c: the pad is the handheld controller then */
 static int operation_mode(void) {return handheld_mode()?0:1;}

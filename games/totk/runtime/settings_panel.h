@@ -372,9 +372,11 @@ static NSString *settings_on_off(int on) { return on?settings_text("开","On"):s
 #if defined(GAME_NS2) && !defined(GAME_DKB) && !defined(GAME_POKOPIA)
 /* The game's own handheld profile (operation mode 0, performance mode Normal): 1440x810 scene, 1920x1080 output,
    1000x1000 shadows, 17.3 ms a frame against the docked 25.3 at the Kokiri Forest spawn (2026-11-09, games/oot/README.md).
-   services.c reads the choice before the guest starts, so a pick is the next launch's. */
+   It is this game's default; the row's quality choice saves "docked". services.c reads the choice before the guest
+   starts, so a pick is the next launch's. */
 static int settings_profile_saved(void) {
- char word[32];return runtime_setting_word("graphics-profile.txt",word,sizeof word)&&!strncmp(word,"handheld",8);
+ char word[32];if(!runtime_setting_word("graphics-profile.txt",word,sizeof word))return 1;   /* no file: this game's default */
+ return !strncmp(word,"handheld",8);
 }
 static TOTKSettingRow *settings_performance_row(void) {
  NSString *title=settings_text("性能档（下次启动生效）","Performance profile (from the next launch)");
