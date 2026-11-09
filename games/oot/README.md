@@ -16,7 +16,32 @@ Known problems:
   (0.423 / 0.256 / 0.164, within 1 % of the network), for 52 to 58 fps at the title against the network's 17.5 and no cost
   over the old copy in the forest (27 to 35 fps, GPU 29 to 31 ms). `TOTK_NDSR_BYPASS=0` runs the whole network, `=1` the
   old copy. The picture is softer than the console's only in what the eight layers added.
-- Draws of shaders that read an image or buffer texture handle from memory are skipped.
+- Draws of shaders that read an image or buffer texture handle from memory are skipped. A texture copy that scales
+  (2048x1152 to 1280x720 docked, 1920x1080 to 1280x720 in the performance profile below) is not implemented and is
+  dropped, one red line; nothing was seen to be missing from the picture.
+
+## Performance profile (2026-11-09)
+
+The settings panel's display page has a row, "performance profile (from the next launch)": quality is the game's own
+docked configuration, performance reports the Switch handheld mode (`nn::oe` OperationMode 0, PerformanceMode Normal) so
+the game uses the configuration Nintendo made for the handheld's lower clock. The game then renders a 1440x810 scene into
+a 1920x1080 output with 1000x1000 shadows, instead of 1536x864 into 2048x1152 with 1600x1600 shadows.
+
+At the Kokiri Forest spawn (same save, autoload, warm cache, one 25 s window each, 20 s of play before it): frame p50
+25.3 ms docked against 17.3 (TOTK_OPERATION_MODE) and 18.3 (saved choice) ms, 39.1 against 54.6 and 52.5 fps, 1 % low 30.1
+against 38.9 and 27.4, p99 31.8 against 24.3 and 29.6. The picture and the HUD were checked in a screenshot (the panel
+shows the row, the HUD's output size reads 1920x1080), and walking with the keyboard still moves Link. The choice is
+saved in `graphics-profile.txt` next to `controls.txt` and read at start, so it is the next launch's; `TOTK_OPERATION_MODE`
+decides first, and a run without a settings folder (development) is docked. The panel's resolution row now says "the game's
+own (2048x1152)" instead of "1080p", which was wrong for this game.
+
+The game has these two profiles and no other: a window of another size does not change its render sizes (a 1280x720 window
+still rendered 1536x864 and 2048x1152, measured the same day), so a window size is not a performance switch; it only makes
+the final present cheaper. Not yet checked: the gamepad in the handheld profile, whether the game records the mode in its
+save, and a long session's heat.
+
+For a Metal trace that names the frame's passes, `DM_NVN_ENC_LABEL=1` labels every render pass (`p07 1536x864 <shader key>
+d29`) and, since 2026-11-09, the dispatch, copy and upload encoders (`d20`, `b18`, `u00`); off by default, diagnostic only.
 
 Output size (open): the game picks 2048x1152 itself (scene 1536x864, NDSR to 2048x1152), and the port has no switch for it -
 `runtime_output_modes()` returns 0 for this game, unlike Bananza and Pokopia. What a patch would have to change, measured

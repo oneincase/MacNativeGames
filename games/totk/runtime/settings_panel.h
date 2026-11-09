@@ -369,6 +369,24 @@ static TOTKSettingRow *settings_fixed(NSString *title, NSString *value) {
  return settings_row(title,@[value],@[@0],^int{return 0;},nil);
 }
 static NSString *settings_on_off(int on) { return on?settings_text("开","On"):settings_text("关","Off"); }
+#if defined(GAME_NS2) && !defined(GAME_DKB) && !defined(GAME_POKOPIA)
+/* The game's own handheld profile (operation mode 0, performance mode Normal): 1440x810 scene, 1920x1080 output,
+   1000x1000 shadows, 17.3 ms a frame against the docked 25.3 at the Kokiri Forest spawn (2026-11-09, games/oot/README.md).
+   services.c reads the choice before the guest starts, so a pick is the next launch's. */
+static int settings_profile_saved(void) {
+ char word[32];return runtime_setting_word("graphics-profile.txt",word,sizeof word)&&!strncmp(word,"handheld",8);
+}
+static TOTKSettingRow *settings_performance_row(void) {
+ NSString *title=settings_text("性能档（下次启动生效）","Performance profile (from the next launch)");
+ NSString *quality=settings_text("画质（游戏默认）","Quality (the game's own)");
+ NSString *perf=settings_text("性能（掌机配置）","Performance (handheld profile)");
+ const char *env=getenv("TOTK_OPERATION_MODE");
+ if(env&&*env)return settings_fixed(title,!strcmp(env,"handheld")?perf:quality);
+ return settings_row(title,@[quality,perf],@[@0,@1],^int{return settings_profile_saved();},^(int v){
+  runtime_setting_save("graphics-profile.txt",v?"handheld":"docked","performance profile");
+  dispatch_async(dispatch_get_main_queue(),^{settings_rebuild();});});
+}
+#endif
 #if defined(GAME_DKB) || defined(GAME_POKOPIA)
 /* The game consumes this request in its native display calculation. */
 static void settings_ns2_save_size(void) {
@@ -870,9 +888,16 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
  (void)resolution;
  [rows addObject:settings_ns2_resolution_row()];
 #else
- if(res.count<2)[rows addObject:settings_fixed(resolution,@"1080p")];
+ NSString *fixedRes=@"1080p";
+#if defined(GAME_NS2)
+ fixedRes=settings_text("由游戏决定（2048×1152）","The game's own (2048×1152)");   /* the performance profile: 1920x1080 */
+#endif
+ if(res.count<2)[rows addObject:settings_fixed(resolution,fixedRes)];
  else [rows addObject:settings_row(resolution,res,resModes,
   ^int{return runtime_output_mode();},^(int v){settingsPendingOutput=-1;if(runtime_output_mode_set(v)){settings_window_for(v);settings_save_int("graphics-output.txt",v,"resolution");}})];
+#endif
+#if defined(GAME_NS2) && !defined(GAME_DKB) && !defined(GAME_POKOPIA)
+ [rows addObject:settings_performance_row()];
 #endif
  NSString *aspect=settings_text("画面比例","Aspect ratio");
  if(!(runtime_aspect_ratio()>0))[rows addObject:settings_fixed(aspect,@"16:9")];

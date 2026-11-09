@@ -336,11 +336,20 @@ static void observed_sdk_init(void) { fprintf(stderr,"[totk] ENTER nninitInitial
 static void observed_startup(void) { fprintf(stderr,"[totk] ENTER nninitStartup\n");((void(*)(void))runtime_symbol("nninitStartup"))();fprintf(stderr,"[totk] RETURN nninitStartup\n"); }
 static void observed_main(void) { fprintf(stderr,"[totk] ENTER nnMain\n");((void(*)(void))runtime_symbol("nnMain"))();fprintf(stderr,"[totk] RETURN nnMain\n"); }
 static void cpu_boost(int mode) { if(mode<0||mode>2)runtime_fail("unknown CPU boost mode");fprintf(stderr,"[totk] CPU boost request %d: macOS manages CPU frequency\n",mode); }
+#if TARGET_OS_IPHONE
+/* The settings-panel files live next to controls.txt, which only the Mac frontend has (runtime/gamepad.m): the phone
+   reads none of them, so a saved performance profile is the Mac's alone. */
+__attribute__((weak)) int runtime_setting_word(const char *name, char *word, size_t size) { (void)name; (void)word; (void)size; return 0; }
+#endif
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
-   docked (1, Boost 1): the game then uses its own handheld settings (1280x720 output, lower internal resolution), which
-   Nintendo made for half the docked GPU clock. Read once; any other value stops the start. */
-static int handheld_mode(void) {static int v=-1;if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");int h;if(!e||!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");
- fprintf(stderr,"[totk] operation mode reported to the game: %s\n",h?"handheld (performance normal)":"docked (performance boost)");v=h;}return v;}
+   docked (1, Boost 1): the game then uses its own handheld settings (1440x810 scene, 1920x1080 output, 1000x1000 shadows),
+   which Nintendo made for half the docked GPU clock. Without the variable a saved settings-panel choice decides
+   (graphics-profile.txt, "handheld" or "docked"), then docked. Read once; any other value of the variable stops the start. */
+static int handheld_mode(void) {static int v=-1;if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");int h=0;const char *from="docked (default)";
+ if(e&&*e){if(!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");from="TOTK_OPERATION_MODE";}
+ else{char word[32];if(runtime_setting_word("graphics-profile.txt",word,sizeof word)&&!strncmp(word,"handheld",8)){h=1;from="the settings panel's performance profile";}
+  else from="the settings panel's quality profile";}
+ fprintf(stderr,"[totk] operation mode reported to the game: %s (from %s)\n",h?"handheld (performance normal)":"docked (performance boost)",from);v=h;}return v;}
 int runtime_handheld_mode(void){return handheld_mode();}   /* runtime/input.c: the pad is the handheld controller then */
 static int operation_mode(void) {return handheld_mode()?0:1;}
 static int performance_mode(void) {return handheld_mode()?0:1;}
