@@ -2947,11 +2947,14 @@ void nvn_set_framewait(int on) {
     LOG("[flag] framewait = %d（写 +0x224 = %d）", on, on ? 1 : 2);
 }
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; if (!g_game_sys) find_game_sys(); }
+#if defined(GAME_OOT)   /* game_patches_ns2.c defines these in its GAME_OOT block; DKB and Pokopia share GAME_NS2 */
 extern uint64_t oot_size_probe_obj, oot_size_probe_w, oot_size_probe_h;   // game_patches_ns2.c (TOTK_SIZE_PROBE)
 extern int oot_size_probe_on;
+#endif
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
     if (memcmp(o->crop, v, sizeof v)) { LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh); if (getenv("TOTK_SIZE_CHAIN")) guest_chain("window crop");
+#if defined(GAME_OOT)
         /* TOTK_SIZE_PROBE (diagnostic, game_patches_ns2.c patch_oot_size_probe): the stub at main+0x11e7b64 recorded the
            object the size is read from (x19) and the two words it loaded. Print it and every 2048 / 1152 around it, so the
            storage the size is computed into can be found. */
@@ -2967,6 +2970,7 @@ NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
             LOG("[size-probe]%s", n ? line : " (no 2048/1152 within +-0x1000)");
             { extern void runtime_watch_set(uintptr_t, size_t);
               runtime_watch_set((uintptr_t)oot_size_probe_obj + 0xb4, 8);   /* who writes the size */ } } }
+#endif
     }
     memcpy(o->crop, v, sizeof v);
 }
