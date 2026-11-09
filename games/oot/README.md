@@ -64,9 +64,10 @@ d29`) and, since 2026-11-09, the dispatch, copy and upload encoders (`d20`, `b18
 Code-level budget (2026-11-09): `DM_SUBMIT_SPLIT=1` times the replay loop by kind of operation. Kokiri Forest, the
 performance profile: **0.5 ms state / 5.5 ms draw / 0.07 copy / 0.18 other a frame**, with the pool table's 1.7 ms inside
 the draw part (3 rebuilds a frame, because the game re-registers about 96 textures a frame - a cross-frame cache would not
-hit). The frame itself is GPU bound (about 16 ms), so this is headroom, not frame rate. Building with
-`NATIVE_OPT="-O3 -flto"` measured 0.4 ms less draw time than the default `-O2` (5.50 against 5.90 ms, two alternating
-pairs); it is not the default because it changes every game's binary. `TOTK_REUP_LOG=1` shows where the two texture
+hit). The frame itself is GPU bound (about 16 ms), so this is headroom, not frame rate. This game builds with `-O3 -flto`
+(`NATIVE_OPT_OOT`, Makefile): two alternating pairs measured its draw encoding at 5.50 ms against `-O2`'s 5.90. The frame
+is GPU bound, so that is CPU headroom, not frame rate; `NATIVE_OPT_OOT=-O2` restores the old build, and the other games
+keep `-O2`. `TOTK_REUP_LOG=1` shows where the two texture
 re-uploads a frame come from: one 1920x1080 RGBA8 texture of 8.8 MB and two 256x32 ones of 1 MB each, about 10.8 MB a
 frame (650 MB/s at 60 fps); they are uploaded because the game changes them every frame, and sharing them instead needs a
 zero-copy texture alias (the port's "shared storage" only shares one texture between guest serials). The present pass
