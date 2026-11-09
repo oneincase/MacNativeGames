@@ -1363,6 +1363,13 @@ static void dump_threads(unsigned secs) {
     for (int c = 0; c < NCORE; c++) fprintf(stderr, "[totk-dump] core %d owner %#x for %.1f ms\n", c, g_core_owner[c] ? g_core_owner[c]->handle : 0,
                                             g_core_owner[c] ? (now_ns() - g_core_owner[c]->core_since) / 1e6 : 0.0);
     for (thr_t *w = g_core_wait; w; w = w->cnext) fprintf(stderr, "[totk-dump] core waiter %#x prio %d mask %#llx ideal %d\n", w->handle, w->prio, (unsigned long long)w->mask, w->core);
+    /* The threads that accumulated the most waiting for a virtual core: the 2026-11-09 spikes are core waits
+       (games/oot/README.md), and this says which threads pay them and at what priority and core mask. */
+    { thr_t *top[5] = {0};
+      for (thr_t *t = g_all; t; t = t->all) { if (t->exited) continue;
+          for (int i = 0; i < 5; i++) if (!top[i] || t->core_wait_ns > top[i]->core_wait_ns) { for (int j = 4; j > i; j--) top[j] = top[j - 1]; top[i] = t; break; } }
+      for (int i = 0; i < 5 && top[i]; i++) fprintf(stderr, "[totk-dump] waits-most #%d h=%#x prio=%d mask=%#llx core=%d core_wait=%.1f ms (%llu waits)\n",
+          i + 1, top[i]->handle, top[i]->prio, (unsigned long long)top[i]->mask, top[i]->cur_core, top[i]->core_wait_ns / 1e6, (unsigned long long)top[i]->core_nwait); }
 #ifdef GAME_BOTW
     fprintf(stderr, "[totk-dump] preemption signals %llu, cores given up in the signal handler %llu, starvation grants %llu\n",
             (unsigned long long)g_preempt_kicks, (unsigned long long)g_preempt_async, (unsigned long long)g_starve_grants);
