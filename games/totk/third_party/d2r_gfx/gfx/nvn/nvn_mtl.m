@@ -4752,6 +4752,26 @@ static int g_pso_dirty = 1, g_dss_dirty = 1;   // 回放中改了管线 / 深度
 static uint64_t g_stat_args_enc, g_stat_args_reuse;   // 参数缓冲：新编 / 复用次数 | Argument buffer: new-encode / reuse counts
 uint64_t g_draw_skip[16];   // TOTK: draws dropped in the replay, by reason (logged with the per-frame draw count)
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // 带宽账：附件读入 / 写出字节、全量读写通道数 | Bandwidth ledger: attachment load / store bytes, number of full load-store passes
+/* DM_SUBMIT_SPLIT (diagnostic): the replay loop's time by kind of operation, so the submit CPU's ~8 ms can be
+   attributed (the Time Profiler's guest stacks are addresses only). Two clock reads per operation; off by default. */
+static uint64_t g_split_state_ns, g_split_draw_ns, g_split_copy_ns, g_split_other_ns;
+static int submit_split_on(void) { static int v = -1; if (v < 0) v = getenv("DM_SUBMIT_SPLIT") != NULL; return v; }
+static int split_cat(unsigned op) {   /* 0 state, 1 draw/dispatch, 2 copy/clear, 3 everything else */
+    switch (op) {
+        case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+        case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
+        case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP:
+        case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_PUSH_CONST: case OP_RENDER_COND: return 0;
+        case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH:
+#ifdef GAME_NS2
+        case OP_MESH_TASKS:
+#endif
+            return 1;
+        case OP_COPY_B2B: case OP_UPDATE_UB: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX:
+        case OP_CLEAR_BUF: case OP_CLEAR_COLOR: case OP_CLEAR_DS: return 2;
+        default: return 3;
+    }
+}
 // DM_NVN_PASSDUMP：逐条记通道附件 / 采样 / 出图（贴图按序号），供离线做数据流分析；P / D / R / S 行的通道号一致（= 开通道后的 g_stat_pass）
 // DM_NVN_PASSDUMP=帧号 或 起-止（含两端）
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
@@ -11018,7 +11038,13 @@ static uint64_t pool_table(int samp, int dtt, int dpf, int base) {   // caller h
     uint64_t fr = atomic_load(&g_cur_frame); pool_seen_scan();
     if (fr != g_pool_frame) { g_pool_frame = fr; g_pool_spent = 0; g_pool_req = 0;
         if (fr / 300 != g_pool_stat_frame / 300) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
-            MLOG("[pool] up to frame %llu: %llu table walks, %.1f ms a frame; liveness %llu kernel reads, %llu remembered; draw passes %llu without the full barrier, %llu with it; read textures made so far %llu", (unsigned long long)fr, (unsigned long long)g_pool_walks, (double)g_pool_walk_ns * tb.numer / tb.denom / 1e6 / MAX(1, (double)(fr - g_pool_stat_frame)), (unsigned long long)g_pool_live_reads, (unsigned long long)g_pool_live_hits, (unsigned long long)g_bar_skip, (unsigned long long)g_bar_full, (unsigned long long)g_pool_seen_made); g_bar_skip = g_bar_full = 0;
+            const double per = MAX(1.0, (double)(fr - g_pool_stat_frame));
+            MLOG("[pool] up to frame %llu: %llu table walks, %.1f ms a frame; liveness %llu kernel reads, %llu remembered; draw passes %llu without the full barrier, %llu with it; read textures made so far %llu", (unsigned long long)fr, (unsigned long long)g_pool_walks, (double)g_pool_walk_ns * tb.numer / tb.denom / 1e6 / per, (unsigned long long)g_pool_live_reads, (unsigned long long)g_pool_live_hits, (unsigned long long)g_bar_skip, (unsigned long long)g_bar_full, (unsigned long long)g_pool_seen_made); g_bar_skip = g_bar_full = 0;
+            if (submit_split_on()) {   /* DM_SUBMIT_SPLIT: the replay loop by kind of operation (see split_cat) */
+                const double k = (double)tb.numer / tb.denom / 1e6 / per;
+                MLOG("提交分项 至帧 %llu：状态 %.2f / 绘制 %.2f / 拷贝 %.2f / 其余 %.2f ms 每帧（DM_SUBMIT_SPLIT）", (unsigned long long)fr,
+                     g_split_state_ns * k, g_split_draw_ns * k, g_split_copy_ns * k, g_split_other_ns * k);
+                g_split_state_ns = g_split_draw_ns = g_split_copy_ns = g_split_other_ns = 0; }
             g_pool_stat_frame = fr; g_pool_walks = g_pool_walk_ns = g_pool_live_reads = g_pool_live_hits = 0; } }
     int k = -1, fre = -1; for (int i = 0; i < POOL_KEYS; i++) { if (!g_ptab[i].copy) { if (fre < 0) fre = i; } else if (g_ptab[i].samp == samp && g_ptab[i].dtt == dtt && g_ptab[i].dpf == dpf && g_ptab[i].base == base) { k = i; break; } }
     if (k >= 0 && g_ptab[k].sub == g_sub_serial && g_ptab[k].epoch == g_arena_epoch) return g_ptab[k].gpu;
@@ -16934,6 +16960,7 @@ void mtl_exec(const uint8_t *p) {
     { static long st_frame = -2, st_ms; if (st_frame == -2) { const char *e = getenv("DM_NVN_STALL"); st_frame = e ? atol(e) : -1; st_ms = e && strchr(e, ':') ? atol(strchr(e, ':') + 1) : 1000; }   // TOTK diagnostic: DM_NVN_STALL=frame:ms sleeps the replay thread once at the start of that frame's replay
       static long st_done = -1; long cf = (long)atomic_load(&g_cur_frame); if (st_frame >= 0 && cf == st_frame && st_done != cf) { st_done = cf; MLOG("[stall] frame %ld: sleeping %ld ms on the replay thread", cf, st_ms); usleep((useconds_t)(st_ms * 1000)); } }
     int trace = dump_all && passdump();   // 普通模式不逐操作查帧范围，完整命令位置仅用于指定诊断帧 | Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames
+    const int split = submit_split_on();
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) MDIE("corrupt command record at %p: op %u size %u (call depth %d)", (const void *)p, (unsigned)h.op, (unsigned)h.size, g_ret_n);
@@ -16954,6 +16981,7 @@ void mtl_exec(const uint8_t *p) {
         if (g_cg_pending && !cg_op_safe(h.op)) { g_cg.reason[1]++; cg_flush(); }   // TOTK: cube-face-set groups pend only across state / binding ops (nvn_cube_group.h)
         if (g_hoist_n && hoist_take(p)) { if (g_fz.active && p == g_fz.rt2_op) { g_fz.phase = 2; g_rt_merged = 0; PD("F %llu 合并通道进入后一个通道的绘制", g_stat_pass); } p += h.size; continue; }   // 已提前执行的纯清除通道 / 已并入的后一个通道开头   // 进入后一个通道：前一个通道的同目标续用到此为止，后一个通道读前一个通道附件由 fz_p2_draw 证本像素，不再按续用规则切开 | A pure-clear render pass already executed early / the start of a later pass already merged in   // Entering the later pass: the same-target continuation of the earlier pass ends here; the later pass reading the earlier pass's attachment is proven to be same-pixel by fz_p2_draw, and is no longer split by the continuation rule
         const void *a = p + 8;
+        uint64_t t_op = split ? mach_absolute_time() : 0;
         switch (h.op) {
             case OP_END: g_exec_cur = NULL;
                 if (g_hoist_n && !g_ret_n && !g_nrest) {
@@ -17057,6 +17085,9 @@ void mtl_exec(const uint8_t *p) {
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); if (bits) g_game_barrier = g_disp_gbar = 1; break; }   // ordered at the next draw pass (barrier_game) or dispatch (disp_enc)
             default: break;
         }
+        if (split) { uint64_t dt = mach_absolute_time() - t_op;
+            switch (split_cat(h.op)) { case 0: g_split_state_ns += dt; break; case 1: g_split_draw_ns += dt; break;
+                case 2: g_split_copy_ns += dt; break; default: g_split_other_ns += dt; } }
         p += h.size;
     }
 }
