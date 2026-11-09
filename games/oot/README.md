@@ -69,8 +69,10 @@ hit). The frame itself is GPU bound (about 16 ms), so this is headroom, not fram
 is GPU bound, so that is CPU headroom, not frame rate; `NATIVE_OPT_OOT=-O2` restores the old build, and the other games
 keep `-O2`. `TOTK_REUP_LOG=1` shows where the two texture
 re-uploads a frame come from: one 1920x1080 RGBA8 texture of 8.8 MB and two 256x32 ones of 1 MB each, about 10.8 MB a
-frame (650 MB/s at 60 fps); they are uploaded because the game changes them every frame, and sharing them instead needs a
-zero-copy texture alias (the port's "shared storage" only shares one texture between guest serials). The present pass
+frame (650 MB/s at 60 fps); they are uploaded because the game changes them every frame, and a zero-copy alias cannot replace
+those uploads: TOTK_REUP_LOG now prints the layout, and all three are block-linear (linear=0), which Metal cannot sample
+directly - the GPU deswizzle the upload already does is the cheapest path for them. The port's "shared storage" is a
+different thing: one Metal texture shared between guest serials that alias the same storage. The present pass
 tone-maps the picture at the drawable's size (3024x1700 for a 1512x850-point window), so presenting the 1920x1080 picture
 1:1 would save pixels but soften the tone map - an option for the maintainer, not a default.
 
